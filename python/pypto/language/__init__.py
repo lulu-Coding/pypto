@@ -79,6 +79,7 @@ from .dsl_api import (
     yield_,
 )
 from .op import array_ops as array
+from .op import l2_buffer_ops as l2
 from .op import prefetch_ops as prefetch
 from .op import system_ops as system
 from .op import tensor_ops as tensor
@@ -354,6 +355,7 @@ __all__ = [
     "cross_core_slot",
     "adir",
     "array",
+    "l2",
     "prefetch",
     "tile",
     "system",

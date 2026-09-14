@@ -941,5 +941,40 @@ REGISTER_OP("tensor.get_block_num")
       return std::make_shared<ScalarType>(DataType::INDEX);
     });
 
+// ============================================================================
+// L2 CMO Prefetch Annotation
+// ============================================================================
+
+// Register tensor.annotate_prefetch
+//
+// A pure metadata annotation op: it carries (tensor, offset, size) from the
+// DSL to the backend without generating any computation. The backend
+// (pto_backend.py) scans Orchestration functions for this op and injects
+// aclshmemx_cmo_qp_nbi calls into the kernel_entry wrapper of the called
+// InCore functions. Each AIV prefetches its own data block using its own
+// QP (qp_idx = block_idx).
+//
+// This op returns UnknownType (void) — it is not a value-producing op.
+// It must appear inside an Orchestration function (FunctionType::Orchestration),
+// not inside an InCore function.
+REGISTER_OP("tensor.annotate_prefetch")
+    .set_op_category("TensorOp")
+    .no_execution_memory_access()
+    .set_description(
+        "Annotate a GM tensor for L2 cache prefetch via SHMEM CMO. "
+        "The backend injects aclshmemx_cmo_qp_nbi into the kernel_entry wrapper. "
+        "Effective on A5 (Ascend950) with SDMA engine enabled. "
+        "Must appear in an Orchestration function; the annotation is forwarded "
+        "to each called InCore function's kernel_entry wrapper.")
+    .add_argument("tensor", "Source tensor (TensorType)")
+    .add_argument("offset", "Byte offset within tensor (scalar INT64)")
+    .add_argument("size", "Bytes to prefetch (scalar INT64)")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      CHECK(args.size() == 3) << "tensor.annotate_prefetch requires 3 arguments (tensor, offset, size), got "
+                              << args.size();
+      return GetUnknownType();
+    });
+
 }  // namespace ir
 }  // namespace pypto

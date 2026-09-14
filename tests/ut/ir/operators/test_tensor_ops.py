@@ -5551,5 +5551,71 @@ def test_unified_xor_keeps_three_arg_tile_form():
     assert "tile.xor(" in str(Program)
 
 
+_OP_TENSOR_ANNOTATE_PREFETCH = ir.get_op("tensor.annotate_prefetch").name
+
+
+def test_tensor_annotate_prefetch():
+    """Test tensor.annotate_prefetch op registration and type deduction."""
+    span = ir.Span.unknown()
+    dim16 = ir.ConstInt(16, DataType.INT32, span)
+    dim32 = ir.ConstInt(32, DataType.INT32, span)
+    tensor_type = ir.TensorType([dim16, dim32], DataType.FP16)
+    tensor_var = ir.Var("x", tensor_type, span)
+
+    call = tensor.annotate_prefetch(
+        tensor_var,
+        ir.ConstInt(0, DataType.INT64, span),
+        ir.ConstInt(1024, DataType.INT64, span),
+    )
+
+    assert isinstance(call, ir.Call)
+    assert call.op.name == _OP_TENSOR_ANNOTATE_PREFETCH
+    assert len(call.args) == 3
+
+    # annotate_prefetch returns UnknownType (void annotation op)
+    assert isinstance(call.type, ir.UnknownType)
+
+
+def test_tensor_annotate_prefetch_wrong_arity():
+    """tensor.annotate_prefetch requires exactly 3 arguments."""
+    span = ir.Span.unknown()
+    tensor_var = ir.Var("x", ir.TensorType([16], DataType.FP16), span)
+
+    with pytest.raises(Exception):
+        tensor.annotate_prefetch(tensor_var, ir.ConstInt(0, DataType.INT64, span))
+
+
+def test_pl_l2_prefetch_dsl():
+    """Test pl.l2.prefetch DSL wrapper."""
+    import pypto.language as pl
+
+    # Verify pl.l2 module is accessible
+    assert hasattr(pl, "l2")
+    assert hasattr(pl.l2, "prefetch")
+
+    # Build a simple program with pl.l2.prefetch
+    @pl.program
+    def prog(
+        a: pl.Tensor[[16, 32], pl.FP16],
+        b: pl.Tensor[[32, 16], pl.FP16],
+        c: pl.Tensor[[16, 16], pl.FP16],
+    ) -> None:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def orch(self, a, b, c):
+            pl.l2.prefetch(a, size=16 * 32 * 2)
+            pl.l2.prefetch(b, size=32 * 16 * 2)
+            self.kernel(a, b, c)
+
+        @pl.incore_func(core_type=pl.CoreType.VECTOR)
+        def kernel(self, a, b, c):
+            tile_a: pl.Tile[[16, 32], pl.FP16] = pl.load(a, [0, 0], [16, 32])
+            tile_b: pl.Tile[[32, 16], pl.FP16] = pl.load(b, [0, 0], [32, 16])
+            tile_c = pl.matmul(tile_a, tile_b)
+            pl.store(tile_c, [0, 0], c)
+
+    prog_text = str(prog)
+    assert "tensor.annotate_prefetch" in prog_text
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

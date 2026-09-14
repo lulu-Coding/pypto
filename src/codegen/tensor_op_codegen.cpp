@@ -610,5 +610,17 @@ REGISTER_ORCHESTRATION_OP(tensor_dim, ("tensor.dim")) {
   return oss.str();
 }
 
+// ---------------------------------------------------------------------------
+// L2 CMO prefetch annotation
+// ---------------------------------------------------------------------------
+
+// tensor.annotate_prefetch is a pure metadata op: it carries (tensor, offset,
+// size) from the DSL to pto_backend.py, which scans Orchestration functions
+// for this op and injects aclshmemx_cmo_qp_nbi calls into the kernel_entry
+// wrapper. In the orchestration C++ layer it generates NO code.
+REGISTER_ORCHESTRATION_OP(tensor_annotate_prefetch, ("tensor.annotate_prefetch")) {
+  return "";
+}
+
 }  // namespace codegen
 }  // namespace pypto

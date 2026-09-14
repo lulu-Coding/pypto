@@ -264,7 +264,7 @@ _KERNEL_HEADER = """\
 #include "tensor.h"
 {deferred_completion_include}
 {spmd_override}
-
+{cmo_include}
 using namespace pto;
 
 """
@@ -678,6 +678,7 @@ _AIV_FIFO_ENDPOINT_OPS = frozenset(
 )
 _SDMA_WORKSPACE_OPS = frozenset({_ir_core.get_op("prefetch.make_context").name})
 _DEFERRED_COMPLETION_OPS = frozenset({_ir_core.get_op("pld.system.defer_wait").name})
+_CMO_PREFETCH_OPS = frozenset({_ir_core.get_op("tensor.annotate_prefetch").name})
 
 
 def _function_uses_ops(func: _ir_core.Function, op_names: frozenset[str]) -> bool:
@@ -726,6 +727,178 @@ def _uses_sdma_workspace(func: _ir_core.Function) -> bool:
 def _uses_deferred_completion(func: _ir_core.Function) -> bool:
     """Return whether the wrapper must expose the scheduler AsyncCtx."""
     return _function_uses_ops(func, _DEFERRED_COMPLETION_OPS)
+
+
+# ---------------------------------------------------------------------------
+# L2 CMO prefetch annotation collection
+# ---------------------------------------------------------------------------
+
+# Each entry: (tensor_param_index, offset_c_expr, size_c_expr)
+# tensor_param_index is the position of the annotated tensor in the InCore
+# function's tensor params (0-based, tensors-first order).
+PrefetchAnnotation = tuple[int, str, str]
+
+
+def _collect_cmo_prefetch_annotations(
+    orch_func: _ir_core.Function | None,
+) -> dict[str, list[PrefetchAnnotation]]:
+    """Scan an Orchestration function for ``tensor.annotate_prefetch`` ops.
+
+    Returns a mapping from InCore function name to a list of prefetch
+    annotations. Each annotation is ``(param_index, offset_expr, size_expr)``
+    where ``param_index`` is the position of the annotated tensor variable
+    in the callee InCore function's tensor params.
+
+    The mapping is built by:
+    1. Finding every ``tensor.annotate_prefetch`` call in the Orchestration
+       function body, extracting the tensor Var name.
+    2. Finding every ``Call``/``Submit`` to an InCore function, matching
+       the annotated tensor Var to the callee's argument position.
+    3. Mapping the argument position to the InCore function's tensor param
+       index (tensors-first order).
+    """
+    if orch_func is None:
+        return {}
+
+    # Phase 1: collect prefetch annotations — (tensor_var_name, offset_expr, size_expr)
+    prefetch_specs: list[tuple[str, str, str]] = []
+
+    class _PrefetchCollector(_ir_core.IRVisitor):
+        def visit_call(self, op: _ir_core.Call) -> None:
+            ir_op = getattr(op, "op", None)
+            if isinstance(ir_op, _ir_core.Op) and ir_op.name in _CMO_PREFETCH_OPS:
+                tensor_arg = op.args[0]
+                tensor_name = _extract_var_name(tensor_arg)
+                if tensor_name is not None:
+                    offset_expr = _scalar_to_c_expr(op.args[1])
+                    size_expr = _scalar_to_c_expr(op.args[2])
+                    prefetch_specs.append((tensor_name, offset_expr, size_expr))
+            super().visit_call(op)
+
+    collector = _PrefetchCollector()
+    collector.visit_stmt(orch_func.body)
+
+    if not prefetch_specs:
+        return {}
+
+    # Phase 2: collect Call/Submit sites — (callee_name, arg_var_names)
+    call_sites: list[tuple[str, list[str | None]]] = []
+
+    class _CallSiteCollector(_ir_core.IRVisitor):
+        def visit_call(self, op: _ir_core.Call) -> None:
+            ir_op = getattr(op, "op", None)
+            if isinstance(ir_op, _ir_core.GlobalVar):
+                arg_names = [_extract_var_name(a) for a in op.args]
+                call_sites.append((ir_op.name, arg_names))
+            super().visit_call(op)
+
+        def visit_submit(self, op: _ir_core.Submit) -> None:
+            ir_op = getattr(op, "op", None)
+            if isinstance(ir_op, _ir_core.GlobalVar):
+                arg_names = [_extract_var_name(a) for a in op.args]
+                call_sites.append((ir_op.name, arg_names))
+            super().visit_submit(op)
+
+    site_collector = _CallSiteCollector()
+    site_collector.visit_stmt(orch_func.body)
+
+    # Phase 3: match prefetch annotations to InCore function param indices
+    result: dict[str, list[PrefetchAnnotation]] = {}
+    for tensor_name, offset_expr, size_expr in prefetch_specs:
+        for callee_name, arg_names in call_sites:
+            if tensor_name in arg_names:
+                param_idx = arg_names.index(tensor_name)
+                result.setdefault(callee_name, []).append(
+                    (param_idx, offset_expr, size_expr)
+                )
+                break  # one annotation matches one call site
+
+    return result
+
+
+def _extract_var_name(expr: _ir_core.Expr) -> str | None:
+    """Extract the variable name from an IR expression (Var or VarRef)."""
+    if isinstance(expr, _ir_core.Var):
+        return expr.name_hint
+    # Handle VarRef or other wrappers
+    name_hint = getattr(expr, "name_hint", None)
+    if name_hint is not None:
+        return name_hint
+    var = getattr(expr, "var", None)
+    if var is not None:
+        return getattr(var, "name_hint", None)
+    return None
+
+
+def _scalar_to_c_expr(expr: _ir_core.Expr) -> str:
+    """Render a scalar IR expression as a C++ expression string."""
+    if isinstance(expr, _ir_core.ConstInt):
+        return str(expr.value)
+    if isinstance(expr, _ir_core.ConstFloat):
+        return repr(expr.value)
+    # Dynamic scalar (e.g. pl.dynamic("M")): use the var name
+    name = _extract_var_name(expr)
+    if name is not None:
+        return name
+    # Fallback: stringify
+    return str(expr)
+
+
+def _generate_cmo_setup(
+    func: _ir_core.Function,
+    prefetch_annotations: list[PrefetchAnnotation] | None,
+) -> str:
+    """Generate the CMO prefetch C++ snippet for kernel_entry wrapper.
+
+    Only injects CMO calls for AIV (VECTOR) functions — CMO is an AIV-only
+    operation on A5. CUBE (AIC) functions skip injection.
+
+    Uses ``__pypto_spmd_block_idx`` as ``qp_idx`` (requires SPMD args setup)
+    and a literal ``0`` as ``sync_id`` (avoiding ``EVENT_ID0`` macro dependency).
+    """
+    if not prefetch_annotations:
+        return ""
+
+    # CMO is AIV-only — skip for CUBE kernels
+    core_type = _codegen_core.infer_function_core_type(func)
+    if core_type != _ir_core.CoreType.VECTOR:
+        return ""
+
+    # Build tensor param name list (tensors-first order, matching _generate_arg_unpacking)
+    tensor_params = [p for p in func.params if isinstance(p.type, _ir_core.TensorType)]
+    if not tensor_params:
+        return ""
+
+    lines = [
+        "    // --- L2 CMO prefetch (A5 SHMEM) ---",
+        "    {",
+        "        constexpr uint32_t __cmo_ub_offset = 1024;",
+        "        constexpr uint32_t __cmo_ub_size = 64;",
+        "        __ubuf__ uint8_t* __cmo_tmp = "
+        "reinterpret_cast<__ubuf__ uint8_t*>(uint64_t(__cmo_ub_offset));",
+    ]
+
+    for param_idx, offset_expr, size_expr in prefetch_annotations:
+        if param_idx >= len(tensor_params):
+            continue
+        param_name = tensor_params[param_idx].name_hint
+        lines.append(f"        // Prefetch tensor param {param_idx}: {param_name}")
+        lines.append(
+            f"        aclshmemx_cmo_qp_nbi("
+            f"reinterpret_cast<__gm__ uint8_t*>({param_name}) + ({offset_expr}), "
+            f"static_cast<uint32_t>({size_expr}), "
+            f"ACLSHMEMCMOTYPE::CMO_TYPE_PREFETCH, "
+            f"__cmo_tmp, __cmo_ub_size, "
+            f"static_cast<uint32_t>(__pypto_spmd_block_idx), 0);"
+        )
+
+    lines.append(
+        "        aclshmemx_sdma_qp_quiet(__cmo_tmp, __cmo_ub_size, "
+        "static_cast<uint32_t>(__pypto_spmd_block_idx), 0);"
+    )
+    lines.append("    }")
+
+    return "\n".join(lines) + "\n\n"
 
 
 def _requires_dual_aiv_dispatch(func: _ir_core.Function) -> bool:
@@ -945,6 +1118,7 @@ def _generate_kernel_header(
     uses_subblock: bool | None = None,
     uses_sdma: bool | None = None,
     uses_deferred_completion: bool | None = None,
+    has_cmo_prefetch: bool = False,
 ) -> str:
     """Generate the wrapper header, including split lane overrides when needed."""
     fixed_subblock_id = _get_fixed_subblock_id(func)
@@ -977,11 +1151,17 @@ def _generate_kernel_header(
     spmd_override = '#include "intrinsic.h"\n' if needs_intrinsic else ""
     deferred_completion_include = _DEFERRED_COMPLETION_INCLUDE if uses_deferred_completion else ""
 
+    # CMO prefetch requires SHMEM headers for aclshmemx_cmo_qp_nbi / aclshmemx_sdma_qp_quiet
+    cmo_include = (
+        '#include "shmem.h"\n#include "kernel_operator.h"\n' if has_cmo_prefetch else ""
+    )
+
     return _KERNEL_HEADER.format(
         func_name=func.name,
         subblock_override=subblock_override,
         deferred_completion_include=deferred_completion_include,
         spmd_override=spmd_override,
+        cmo_include=cmo_include,
     )
 
 
@@ -990,6 +1170,7 @@ def _generate_kernel_wrapper(
     ptoas_code: str,
     *,
     group_uses_spmd: bool = False,
+    prefetch_annotations: list[PrefetchAnnotation] | None = None,
 ) -> str:
     """Generate a complete kernel wrapper file for one InCore function.
 
@@ -997,12 +1178,24 @@ def _generate_kernel_wrapper(
     1. Kernel header (includes, macros)
     2. Preprocessed ptoas code (static, no duplicate includes)
     3. ``kernel_entry`` wrapper with arg unpacking and forward call
+
+    Args:
+        prefetch_annotations: Optional L2 CMO prefetch annotations from the
+            Orchestration function. When present and the function is AIV,
+            ``aclshmemx_cmo_qp_nbi`` calls are injected into ``kernel_entry``
+            before the ptoas function call.
     """
     func_uses_spmd = _uses_spmd_block_ops(func)
-    uses_spmd = group_uses_spmd or func_uses_spmd
     func_uses_subblock = _uses_dynamic_subblock_id(func)
     func_uses_sdma = _uses_sdma_workspace(func)
     func_uses_deferred_completion = _uses_deferred_completion(func)
+
+    # CMO prefetch requires SPMD block identity (for qp_idx). Force-enable SPMD
+    # args setup when prefetch annotations are present, even if the InCore
+    # function itself doesn't use get_block_idx/get_block_num.
+    has_cmo_prefetch = bool(prefetch_annotations)
+    uses_spmd = group_uses_spmd or func_uses_spmd or has_cmo_prefetch
+
     ptoas_body = _preprocess_ptoas_output(ptoas_code)
     ptoas_body, fifo_uses_subblock = _forward_runtime_lane_to_split_fifo_calls(func, ptoas_body)
     wrapper_uses_subblock = func_uses_subblock or fifo_uses_subblock
@@ -1012,6 +1205,7 @@ def _generate_kernel_wrapper(
         uses_subblock=wrapper_uses_subblock,
         uses_sdma=func_uses_sdma,
         uses_deferred_completion=func_uses_deferred_completion,
+        has_cmo_prefetch=has_cmo_prefetch,
     )
     unpacking_code, var_names = _generate_arg_unpacking(func, uses_spmd=uses_spmd)
 
@@ -1063,6 +1257,10 @@ def _generate_kernel_wrapper(
             "get_dma_workspace(args, DMA_WORKSPACE_SDMA));\n\n"
         )
 
+    # L2 CMO prefetch injection (A5 only, AIV-only functions).
+    # Uses __pypto_spmd_block_idx as qp_idx (requires uses_spmd=True above).
+    cmo_setup = _generate_cmo_setup(func, prefetch_annotations)
+
     # PTOCodegen appends raw dispatch args for deferred completion after
     # user-derived arguments, then the SDMA workspace and synthetic i32
     # identity params in canonical order (block_idx, block_num, subblock_idx).
@@ -1091,6 +1289,7 @@ def _generate_kernel_wrapper(
         f"{subblock_arg_setup}"
         f"{unpacking_code}\n"
         f"{sdma_setup}"
+        f"{cmo_setup}"
         f"    // Forward to ptoas-generated function\n"
         f"    {func.name}({call_args});\n"
         "}\n"
@@ -1121,6 +1320,7 @@ def _generate_config_file(
     func_name_to_external_source: dict[str, str] | None = None,
     func_name_to_external_include_dirs: dict[str, tuple[str, ...]] | None = None,
     enable_sdma: bool = False,
+    enable_cmo_prefetch: bool = False,
     runtime: _passes.RuntimeKind = _passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER,
 ) -> str:
     """Generate kernel_config.py content.
@@ -1170,6 +1370,9 @@ def _generate_config_file(
     ]
     if enable_sdma:
         runtime_lines.append('\t"enable_sdma": True,')
+    if enable_cmo_prefetch:
+        runtime_lines.append('\t"enable_cmo_prefetch": True,')
+        runtime_lines.append('\t"cmo_qp_num": 72,')
     runtime_lines.append("}\n")
 
     header = [
@@ -1470,6 +1673,7 @@ def _emit_single_function_output(
     skip_ptoas: bool,
     memory_planner: _passes.MemoryPlanner = _passes.MemoryPlanner.PYPTO,
     dump_ptoas_passes: bool = False,
+    prefetch_annotations: list[PrefetchAnnotation] | None = None,
 ) -> None:
     """Emit output files for one InCore function."""
     suffix = "pto" if skip_ptoas else "cpp"
@@ -1488,7 +1692,9 @@ def _emit_single_function_output(
         )
     else:
         ptoas_cpp = _compile_pto_module(pto_code, func.name, output_dir, memory_planner)
-    result_files[kernel_rel] = _generate_kernel_wrapper(func, ptoas_cpp)
+    result_files[kernel_rel] = _generate_kernel_wrapper(
+        func, ptoas_cpp, prefetch_annotations=prefetch_annotations
+    )
 
 
 def _emit_group_output(
@@ -1500,6 +1706,7 @@ def _emit_group_output(
     skip_ptoas: bool,
     memory_planner: _passes.MemoryPlanner = _passes.MemoryPlanner.PYPTO,
     dump_ptoas_passes: bool = False,
+    prefetch_map: dict[str, list[PrefetchAnnotation]] | None = None,
 ) -> None:
     """Emit output files for one grouped MLIR module."""
     if skip_ptoas:
@@ -1518,8 +1725,10 @@ def _emit_group_output(
         ptoas_cpp = _compile_pto_module(pto_code, group_name, output_dir, memory_planner)
     group_uses_spmd = any(_uses_spmd_block_ops(f) for f in members)
     for func in members:
+        annotations = prefetch_map.get(func.name) if prefetch_map else None
         result_files[_get_kernel_output_path(func, "cpp")] = _generate_kernel_wrapper(
-            func, ptoas_cpp, group_uses_spmd=group_uses_spmd
+            func, ptoas_cpp, group_uses_spmd=group_uses_spmd,
+            prefetch_annotations=annotations,
         )
 
 
@@ -1582,6 +1791,7 @@ def _emit_unit(
     skip_ptoas: bool,
     memory_planner: _passes.MemoryPlanner = _passes.MemoryPlanner.PYPTO,
     dump_ptoas_passes: bool = False,
+    prefetch_map: dict[str, list[PrefetchAnnotation]] | None = None,
 ) -> _EmitResult:
     """Run ptoas + wrapper generation for one codegen unit.
 
@@ -1601,8 +1811,10 @@ def _emit_unit(
                 skip_ptoas,
                 memory_planner,
                 dump_ptoas_passes,
+                prefetch_map=prefetch_map,
             )
         else:
+            annotations = prefetch_map.get(unit.funcs[0].name) if prefetch_map else None
             _emit_single_function_output(
                 local_files,
                 unit.funcs[0],
@@ -1611,6 +1823,7 @@ def _emit_unit(
                 skip_ptoas,
                 memory_planner,
                 dump_ptoas_passes,
+                prefetch_annotations=annotations,
             )
         ptoas_record.end = time.perf_counter()
         return _EmitResult(name=unit.name, files=local_files, ptoas_record=ptoas_record)
@@ -1655,6 +1868,7 @@ def _run_ptoas_phase(
     errors: list[tuple[str, Exception]],
     memory_planner: _passes.MemoryPlanner = _passes.MemoryPlanner.PYPTO,
     dump_ptoas_passes: bool = False,
+    prefetch_map: dict[str, list[PrefetchAnnotation]] | None = None,
 ) -> None:
     """Phase 2: run ptoas for all codegen units, sequentially or in parallel."""
     max_workers = _get_max_workers()
@@ -1667,6 +1881,7 @@ def _run_ptoas_phase(
                 skip_ptoas,
                 memory_planner=memory_planner,
                 dump_ptoas_passes=dump_ptoas_passes,
+                prefetch_map=prefetch_map,
             )
             _collect_emit_result(result, unit, prof, result_files, errors)
     else:
@@ -1679,6 +1894,7 @@ def _run_ptoas_phase(
                     skip_ptoas,
                     memory_planner,
                     dump_ptoas_passes,
+                    prefetch_map,
                 )
                 for unit in units
             ]
@@ -2211,6 +2427,11 @@ def _generate_single_chip(
     # Each _emit_unit call runs the ptoas subprocess and generates the
     # kernel wrapper.  These are data-independent and subprocess-heavy, so
     # a thread pool gives real parallelism (subprocess.run releases the GIL).
+
+    # Collect L2 CMO prefetch annotations from the Orchestration function.
+    # These are forwarded to each InCore function's kernel_entry wrapper.
+    prefetch_map = _collect_cmo_prefetch_annotations(orch_func)
+
     _run_ptoas_phase(
         units,
         output_dir,
@@ -2220,6 +2441,7 @@ def _generate_single_chip(
         errors,
         memory_planner=memory_planner,
         dump_ptoas_passes=dump_ptoas_passes,
+        prefetch_map=prefetch_map,
     )
 
     # Orchestration + config
@@ -2249,6 +2471,7 @@ def _generate_single_chip(
                     func_name_to_external_source,
                     func_name_to_external_include_dirs,
                     enable_sdma=any(_uses_sdma_workspace(func) for func in emitted_incore_funcs),
+                    enable_cmo_prefetch=bool(prefetch_map),
                     runtime=runtime,
                 )
         except Exception as e:

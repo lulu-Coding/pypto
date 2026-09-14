@@ -2584,3 +2584,37 @@ def get_block_num(span: Span | None = None) -> Call:
     """
     actual_span = _get_span_or_capture(span)
     return _ir_core.create_op_call("tensor.get_block_num", [], {}, actual_span)
+
+
+def annotate_prefetch(
+    tensor: Expr,
+    offset: Expr,
+    size: Expr,
+    span: Span | None = None,
+) -> Call:
+    """Annotate a GM tensor for L2 cache prefetch via SHMEM CMO.
+
+    This is a metadata annotation op: it carries (tensor, offset, size) from
+    the DSL to the backend without generating any computation code in the
+    orchestration layer. The backend (pto_backend.py) scans Orchestration
+    functions for this op and injects ``aclshmemx_cmo_qp_nbi`` calls into
+    the ``kernel_entry`` wrapper of called InCore functions.
+
+    Effective on A5 (Ascend950) with SDMA engine enabled. Each AIV
+    prefetches its own data block using its own QP (qp_idx = block_idx).
+
+    Must appear in an Orchestration function, not inside an InCore function.
+
+    Args:
+        tensor: Source GM tensor to prefetch into L2 cache
+        offset: Byte offset within the tensor's device buffer
+        size: Number of bytes to prefetch
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression (void — annotation only, no return value)
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call(
+        "tensor.annotate_prefetch", [tensor, offset, size], {}, actual_span
+    )
