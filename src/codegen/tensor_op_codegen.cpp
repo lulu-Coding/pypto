@@ -614,12 +614,40 @@ REGISTER_ORCHESTRATION_OP(tensor_dim, ("tensor.dim")) {
 // L2 CMO prefetch annotation
 // ---------------------------------------------------------------------------
 
-// tensor.annotate_prefetch is a pure metadata op: it carries (tensor, offset,
-// size) from the DSL to pto_backend.py, which scans Orchestration functions
-// for this op and injects aclshmemx_cmo_qp_nbi calls into the kernel_entry
-// wrapper. In the orchestration C++ layer it generates NO code.
+// tensor.annotate_prefetch generates an aclrtCmoAsync call in the orchestration
+// C++ layer. This is a CANN native API (acl/acl_rt.h) — no SHMEM library
+// dependency. The prefetch runs on the AICPU stream before the InCore kernel
+// task is submitted, so the kernel's tile.load operations hit L2 cache.
+//
+// Args: (tensor, offset, size)
+//   tensor — must be an external tensor (orch_args.tensor(N).ref())
+//   offset — byte offset within the tensor's device buffer
+//   size   — bytes to prefetch into L2 cache
 REGISTER_ORCHESTRATION_OP(tensor_annotate_prefetch, ("tensor.annotate_prefetch")) {
-  return "";
+  INTERNAL_CHECK_SPAN(op->args_.size() == 3, op->span_)
+      << "tensor.annotate_prefetch requires 3 arguments (tensor, offset, size)";
+
+  std::string tensor_name = codegen.TryGetVarName(op->args_[0]);
+  CHECK(!tensor_name.empty()) << "tensor.annotate_prefetch: first argument must be a variable";
+  std::string tensor_ref = codegen.GetExternalTensorName(tensor_name);
+
+  std::string offset_expr = codegen.GenerateExprString(op->args_[1]);
+  std::string size_expr = codegen.GenerateExprString(op->args_[2]);
+
+  // Generate: aclrtCmoAsync((void*)((char*)ext_tensor.buffer.addr + offset),
+  //                          size, ACL_RT_CMO_TYPE_PREFETCH, nullptr);
+  // nullptr stream = use the current (default) stream.
+  // The prefetch is asynchronous; the subsequent rt_submit_*_task on the same
+  // stream will serialize after it, ensuring the prefetch completes before the
+  // kernel runs.
+  std::ostringstream oss;
+  oss << "aclrtCmoAsync("
+      << "reinterpret_cast<void*>("
+      << "reinterpret_cast<char*>(" << tensor_ref << ".buffer.addr) + (" << offset_expr << ")), "
+      << "static_cast<size_t>(" << size_expr << "), "
+      << "ACL_RT_CMO_TYPE_PREFETCH, "
+      << "nullptr);";
+  return oss.str();
 }
 
 }  // namespace codegen

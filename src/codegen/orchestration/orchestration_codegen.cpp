@@ -132,7 +132,8 @@ const char* ParamDirectionToRuntimeName(ParamDirection dir) {
 // Template / boilerplate generation helpers
 // ---------------------------------------------------------------------------
 
-std::string GenerateIncludes(bool include_optional, bool include_vector = false) {
+std::string GenerateIncludes(bool include_optional, bool include_vector = false,
+                              bool include_acl_rt = false) {
   std::ostringstream oss;
   oss << "#include <stddef.h>\n";
   oss << "#include <stdint.h>\n";
@@ -142,6 +143,9 @@ std::string GenerateIncludes(bool include_optional, bool include_vector = false)
   }
   if (include_optional) {
     oss << "#include <optional>\n";
+  }
+  if (include_acl_rt) {
+    oss << "#include <acl/acl_rt.h>\n";
   }
   oss << "\n";
   oss << "#include \"orchestration_api.h\"\n";
@@ -334,6 +338,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
 
   void SetEffectiveUses(std::unordered_set<const Var*> uses) { effective_uses_ = std::move(uses); }
   [[nodiscard]] bool NeedsVectorInclude() const { return needs_vector_include_; }
+  [[nodiscard]] bool NeedsAclRtInclude() const { return needs_acl_rt_include_; }
 
   void PrepareCrossScopeTaskIdHoists(const StmtPtr& body) {
     struct ScopeInfo {
@@ -2252,6 +2257,11 @@ class OrchestrationStmtCodegen : public CodegenBase {
     current_result_var_ = emit_var;
 
     std::string gen_code = (*codegen_func)(call, *this);
+
+    // aclrtCmoAsync (from tensor.annotate_prefetch) requires <acl/acl_rt.h>.
+    if (IsOp(call, "tensor.annotate_prefetch")) {
+      needs_acl_rt_include_ = true;
+    }
 
     std::istringstream iss(gen_code);
     std::string line;
@@ -4524,6 +4534,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
   std::unordered_map<const Var*, ArrayPhiBinding> pending_array_phis_;
   std::unordered_map<const Var*, DynamicTaskIdCollection> dynamic_task_id_collections_;
   bool needs_vector_include_ = false;
+  bool needs_acl_rt_include_ = false;
   /// Names of mutable Tensor values declared in each generated C++ block.
   /// Tuple-output alias emission must avoid redeclaring names already declared
   /// in the same block, but must not treat outer-block declarations as aliases:
@@ -4874,7 +4885,8 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
   stmt_codegen.SetInitialIndent(4);
   stmt_codegen.VisitStmt(func->body_);
 
-  oss << GenerateIncludes(false, stmt_codegen.NeedsVectorInclude());
+  oss << GenerateIncludes(false, stmt_codegen.NeedsVectorInclude(),
+                           stmt_codegen.NeedsAclRtInclude());
 
   oss << "extern \"C\" {\n\n";
 

@@ -850,55 +850,15 @@ def _generate_cmo_setup(
 ) -> str:
     """Generate the CMO prefetch C++ snippet for kernel_entry wrapper.
 
-    Only injects CMO calls for AIV (VECTOR) functions — CMO is an AIV-only
-    operation on A5. CUBE (AIC) functions skip injection.
+    This function is now a no-op — CMO prefetch is handled entirely in the
+    orchestration C++ layer via aclrtCmoAsync (CANN native API, no SHMEM
+    dependency). The prefetch runs on the AICPU stream before the InCore
+    kernel task is submitted.
 
-    Uses ``__pypto_spmd_block_idx`` as ``qp_idx`` (requires SPMD args setup)
-    and a literal ``0`` as ``sync_id`` (avoiding ``EVENT_ID0`` macro dependency).
+    Kept as a placeholder for potential future device-side CMO injection
+    (e.g. when SHMEM aclshmemx_cmo_qp_nbi is available).
     """
-    if not prefetch_annotations:
-        return ""
-
-    # CMO is AIV-only — skip for CUBE kernels
-    core_type = _codegen_core.infer_function_core_type(func)
-    if core_type != _ir_core.CoreType.VECTOR:
-        return ""
-
-    # Build tensor param name list (tensors-first order, matching _generate_arg_unpacking)
-    tensor_params = [p for p in func.params if isinstance(p.type, _ir_core.TensorType)]
-    if not tensor_params:
-        return ""
-
-    lines = [
-        "    // --- L2 CMO prefetch (A5 SHMEM) ---",
-        "    {",
-        "        constexpr uint32_t __cmo_ub_offset = 1024;",
-        "        constexpr uint32_t __cmo_ub_size = 64;",
-        "        __ubuf__ uint8_t* __cmo_tmp = "
-        "reinterpret_cast<__ubuf__ uint8_t*>(uint64_t(__cmo_ub_offset));",
-    ]
-
-    for param_idx, offset_expr, size_expr in prefetch_annotations:
-        if param_idx >= len(tensor_params):
-            continue
-        param_name = tensor_params[param_idx].name_hint
-        lines.append(f"        // Prefetch tensor param {param_idx}: {param_name}")
-        lines.append(
-            f"        aclshmemx_cmo_qp_nbi("
-            f"reinterpret_cast<__gm__ uint8_t*>({param_name}) + ({offset_expr}), "
-            f"static_cast<uint32_t>({size_expr}), "
-            f"ACLSHMEMCMOTYPE::CMO_TYPE_PREFETCH, "
-            f"__cmo_tmp, __cmo_ub_size, "
-            f"static_cast<uint32_t>(__pypto_spmd_block_idx), 0);"
-        )
-
-    lines.append(
-        "        aclshmemx_sdma_qp_quiet(__cmo_tmp, __cmo_ub_size, "
-        "static_cast<uint32_t>(__pypto_spmd_block_idx), 0);"
-    )
-    lines.append("    }")
-
-    return "\n".join(lines) + "\n\n"
+    return ""
 
 
 def _requires_dual_aiv_dispatch(func: _ir_core.Function) -> bool:
@@ -1151,10 +1111,11 @@ def _generate_kernel_header(
     spmd_override = '#include "intrinsic.h"\n' if needs_intrinsic else ""
     deferred_completion_include = _DEFERRED_COMPLETION_INCLUDE if uses_deferred_completion else ""
 
-    # CMO prefetch requires SHMEM headers for aclshmemx_cmo_qp_nbi / aclshmemx_sdma_qp_quiet
-    cmo_include = (
-        '#include "shmem.h"\n#include "kernel_operator.h"\n' if has_cmo_prefetch else ""
-    )
+    # CMO prefetch is now handled in the orchestration C++ layer via
+    # aclrtCmoAsync (CANN native API). No SHMEM headers needed in the
+    # kernel wrapper — the prefetch runs on the AICPU stream, not in the
+    # device kernel.
+    cmo_include = ""
 
     return _KERNEL_HEADER.format(
         func_name=func.name,
