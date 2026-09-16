@@ -9,6 +9,7 @@
 > （已验证的 SHMEM-free 参考实现，48 流）
 > **关联文档**：
 > - `a5-shmem-prefetch-extraction.md` —— SHMEM **仓内**实现提取（含 SHMEM API 依赖面，本文的输入）
+> - `a5-cmo-prefetch-demos.md` —— 三条链路的**最小可编译 C++ demo 程序**（本文的代码化落地）
 > - `shmem-prefetch-pypto-integration.md` —— PyPTO 前端语义设计（`pl.prefetch.*` / `host_async`）
 > - `a5-sdma-prefetch-minimal-guide.md` —— pypto/simpler/pto-isa 三仓使能指南
 > - `stars-v2-cmo-direct-drive-guide.md` —— 早期直驱方案（wrapper 注入路线已被正式 IR op 取代，
