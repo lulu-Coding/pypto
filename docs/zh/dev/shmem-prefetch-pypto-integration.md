@@ -3,7 +3,7 @@
 > **状态**：设计提案（RFC）
 > **日期**：2026-09-16
 > **目标设备**：Ascend950（A5）/ Ascend910B（A2A3）
-> **关联文档**：`docs/zh/dev/l2-buffer-managed-design.md`（L2Buffer RFC）、`docs/zh/dev/l2-buffer-a5-cmo-path.md`（早期路径选型）、`docs/zh/dev/a5-sdma-prefetch-minimal-guide.md`（A5 使能最小方案）
+> **关联文档**：`docs/zh/dev/l2-buffer-managed-design.md`（L2Buffer RFC）、`docs/zh/dev/l2-buffer-a5-cmo-path.md`（早期路径选型）、`docs/zh/dev/a5-sdma-prefetch-minimal-guide.md`（A5 使能最小方案）、`docs/zh/dev/a5-cmo-prefetch-shmem-free-minimal-impl.md`（SHMEM-free 底层最小实现与时序图）
 > **来源**：SHMEM PR #459（A5 CMO/SDMA）完整链路提取分析，详见 `docs/zh/dev/a5-shmem-prefetch-extraction.md`（三条通路接口、调用栈、SQE 字段、供给链与最小可用程序）
 
 ---

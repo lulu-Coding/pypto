@@ -4,6 +4,11 @@
 源码基线：`https://atomgit.com/cann/shmem` master @ `73064fa`（CMO 适配 PR #459 已合入）
 分析范围：A5/Ascend950（编译宏 `__NPU_ARCH__ == 3510`，arch 族 dav-3510 / dav-c310）的 L2 预取（prefetch）能力——三条路径的完整接口、调用栈、底层机制、环境准备与最小可用程序。
 
+> 📌 **定位说明（重要）**：本文是"SHMEM **仓内**实现的提取"，其中 host 初始化与设备 API
+> 均依赖 `libshmem.so`。若你需要的是**脱离 SHMEM、仅依赖底层 ACL/Runtime 接口**的最小实现
+> （含时序图/流程图），请看 `a5-cmo-prefetch-shmem-free-minimal-impl.md`——该文档把本文
+> §4 的供给链与 §6 的设备调用栈重建为 SHMEM-free 版本，并给出依赖对照表。
+
 > ⚠️ 关于 "arc type 3150"：SHMEM 源码中 A5 的门控宏是 **`__NPU_ARCH__ == 3510`**（见 `src/device/gm2gm/engine/shmemi_device_sdma.h:139`），编译 flag 为 `--cce-aicore-arch=dav-c310`（族名 c310）。若你的环境某处报 "3150"，指的应是同一代 Ascend950（c310 族 → `__NPU_ARCH__=3510`），本文统一以 **3510/dav-c310** 表述。
 
 ---
