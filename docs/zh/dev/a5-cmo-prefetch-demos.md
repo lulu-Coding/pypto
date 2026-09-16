@@ -3,15 +3,19 @@
 > **状态**：可编译示例（demo）
 > **日期**：2026-09-16
 > **目标**：为三条 GM→L2 预取链路各给出一个**最小可编译 C++ 程序**，完整展现接口调用过程。
-> 全部 demo **不依赖 libshmem.so**——只使用 ACL 公开 API + dlsym 符号 + AICPU 算子 + 设备侧
-> AscendC 原语。
+> 全部 demo **不依赖 libshmem.so，也不依赖 Ascend C API（不包含 kernel_operator.h）**——
+> host 侧只使用 ACL 公开 API + dlsym 符号 + AICPU 算子；设备侧只使用 ccec/bisheng
+> **编译器原生层**（地址空间修饰、启动扩展、隐式内置函数与平台宏，清单见 §0.1）。
 > **环境**：Ascend950（`__NPU_ARCH__=3510`）、CANN ≥ 9.1.0（toolkit + cann-950-ops-legacy 同装）、
 > ccec（`--cce-aicore-arch=dav-c310`）或 bisheng（`--npu-arch=dav-3510`）
 > **关联文档**：`a5-cmo-prefetch-shmem-free-minimal-impl.md`（接口清单 + 时序图/流程图）；
 > `a5-shmem-prefetch-extraction.md`（SHMEM 仓内提取，字段级出处）
 > **事实基准**：SQE 字段与初始化 = SHMEM PR #459 字节级对照 + pto-isa
 > `fix/a5-stars-v2-sqe-init`（全字段显式初始化修复）；host 供给 = pto-isa
-> `SdmaWorkspaceManager`（已验证编译）；quiet = pto-isa postId 机制（MTE2 轮询，免 DCCI）
+> `SdmaWorkspaceManager`（已验证编译）；quiet = pto-isa postId 机制；设备侧原生内置函数
+> 惯用法 = pto-isa `hns_1825_backend.hpp`（A5 后端，**零 CANN 头编译**）+ pto-isa
+> `include/pto/common/debug.h`（零 include 裸用 `trap()`/`cce::printf`）+ SHMEM
+> `examples/cmo`（门控/启动惯例：950 每 block 1 AIC + 2 AIV，`get_block_idx()`=全局 AIV 序号）
 
 ---
 
@@ -19,11 +23,11 @@
 
 | 文件 | 链路 | 角色 |
 |---|---|---|
-| `cmo_device.hpp` | B/C 公共 | 设备侧直驱：64B SQE 结构体 + `cmo_prefetch_nbi` / `cmo_quiet` 内联函数 |
+| `cmo_device.hpp` | B/C 公共 | 设备侧直驱：64B SQE 结构体 + `cmo_prefetch_nbi` / `cmo_quiet` 内联函数（**仅编译器原生内置函数，无 Ascend C**） |
 | `sdma_provision.hpp` | B/C 公共 | host 供给链五步（dlsym → STARS 流 → workspace → H2D → AICPU StarsQuery） |
 | `demo_a.cpp` | **A：host 流序** | 单文件，无供给链：`aclrtCmoAsync` 一次调用 |
 | `demo_b.cpp` | **B：设备 QP0** | 供给 1 通道；单 AIV 内填 SQE + 鸣铃 + quiet |
-| `demo_c.cpp` | **C：设备多 QP** | 供给 4 通道；每 AIV 用 `qp_idx = GetBlockIdx()` 独立通道并发预取 |
+| `demo_c.cpp` | **C：设备多 QP** | 供给 4 通道；每 AIV 用 `qp_idx = get_block_idx()` 独立通道并发预取 |
 
 三条链路的接口调用要点（对应上一份文档的时序图 2/3）：
 
@@ -31,30 +35,62 @@
 A:  aclrtCmoAsync(buf, bytes, ACL_RT_CMO_TYPE_PREFETCH, stream)   ← 全部
 B:  [供给链5步] → kernel(AIV0): cmo_prefetch_nbi(ws,src,bytes,0) + cmo_quiet(ws,0)
 C:  [供给链5步] → kernel(每AIV): cmo_prefetch_nbi(ws,my_slice,bytes,qp_idx) + cmo_quiet(ws,qp_idx)
-                                qp_idx = GetBlockIdx()
+                                qp_idx = get_block_idx()
 ```
+
+### 0.1 设备侧依赖面 —— 编译器原生层清单（零 CANN 头）
+
+B/C 链路的设备代码**不包含任何 CANN 头文件**（仅 `<cstdint>`），全部依赖由 ccec/bisheng
+设备编译**隐式提供**（语言扩展 + 内置函数 + 平台宏），**不属于 Ascend C API 库**
+（无需 `kernel_operator.h`）：
+
+| 原生接口 | 作用 | 出处 / 已验证先例 |
+|---|---|---|
+| `__gm__` / `__ubuf__` | GM / UB 地址空间修饰 | 语言扩展 |
+| `__global__ __aicore__` + `GM_ADDR` + `<<<blocks, nullptr, stream>>>` | kernel 入口与启动 | 语言扩展 |
+| `set_flag(p0, p1, id)` / `wait_flag(p0, p1, id)` | 管线事件同步（S↔MTE3 等） | SHMEM 测试内核、pto-isa 内核均裸用 |
+| `copy_ubuf_to_gm_align_v2(gm, ub, 0, 1, size, 0, 0, 0)` | MTE3 UB→GM 拷贝（4B/64B） | pto-isa `hns_1825_backend.hpp`（A5，零 CANN 头） |
+| `dcci(ptr, SINGLE_CACHE_LINE)` | cache line 清理并失效 | pto-isa A5 内核（`ready_queue.hpp` / `moe_*` 等） |
+| `ld_dev(ptr, 0)` / `st_dev(v, ptr, 0)` | 旁路标量 L1 的 GM 读/写 | pto-isa `hns_1825_backend.hpp`（A5，轮询 NIC 更新的队列索引） |
+| `get_block_idx()` | 全局 AIV 编号（QP 定位） | pto-isa 内核（`get_block_idx() % mIter` 等） |
+| `ASCEND_IS_NOT_AIV` / `ASCEND_IS_AIV` | 混合启动门控（AIC 直接返回） | SHMEM `examples/cmo`、pto-isa A5 内核 |
+| `PIPE_S` / `PIPE_MTE2` / `PIPE_MTE3` / `PIPE_ALL`、`EVENT_ID0` | 管线与事件常量 | 同上 |
+| `trap()` / `cce::printf` | 超时 abort / 设备侧打印 | pto-isa `include/pto/common/debug.h`（零 include） |
+
+> 注 1：`AscendC::GetSystemCycle()` **不在**原生层（由 `kernel_operator_sys_var_intf.h` 声明，
+> 属 API 层）——demo 的 quiet 超时因此改用轮询次数预算。
+> 注 2：`ASCEND_IS_NOT_AIV` 为平台宏（无命名空间、非 API 对象），SHMEM 官方 CMO 示例与
+> pto-isa A5 内核均裸用；950 上每个启动 block 为 1 AIC + 2 AIV 混合核组，AIC 不得触碰
+> STARS 队列，故该门控是语义必需。
 
 ---
 
-## 1. `cmo_device.hpp` —— 设备侧直驱（B/C 公共）
+## 1. `cmo_device.hpp` —— 设备侧直驱（B/C 公共，仅编译器原生内置函数）
 
 ```cpp
-// cmo_device.hpp — A5 (Ascend950) STARS v2 CMO prefetch, SHMEM-free device side.
+// cmo_device.hpp — A5 (Ascend950) STARS v2 CMO prefetch. SHMEM-free AND
+// Ascend-C-free: no libshmem, no kernel_operator.h — the device side uses only
+// the compiler-native layer that ccec/bisheng provide implicitly for device
+// compilation (inventory in §0.1):
+//   language extensions : __gm__/__ubuf__, __global__/__aicore__, GM_ADDR, <<<>>>
+//   implicit builtins   : set_flag / wait_flag, copy_ubuf_to_gm_align_v2,
+//                         dcci, ld_dev / st_dev, get_block_idx, trap, cce::printf
+//   platform macros     : ASCEND_IS_NOT_AIV, PIPE_S/PIPE_MTE3/PIPE_ALL,
+//                         EVENT_ID0, SINGLE_CACHE_LINE
 // Field layout mirrors SHMEM PR #459 (byte-verified); full-field SQE
-// initialization mirrors pto-isa fix/a5-stars-v2-sqe-init.
+// initialization mirrors pto-isa fix/a5-stars-v2-sqe-init. The raw-builtin
+// idioms mirror pto-isa hns_1825_backend.hpp (A5 backend that compiles with
+// no CANN include) and include/pto/common/debug.h (bare trap()/cce::printf).
 #ifndef CMO_DEMO_DEVICE_HPP
 #define CMO_DEMO_DEVICE_HPP
 
 #include <cstdint>
-#include "kernel_operator.h"
 
 #if !defined(__NPU_ARCH__) || (__NPU_ARCH__ != 3510)
 #error "This demo targets Ascend950 (__NPU_ARCH__=3510, --cce-aicore-arch=dav-c310)"
 #endif
 
 namespace cmo_demo {
-
-using namespace AscendC;
 
 // ---- constants (STARS v2 / A5) ----
 constexpr uint8_t  kSqeTypeSdma        = 11;    // RT_STARS_SQE_TYPE_SDMA
@@ -64,7 +100,7 @@ constexpr uint32_t kDoorbellOffset     = 0x0;   // STARS v2 (A5); v1/A2A3 uses 0
 constexpr uint32_t kSqeBytes           = 64;
 constexpr uint32_t kUbScratchOffset    = 1024;  // 64B-aligned UB scratch, >= 64B
 constexpr uint32_t kFlagRegionOffset   = 8192;  // any 64B-aligned free area in the workspace
-constexpr uint64_t kQuietTimeoutCycles = 60ULL * 1000 * 1000 * 1000;  // 1000 cycles/us -> 60s
+constexpr uint32_t kQuietPollLimit     = 100000000U;  // poll budget (~tens of seconds); SHMEM uses a 60 s cycle deadline
 
 // ---- workspace structures (SHMEM-compatible layout) ----
 struct StarsChannelFlagInfo {   // workspace + 0x0, 64B (filled by the AICPU op)
@@ -160,40 +196,41 @@ static __aicore__ inline __gm__ uint8_t* flag_slot(__gm__ uint8_t* ws, uint32_t 
     return ws + kFlagRegionOffset + 64ull * qp_idx;
 }
 
-// ---- UB scratch (64B, 64B-aligned, at UB offset 1024) ----
+// ---- UB scratch (64B, 64B-aligned, at UB offset 1024 — the same offset
+//      SHMEM's cmo example uses for its tmp buffer) ----
 static __aicore__ inline __ubuf__ uint8_t* ub_scratch() {
     return reinterpret_cast<__ubuf__ uint8_t*>(uint64_t(kUbScratchOffset));
 }
 
-// ---- 4B GM store through MTE3 (SHMEM aclshmemi_set_value idiom) ----
-static __aicore__ inline void set_value_u32(__gm__ uint32_t* dst, uint32_t v) {
-    LocalTensor<uint32_t> tmp{VECOUT, ub_scratch(), kSqeBytes};
-    tmp.SetValue(0, v);
-    SetFlag<HardEvent::S_MTE3>();
-    GlobalTensor<uint32_t> g;
-    g.SetGlobalBuffer(dst);
-    DataCopyPad(g, tmp, {1, 4, 0, 0, false});
-    WaitFlag<HardEvent::MTE3_S>();
+// ---- 4B GM store through MTE3 (raw form of SHMEM aclshmemi_set_value /
+//      pto-isa WriteUbToGmWithSync): the S->MTE3 pair orders the scalar UB
+//      write before the copy, the MTE3->S pair orders the copy before any
+//      later scalar work. MTE3 writes bypass the AIV data cache, so the value
+//      lands in L2 for the SDMA engine / doorbell register. ----
+static __aicore__ inline void store_u32_gm(__gm__ uint32_t* dst, uint32_t v) {
+    __ubuf__ uint32_t* tmp = reinterpret_cast<__ubuf__ uint32_t*>(ub_scratch());
+    *tmp = v;
+    set_flag(PIPE_S, PIPE_MTE3, EVENT_ID0);
+    wait_flag(PIPE_S, PIPE_MTE3, EVENT_ID0);
+    copy_ubuf_to_gm_align_v2(dst, tmp, 0, 1, sizeof(uint32_t), 0, 0, 0);
+    set_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
+    wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
 }
 
-// ---- 8B GM load through MTE2 (pto-isa GetValue idiom: MTE2 reads bypass the
-//      AIV scalar L1, so no DCCI is needed on the polling path) ----
-static __aicore__ inline uint64_t load_u64(__gm__ uint64_t* src) {
-    LocalTensor<uint64_t> tmp{VECIN, ub_scratch(), kSqeBytes};
-    GlobalTensor<uint64_t> g;
-    g.SetGlobalBuffer(src);
-    DataCopyPad(tmp, g, {1, 8, 0, 0, 0, 0, false});
-    PipeBarrier<PIPE_ALL>();
-    return tmp.GetValue(0);
+// ---- cache-bypass scalar GM load (pto-isa hns_1825 ReadU32Gm idiom, used
+//      there on A5 to poll queue indices written by the NIC): ld_dev skips
+//      the AIV scalar L1, so read paths need no DCCI at all. ----
+static __aicore__ inline uint32_t load_u32_gm(__gm__ uint32_t* src) {
+    return ld_dev(src, 0);
 }
 
 // ---- DCCI: clean & invalidate the cache lines covering [addr, addr + bytes).
-//      A single line covers the whole 64B channel_info, so one call at +4 also
-//      refreshes sq_head (offset 0). ----
+//      Raw form dcci(ptr, SINGLE_CACHE_LINE) as in pto-isa A5 kernels. A
+//      single line covers the whole 64B channel_info. ----
 static __aicore__ inline void dcci_range(__gm__ void* addr, uint32_t bytes) {
     __gm__ uint8_t* p = reinterpret_cast<__gm__ uint8_t*>(addr);
     for (uint32_t off = 0; off < bytes; off += 64) {
-        DataCacheCleanAndInvalid<uint8_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(p + off);
+        dcci(reinterpret_cast<__gm__ void*>(p + off), SINGLE_CACHE_LINE);
     }
 }
 
@@ -206,12 +243,14 @@ static __aicore__ inline void submit_sqe(
 {
     __gm__ StarsChannelInfo* ci = channel_at(ws, qp_idx);
 
-    // 1. read a fresh sq_tail (invalidate the line first: scalar L1 may be stale)
-    dcci_range(reinterpret_cast<__gm__ uint8_t*>(ci) + 4, 4);
-    const uint32_t sq_tail = ci->sq_tail;
+    // 1. fresh sq_tail / sq_head (ld_dev bypasses the scalar L1 — no DCCI needed)
+    const uint32_t sq_tail = load_u32_gm(reinterpret_cast<__gm__ uint32_t*>(reinterpret_cast<__gm__ uint8_t*>(ci) + 4));
+    const uint32_t sq_head = load_u32_gm(reinterpret_cast<__gm__ uint32_t*>(ci));
 
-    // 2. fully initialize the SQE — SQ ring memory is unspecified, every
-    //    hardware-parsed field must be written (fix/a5-stars-v2-sqe-init)
+    // 2. fully initialize the SQE with plain scalar GM stores (the same way
+    //    SHMEM aclshmemi_fill_stars_v2_cmo_sqe writes it) — SQ ring memory is
+    //    unspecified, every hardware-parsed field must be written
+    //    (fix/a5-stars-v2-sqe-init)
     __gm__ StarsV2Sqe* sqe =
         reinterpret_cast<__gm__ StarsV2Sqe*>(ci->sq_base) + (sq_tail % ci->sq_depth);
     *sqe = StarsV2Sqe{};
@@ -219,7 +258,7 @@ static __aicore__ inline void submit_sqe(
     sqe->wr_cqe        = 1;
     sqe->num_blocks    = 0;
     sqe->rt_streamid   = static_cast<uint16_t>(ci->stream_id);
-    sqe->task_id       = static_cast<uint16_t>(sq_tail - ci->sq_head);
+    sqe->task_id       = static_cast<uint16_t>(sq_tail - sq_head);
     sqe->kernel_credit = kKernelCredit;
     sqe->opcode        = opcode;
     sqe->sssv = 1; sqe->dssv = 1; sqe->sns = 1; sqe->dns = 1;
@@ -237,8 +276,8 @@ static __aicore__ inline void submit_sqe(
 
     // 4. advance the tail; ring the doorbell register and mirror the tail
     const uint32_t next = (sq_tail + 1) % ci->sq_depth;
-    set_value_u32(reinterpret_cast<__gm__ uint32_t*>(ci->sq_reg_base + kDoorbellOffset), next);
-    set_value_u32(reinterpret_cast<__gm__ uint32_t*>(reinterpret_cast<__gm__ uint8_t*>(ci) + 4), next);
+    store_u32_gm(reinterpret_cast<__gm__ uint32_t*>(ci->sq_reg_base + kDoorbellOffset), next);
+    store_u32_gm(reinterpret_cast<__gm__ uint32_t*>(reinterpret_cast<__gm__ uint8_t*>(ci) + 4), next);
 }
 
 // ---- CMO prefetch (non-blocking; pair with cmo_quiet on the same channel) ----
@@ -251,31 +290,36 @@ static __aicore__ inline void cmo_prefetch_nbi(
 // ---- quiet: wait until all previously submitted SQEs on qp_idx have drained.
 //      Two-slot postId scheme (pto-isa): arm send=1, submit an 8B SDMA copy
 //      send -> done queued AFTER the data SQEs (its landing proves the queue
-//      drained), poll done through MTE2, then reset both slots. ----
+//      drained), poll done through the cache-bypass load, then reset both
+//      slots. SHMEM arms a 4B value against the 8B copy — the upper word
+//      stays 0 forever, so polling the low word is sufficient. ----
 static __aicore__ inline void cmo_quiet(__gm__ uint8_t* ws, uint32_t qp_idx)
 {
     __gm__ uint8_t* slot = flag_slot(ws, qp_idx);
-    __gm__ uint64_t* send = reinterpret_cast<__gm__ uint64_t*>(slot);
-    __gm__ uint64_t* done = reinterpret_cast<__gm__ uint64_t*>(slot + 32);
+    __gm__ uint32_t* send = reinterpret_cast<__gm__ uint32_t*>(slot);        // low word of the u64 slot
+    __gm__ uint32_t* done = reinterpret_cast<__gm__ uint32_t*>(slot + 32);   // low word of the u64 slot
 
     // 1. arm the flag (through MTE3 so it lands in L2 for the SDMA engine)
-    set_value_u32(reinterpret_cast<__gm__ uint32_t*>(slot), 1u);
+    store_u32_gm(send, 1u);
 
-    // 2. queue the flag SQE after the data SQEs
-    submit_sqe(ws, qp_idx, send, done, 8, /*opcode=*/0);
+    // 2. queue the 8B flag SQE after the data SQEs
+    submit_sqe(ws, qp_idx, slot, slot + 32, 8, /*opcode=*/0);
 
-    // 3. poll the done slot until non-zero
-    const uint64_t deadline = GetSystemCycle() + kQuietTimeoutCycles;
-    while (load_u64(done) == 0) {
-        if (GetSystemCycle() > deadline) {
-            AscendC::printf("cmo_quiet: timeout on channel %u\n", qp_idx);
-            trap();  // SHMEM aclshmemi_kernel_abort: printf + trap
-        }
+    // 3. poll the done slot until non-zero. A poll-count budget replaces
+    //    SHMEM's 60 s cycle deadline because GetSystemCycle() is an AscendC
+    //    API (kernel_operator_sys_var_intf.h), not a native builtin.
+    uint32_t v = 0;
+    for (uint32_t i = 0; i < kQuietPollLimit && v == 0; ++i) {
+        v = load_u32_gm(done);
+    }
+    if (v == 0) {
+        cce::printf("cmo_quiet: timeout on channel %u\n", qp_idx);  // native builtin (pto-isa debug.h)
+        trap();                                                     // SHMEM aclshmemi_kernel_abort ends in trap()
     }
 
     // 4. reset both slots for the next round
-    set_value_u32(reinterpret_cast<__gm__ uint32_t*>(slot), 0u);
-    set_value_u32(reinterpret_cast<__gm__ uint32_t*>(slot + 32), 0u);
+    store_u32_gm(send, 0u);
+    store_u32_gm(done, 0u);
 }
 
 }  // namespace cmo_demo
@@ -645,8 +689,8 @@ int main() {
 
 // ---------------- device kernel ----------------
 __global__ __aicore__ void prefetch_qp0(GM_ADDR ws, GM_ADDR src, uint32_t bytes) {
-    if (ASCEND_IS_NOT_AIV) { return; }            // CMO executes on AIV only
-    if (AscendC::GetBlockIdx() != 0) { return; }  // QP0 interfaces: AIV 0 only
+    if (ASCEND_IS_NOT_AIV) { return; }     // mixed block: AIC lanes stay out (CMO is AIV-only)
+    if (get_block_idx() != 0) { return; }  // QP0 interfaces: AIV 0 only
     __gm__ uint8_t* ws_gm = reinterpret_cast<__gm__ uint8_t*>(ws);
     cmo_demo::cmo_prefetch_nbi(ws_gm, reinterpret_cast<__gm__ void*>(src), bytes, /*qp_idx=*/0);
     cmo_demo::cmo_quiet(ws_gm, /*qp_idx=*/0);
@@ -700,9 +744,9 @@ int main() {
 
 ```cpp
 // demo_c.cpp — Path C: every AIV prefetches its own slice on its own QP.
-// qp_idx = GetBlockIdx() — the global AIV index selects the channel, exactly
-// the semantics SHMEM measured as optimal and pto-isa implements as
-// kAutoChannelGroupIdx -> get_block_idx().
+// qp_idx = get_block_idx() — the global AIV index selects the channel, exactly
+// the semantics SHMEM measured as optimal (AscendC::GetBlockIdx) and pto-isa
+// implements as kAutoChannelGroupIdx -> get_block_idx().
 #include "cmo_device.hpp"
 #include "sdma_provision.hpp"
 #include "acl/acl.h"
@@ -721,7 +765,7 @@ int main() {
 __global__ __aicore__ void prefetch_per_aiv(
     GM_ADDR ws, GM_ADDR src, uint32_t bytes_per_aiv, uint32_t qp_num) {
     if (ASCEND_IS_NOT_AIV) { return; }
-    const uint32_t qp_idx = AscendC::GetBlockIdx();  // global AIV index == QP index
+    const uint32_t qp_idx = get_block_idx();  // global AIV index == QP index
     if (qp_idx >= qp_num) { return; }
     __gm__ uint8_t* ws_gm = reinterpret_cast<__gm__ uint8_t*>(ws);
     __gm__ uint8_t* my_slice =
@@ -813,8 +857,15 @@ ccec $COMMON_FLAGS --cce-fatobj-link demo_c.cpp \
     -L$ASCEND_HOME_PATH/lib64 -lascendcl -lnnopbase -ldl -o demo_c
 ```
 
-要点：`-cce-aicore-dcci-insert-for-scalar=false` 必须保留——设备侧自管 DCCI，
-编译器重复插入会破坏 SQE/tail 的一致性时序（SHMEM 构建同为该组合）。
+要点：
+- `-cce-aicore-dcci-insert-for-scalar=false` 必须保留——设备侧自管 DCCI，编译器重复插入
+  会破坏 SQE/tail 的一致性时序（SHMEM 构建同为该组合）。
+- 设备代码**不包含任何 CANN 头**（`kernel_operator.h` 也不需要）：`set_flag`/`wait_flag`/
+  `copy_ubuf_to_gm_align_v2`/`dcci`/`ld_dev`/`st_dev`/`get_block_idx`/`trap`/`cce::printf`
+  与 `PIPE_*`/`EVENT_ID0`/`SINGLE_CACHE_LINE`/`ASCEND_IS_NOT_AIV` 均由 ccec/bisheng 设备编译
+  隐式提供（pto-isa `hns_1825_backend.hpp` 与 `include/pto/common/debug.h` 即零 CANN 头裸用
+  的先例，见 §0.1）。若现场编译器版本未隐式提供其中某个名字，补包含对应编译器平台头即可，
+  demo 逻辑不变。
 
 ### 6.3 运行与预期输出
 
@@ -845,14 +896,15 @@ ccec $COMMON_FLAGS --cce-fatobj-link demo_c.cpp \
 
 | 简化 | 参考实现的做法 | 影响 |
 |---|---|---|
-| 每次 submit 都 `dcci + 读 GM tail` | pto-isa 在 session 建立时读一次，之后 tail 保存在寄存器（`PersistSqTails` 回写） | demo 语义等价、性能略低，逻辑更直观 |
+| 每次 submit 都 `ld_dev` 重读 GM tail/head | pto-isa 在 session 建立时读一次，之后 tail 保存在寄存器（`PersistSqTails` 回写） | demo 语义等价、性能略低，逻辑更直观 |
 | quiet 用双槽 postId（send/done 各一个 u64） | SHMEM 三段 flag 区（send→remote_recv→recv）+ notify_ids；pto-isa 用 64 深度 flag payload 环 | demo 机制等价（flag SQE 排在数据 SQE 之后落地即证明排空），不支持并发多 post |
+| quiet 轮询/超时：`ld_dev` 低字轮询 + 次数预算 `kQuietPollLimit` | SHMEM：`copy_gm_to_gm` + DCCI + volatile 回读，`GetSystemCycle()` 60 s 周期限额（A5：1000 cycles/µs）；pto-isa sdma：MTE2 搬运回读 | 机制等价（都绕开标量 L1）；`GetSystemCycle` 属 Ascend C API 层、无已验证的 A5 原生等价物，demo 用轮询预算规避 |
+| 超时路径 `cce::printf` + `trap()` | SHMEM `aclshmemi_kernel_abort` = `AscendC::printf` + `trap()`（`shmemi_kernel_debug.h`） | 两者皆为编译器原生（pto-isa `debug.h` 零 include 裸用先例） |
 | 供给失败直接清理 | pto-isa 在错误态卡上宁可泄漏部分资源也不析构（析构可能挂死） | demo 假设正常卡；现场排障若见挂死，参考 pto-isa 策略 |
 | 单 device 单进程 | SHMEM 多 PE（对称堆/barrier） | 预取不需要对称性，任意 `aclrtMalloc` 的 GM 地址皆可 |
 | `MakeU64Tensor` 成功后泄漏 backing buffer | pto-isa 用 TensorGuard 严格释放 | demo 短生命周期，进程退出回收 |
-| 同步原语签名 | `DataCopyPad`/`SetFlag`/`WaitFlag`/`DataCacheCleanAndInvalid`/`PipeBarrier` 的模板参数与参数结构随 CANN 版本略有差异 | 以现场 `$ASCEND_HOME_PATH/include` 的 `kernel_operator.h` 签名为准；本文形式与 SHMEM 示例一致 |
+| 原生内置函数签名 | 设备侧用编译器原生层（`set_flag`/`wait_flag`/`copy_ubuf_to_gm_align_v2`/`dcci`/`ld_dev`），签名与常量随编译器版本和架构有差异（如 a2a3 为 7 参 `copy_gm_to_ubuf`，A5 为 `_align_v2` 变体） | 本文形式逐字取自 pto-isa `hns_1825_backend.hpp`（A5）；若编译报签名不匹配，以现场编译器内置层为准 |
 | 64MB 上限未处理 | pto-isa `kSingleSqeBlockBytes=64MB`，超过按 `queue_num` 拆多条 SQE（`SubmitCmoPrefetchSqes`） | demo 每次预取 ≤64MB（8MB）无需拆分 |
-| `trap()` 直接调用 | SHMEM `aclshmemi_kernel_abort`（printf + trap 内联汇编，`shmemi_device_cc.h`） | demo 用最简形式 |
 
 **逐字段对照**：demo 的 `StarsV2Sqe` 与 SHMEM `stars_v2_sdma_cmo_sqe_t`、pto-isa
 `BatchWriteItem`（A5 分支）字节布局一致；`submit_sqe` 的字段赋值与 pto-isa 修复分支

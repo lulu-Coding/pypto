@@ -3,13 +3,15 @@
 > **状态**：实现指导（最小接口提取）
 > **日期**：2026-09-16
 > **目标**：完全脱离 `libshmem.so`（不 init SHMEM、不用其对称堆/魔法地址/设备 API），仅依赖
-> **ACL Runtime 公开 API + dlsym 私有符号 + AICPU 算子 + 设备侧 AscendC 原语**，在 A5 上实现
+> **ACL Runtime 公开 API + dlsym 私有符号 + AICPU 算子 + 设备侧 ccec/bisheng 编译器原生
+> 内置函数**（不依赖 Ascend C API，清单见 `a5-cmo-prefetch-demos.md` §0.1），在 A5 上实现
 > GM→L2 的 CMO 预取，并以时序图/流程图展示底层调用链
 > **事实来源**：SHMEM master @ 73064fa（PR #459）逐行提取 + pto-isa `SdmaWorkspaceManager`
 > （已验证的 SHMEM-free 参考实现，48 流）
 > **关联文档**：
 > - `a5-shmem-prefetch-extraction.md` —— SHMEM **仓内**实现提取（含 SHMEM API 依赖面，本文的输入）
-> - `a5-cmo-prefetch-demos.md` —— 三条链路的**最小可编译 C++ demo 程序**（本文的代码化落地）
+> - `a5-cmo-prefetch-demos.md` —— 三条链路的**最小可编译 C++ demo 程序**（本文的代码化落地；
+>   设备侧零 Ascend C 依赖，仅编译器原生内置函数）
 > - `shmem-prefetch-pypto-integration.md` —— PyPTO 前端语义设计（`pl.prefetch.*` / `host_async`）
 > - `a5-sdma-prefetch-minimal-guide.md` —— pypto/simpler/pto-isa 三仓使能指南
 > - `stars-v2-cmo-direct-drive-guide.md` —— 早期直驱方案（wrapper 注入路线已被正式 IR op 取代，
@@ -23,7 +25,7 @@
 |------|------|
 | 脱离 SHMEM 后三条路径还可行吗？ | **全部可行**。路径 A 本来就不依赖 SHMEM；路径 B/C 的"SHMEM 依赖"只有两件事——**host 供给链**（可用 6 个 ACL API + 5 个 dlsym 符号重建）与 **workspace 寻址**（用 kernel 参数传入替代 SHMEM 魔法地址） |
 | host 供给链的核心是什么？ | 不是 host 自己编程 doorbell，而是下发 **AICPU 算子 `aclnnShmemSdmaStarsQuery`**（dlsym 自 `libopapi.so`），由它按 STARS 流信息把 channel info（含 doorbell 寄存器地址）写进 workspace |
-| 设备侧需要什么？ | 零库依赖：64B SQE 结构体 + `DataCacheCleanAndInvalid`（DCCI）+ `DataCopyPad`/`SetFlag`/`WaitFlag` + 对 doorbell 地址的 volatile 写 |
+| 设备侧需要什么？ | 零库依赖（**含不依赖 Ascend C**）：64B SQE 结构体 + 编译器原生内置函数 `dcci` / `copy_ubuf_to_gm_align_v2` + `set_flag`/`wait_flag` / `ld_dev`，门铃经 MTE3 4B 写 |
 | 有没有现成参考实现？ | 有：pto-isa `sdma_workspace_manager.hpp`（host 五步，48 流，已随 A5 使能验证编译）+ `sdma_cmo_intrin.hpp`（设备直驱，与 SHMEM 字节级一致） |
 
 ---
@@ -81,15 +83,22 @@ struct SdmaOpResInfo {               // 64B — 算子资源描述，H2D
 };
 ```
 
-### 1.4 设备侧（kernel 内）— 零库依赖，仅编译器内置/AscendC 原语
+### 1.4 设备侧（kernel 内）— 零库依赖，仅编译器原生内置函数（不依赖 Ascend C）
 
-| 原语 | 用途 |
+| 原生内置函数 | 用途 |
 |---|---|
-| `AscendC::DataCacheCleanAndInvalid<T, CacheLine, DcciDst::CACHELINE_OUT>` | DCCI：写 SQE/读 tail 后清 cache line，保证硬件可见 |
-| `AscendC::DataCopyPad` + `SetFlag/WaitFlag<HardEvent::S_MTE3 / MTE3_S>` | UB↔GM 4B/8B 搬运（doorbell 镜像写、flag 回读的基础） |
-| `AscendC::GetBlockIdx()` / `GetSystemCycle()` / `ASCEND_IS_NOT_AIV` | QP 定位 / quiet 超时计时 / AIV 门控 |
-| volatile 直写 GM（`sq_reg_base + 0x0`） | **Ring Doorbell**（A5/STARS v2 偏移 0x0；A2A3/v1 为 0x8） |
+| `dcci(ptr, SINGLE_CACHE_LINE)` | DCCI：写 SQE 后清 cache line，保证硬件可见（AscendC 等价：`DataCacheCleanAndInvalid`） |
+| `copy_ubuf_to_gm_align_v2(gm, ub, 0, 1, size, 0, 0, 0)` + `set_flag`/`wait_flag(PIPE_S↔PIPE_MTE3, EVENT_ID0)` | MTE3 UB→GM 4B 搬运（doorbell 与镜像写、flag 布防；AscendC 等价：`DataCopyPad` + `SetFlag`/`WaitFlag`） |
+| `ld_dev(ptr, 0)` / `st_dev(v, ptr, 0)` | 旁路标量 L1 的 GM 读/写（tail/flag 轮询，免 DCCI） |
+| `get_block_idx()` / `ASCEND_IS_NOT_AIV` / `trap()` + `cce::printf` | QP 定位 / AIV 门控 / 超时 abort |
+| MTE3 4B 写 `sq_reg_base + 0x0` | **Ring Doorbell**（A5/STARS v2 偏移 0x0；A2A3/v1 为 0x8） |
 | `__gm__` 地址空间类型 + 64B 结构体 | 直接解释 workspace 与 SQE 布局 |
+
+> 该层由 ccec/bisheng 设备编译**隐式提供，无需包含任何 CANN 头**。已验证先例：pto-isa
+> `hns_1825_backend.hpp`（A5 后端，零 CANN 头使用 copy/sync/dcci/ld_dev/st_dev 全套）、
+> pto-isa `include/pto/common/debug.h`（零 include 裸用 `trap()`/`cce::printf`）。完整清单
+> 与逐项出处见 `a5-cmo-prefetch-demos.md` §0.1。例外：`AscendC::GetSystemCycle()` 属 API
+> 层（`kernel_operator_sys_var_intf.h`），纯原生实现改用轮询次数预算。
 
 ---
 
@@ -236,7 +245,8 @@ sequenceDiagram
 
 ## 5. 时序图 3：路径 B/C —— 设备侧直驱提交与 quiet
 
-设备侧零库依赖。`qp_idx` 取 `GetBlockIdx()`（路径 C，每 AIV 独立通道）；单 AIV kernel 中
+设备侧零库依赖（仅编译器原生内置函数，见 §1.4）。`qp_idx` 取 `get_block_idx()`
+（路径 C，每 AIV 独立通道；SHMEM 写作 `AscendC::GetBlockIdx()`）；单 AIV kernel 中
 恒为 0（即路径 B）。参考实现：pto-isa `sdma_cmo_intrin.hpp` 的 `AddOneCmoSqe`（与 SHMEM
 `aclshmemi_fill_stars_v2_cmo_sqe` 字节级一致）。
 
@@ -314,14 +324,16 @@ __gm__ stars_channel_info_t* channel_at(__gm__ uint8_t* ws, uint32_t qp_idx) {
            + qp_idx;
 }
 
-// ---- 4B GM 写（doorbell 镜像 / flag 布防的基础）----
-template <typename T>
-static __aicore__ inline void set_value(__gm__ T* dst, T v, __ubuf__ uint8_t* scratch /*64B 对齐*/) {
-    LocalTensor<T> tmp{VECOUT, scratch, 64};
-    tmp.SetValue(0, v);
-    SetFlag<HardEvent::S_MTE3>();
-    DataCopyPad(dst, tmp, {1, 4, 0, 0, false});
-    WaitFlag<HardEvent::MTE3_S>();
+// ---- 4B GM 写（doorbell 镜像 / flag 布防的基础；MTE3 旁路 AIV 数据 cache）----
+static __aicore__ inline void store_u32_gm(__gm__ uint32_t* dst, uint32_t v,
+                                           __ubuf__ uint8_t* scratch /*64B 对齐*/) {
+    __ubuf__ uint32_t* tmp = reinterpret_cast<__ubuf__ uint32_t*>(scratch);
+    *tmp = v;
+    set_flag(PIPE_S, PIPE_MTE3, EVENT_ID0);   // 标量 UB 写先于拷贝
+    wait_flag(PIPE_S, PIPE_MTE3, EVENT_ID0);
+    copy_ubuf_to_gm_align_v2(dst, tmp, 0, 1, 4, 0, 0, 0);
+    set_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);   // 拷贝先于后续标量操作
+    wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
 }
 
 // ---- 单次 CMO 预取提交（nbi）----
@@ -330,10 +342,9 @@ static __aicore__ inline void cmo_prefetch_nbi(
     uint32_t qp_idx, __ubuf__ uint8_t* scratch /*64B 对齐, >=64B*/)
 {
     __gm__ stars_channel_info_t* ci = channel_at(ws, qp_idx);
-    // 1. 读 tail（先清 cache line）
-    AscendC::DataCacheCleanAndInvalid<uint32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
-        reinterpret_cast<__gm__ uint32_t*>(reinterpret_cast<__gm__ uint8_t*>(ci) + 4));
-    uint32_t sq_tail = ci->sq_tail;
+    // 1. 读 tail / head（ld_dev 旁路标量 L1，无需 DCCI）
+    uint32_t sq_tail = ld_dev(reinterpret_cast<__gm__ uint32_t*>(reinterpret_cast<__gm__ uint8_t*>(ci) + 4), 0);
+    const uint32_t sq_head = ld_dev(reinterpret_cast<__gm__ uint32_t*>(ci), 0);
     // 2. 填 64B SQE（全字段初始化，布局见 §6.2；res 字段必须清零）
     __gm__ stars_v2_sdma_cmo_sqe_t* sqe =
         reinterpret_cast<__gm__ stars_v2_sdma_cmo_sqe_t*>(ci->sq_base) + (sq_tail % ci->sq_depth);
@@ -341,7 +352,7 @@ static __aicore__ inline void cmo_prefetch_nbi(
     sqe->header.type = kSqeTypeSdma;
     sqe->header.wr_cqe = 1;
     sqe->header.rt_streamid = static_cast<uint16_t>(ci->stream_id);
-    sqe->header.task_id = static_cast<uint16_t>(sq_tail - ci->sq_head);
+    sqe->header.task_id = static_cast<uint16_t>(sq_tail - sq_head);
     sqe->kernel_credit = kKernelCredit;
     sqe->opcode = kCmoPrefetchOpcode;
     sqe->sssv = sqe->dssv = sqe->sns = sqe->dns = 1;
@@ -349,18 +360,21 @@ static __aicore__ inline void cmo_prefetch_nbi(
     sqe->src_addr_low  = static_cast<uint32_t>(reinterpret_cast<uint64_t>(src));
     sqe->src_addr_high = static_cast<uint32_t>(reinterpret_cast<uint64_t>(src) >> 32);
     sqe->length = bytes;
-    // 3. DCCI 让 SQE 对硬件可见
-    AscendC::DataCacheCleanAndInvalid<uint8_t, CacheLine::ENTIRE_DATA_CACHE, DcciDst::CACHELINE_OUT>(
-        reinterpret_cast<__gm__ uint8_t*>(sqe), sizeof(*sqe));
+    // 3. DCCI 让 SQE 对硬件可见（逐 64B 行清理并失效）
+    for (uint32_t off = 0; off < sizeof(*sqe); off += 64) {
+        dcci(reinterpret_cast<__gm__ void*>(reinterpret_cast<__gm__ uint8_t*>(sqe) + off), SINGLE_CACHE_LINE);
+    }
     // 4. 鸣铃 + 镜像 tail
     sq_tail = (sq_tail + 1) % ci->sq_depth;
-    set_value(reinterpret_cast<__gm__ uint32_t*>(ci->sq_reg_base + kDoorbellOffset), sq_tail, scratch);
-    set_value(reinterpret_cast<__gm__ uint32_t*>(reinterpret_cast<__gm__ uint8_t*>(ci) + 4), sq_tail, scratch);
+    store_u32_gm(reinterpret_cast<__gm__ uint32_t*>(ci->sq_reg_base + kDoorbellOffset), sq_tail, scratch);
+    store_u32_gm(reinterpret_cast<__gm__ uint32_t*>(reinterpret_cast<__gm__ uint8_t*>(ci) + 4), sq_tail, scratch);
 }
 ```
 
 > quiet（flag SQE + 轮询）骨架相同：多一次 8B SDMA 写 flag 的 SQE（`opcode=0`，复用 64B v2
-> 布局）+ `GetSystemCycle()` 计时轮询（A5：1000 cycles/µs，超时 60s → `printf`+`trap`）。
+> 布局）+ `ld_dev` 低字轮询（旁路标量 L1）+ 超时路径 `cce::printf` + `trap()`（均为编译器
+> 原生内置函数，pto-isa `debug.h` 零 include 先例）。SHMEM 用 `GetSystemCycle()` 60 s 周期
+> 限额计时（A5：1000 cycles/µs），但该函数属 Ascend C API 层，纯原生实现改用轮询次数预算。
 > 完整字段级实现直接参考 pto-isa `sdma_cmo_intrin.hpp` / `sdma_async_intrin.hpp`——
 > 二者已与 SHMEM 做过字节级比对。
 
@@ -434,4 +448,4 @@ workspace（host aclrtMalloc，供给链第 2 步；AICPU 算子第 4 步填充�
 | 文档 | 回答的问题 | 依赖面 |
 |---|---|---|
 | `a5-shmem-prefetch-extraction.md` | SHMEM **仓内**是怎么实现的（含其公开 API、示例、构建） | 使用 libshmem |
-| **本文** | **不用 SHMEM** 时，同样的能力最少需要哪些底层接口、按什么顺序调用 | 仅 ACL/dlsym/AICPU 算子/AscendC 原语 |
+| **本文** | **不用 SHMEM** 时，同样的能力最少需要哪些底层接口、按什么顺序调用 | 仅 ACL/dlsym/AICPU 算子/编译器原生内置函数 |
