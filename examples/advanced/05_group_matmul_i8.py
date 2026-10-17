@@ -41,6 +41,11 @@ Parallelism:
     first tasks would consume the 64-lane parallel join and blow the per-task
     fan-in capacity (finalize code -4, SIMPLER_ERROR_FANIN_CAPACITY_EXCEEDED).
 
+    The HBG runtime hard-caps each task's dependency fan-in at
+    CHIP_MAX_FANIN=128 with no spill pool, so the parallel lane count is
+    bounded (LANES=32 -> the terminal join carries ~64 edges) and each lane
+    walks its share of the row tiles with an inner runtime range loop.
+
 Run:
     python examples/advanced/05_group_matmul_i8.py                # a5, device 0
     python examples/advanced/05_group_matmul_i8.py -p a5sim      # simulator first
@@ -58,6 +63,7 @@ GROUP = 32
 M, K, N = 8192, 3584, 3072
 TILE_M, TILE_K, TILE_N = 128, 512, 256   # acc 128KB = L0C/2; K panels x2 = 384KB Mat
 DEQ_ROWS = 64                            # dequant strip rows (Vec peak ~128KB)
+LANES = 32                               # parallel dispatch lanes (fan-in bounded, see below)
 OUT_DTYPE = pl.FP16
 SCALE = 0.001                            # guarded: 127*127*K*SCALE must stay < 65504
 # ===================================================
@@ -66,6 +72,10 @@ L0C_BYTES = 256 * 1024                   # A5 Acc (L0C)
 MAT_BYTES = 512 * 1024                   # A5 Mat (L1)
 VEC_BYTES = 240 * 1024                   # A5 safe Vec (UB)
 CUBE_CORES, AIV_CORES = 18, 36
+CHIP_MAX_FANIN = 128                     # HBG per-task fan-in cap, no spill pool
+
+N_ROW_TILES = GROUP * M // TILE_M
+TILES_PER_LANE = N_ROW_TILES // LANES
 
 # Config sanity: every hardware bound is checked here so a bad edit fails at
 # import with the reason, never silently on device.
@@ -73,6 +83,12 @@ assert M % TILE_M == 0 and N % TILE_N == 0 and K % TILE_K == 0, "tiles must divi
 assert K // TILE_K >= 2 and TILE_M % DEQ_ROWS == 0
 for _d in (M, K, N, TILE_M, TILE_K, TILE_N, DEQ_ROWS):
     assert _d % 16 == 0, f"{_d} is not a multiple of 16 (cube fractal alignment)"
+assert N_ROW_TILES % LANES == 0, "LANES must divide GROUP*M/TILE_M"
+# The run's terminal wait joins one edge per lane per threaded tensor
+# (~2 x LANES: lane-final acc_gm and out writers). Keep it under CHIP_MAX_FANIN
+# with headroom for per-task chain edges.
+assert 2 * LANES + 8 < CHIP_MAX_FANIN, \
+    f"LANES={LANES} joins ~{2 * LANES} edges into the terminal wait, too close to CHIP_MAX_FANIN=128"
 assert TILE_M * TILE_N * 4 <= L0C_BYTES, "acc tile exceeds A5 L0C (256KB)"
 assert TILE_M * TILE_N * 8 <= L0C_BYTES, "acc tile > L0C/2: dbC ping-pong will not fit"
 assert 2 * (TILE_M * TILE_K + TILE_K * TILE_N) <= MAT_BYTES, \
@@ -92,36 +108,37 @@ def group_matmul_i8(x: pl.Tensor, w: pl.Tensor, scale: pl.Tensor, out: pl.Out[pl
     matter how large GROUP / N grow.
     """
     acc_gm = pl.create_tensor([GROUP * M, N], dtype=pl.INT32)
-    # Single outermost parallel loop over the flattened row-tile space. The group
-    # index is derived per lane (row // M), so no range(g)-level loop ever
-    # consumes the parallel join: consuming it made every next group's first
-    # tasks wait on all 64 lanes' last writers of acc_gm/out, and one task's
-    # dependency fan-in blew the ring-buffer per-task capacity
-    # (SIMPLER_ERROR_FANIN_CAPACITY_EXCEEDED, surfaced as finalize code -4).
-    # The join now only reaches the function return (parent-child completion
-    # accounting), never another device task.
-    for row in pl.parallel(0, GROUP * M, TILE_M):
-        wbase = (row // M) * K
-        for n_i in pl.range(N // TILE_N):
-            n0 = n_i * TILE_N
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="gemm"):
-                acc = pl.create_tensor([TILE_M, TILE_N], dtype=pl.INT32)
-                for kb in pl.pipeline(0, K // TILE_K, stage=2):
-                    k0 = kb * TILE_K
-                    a = x[row : row + TILE_M, k0 : k0 + TILE_K]
-                    b = w[wbase + k0 : wbase + k0 + TILE_K, n0 : n0 + TILE_N]
-                    if k0 == 0:
-                        acc = pl.matmul(a, b, out_dtype=pl.INT32)
-                    else:
-                        acc = pl.matmul_acc(acc, a, b)
-                acc_gm = pl.assemble(acc_gm, acc, [row, n0])
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="deq"):
-                for r_i in pl.range(TILE_M // DEQ_ROWS):
-                    r0 = r_i * DEQ_ROWS
-                    t = acc_gm[row + r0 : row + r0 + DEQ_ROWS, n0 : n0 + TILE_N]
-                    s = scale[row + r0 : row + r0 + DEQ_ROWS, :]
-                    deq = pl.row_expand_mul(pl.cast(t, target_type=pl.FP32, mode="none"), s)
-                    out = pl.assemble(out, pl.cast(deq, target_type=OUT_DTYPE), [row + r0, n0])
+    # The HBG runtime hard-caps every task's dependency fan-in at
+    # CHIP_MAX_FANIN = 128 with no spill pool (runtime_types.h), and the
+    # parallel loop's join feeds the run's terminal wait with one edge per lane
+    # per threaded tensor (~2 x LANES: the lane-final acc_gm and out writers).
+    # 64 lanes x 2 tensors = 128 edges hit the cap exactly; a flat
+    # parallel over all 2048 row tiles overshot it 16x. Bound the lane count
+    # and walk the row tiles each lane owns with an inner runtime range loop.
+    for lane in pl.parallel(0, LANES):
+        for i in pl.range(TILES_PER_LANE):
+            row = (lane * TILES_PER_LANE + i) * TILE_M
+            wbase = (row // M) * K
+            for n_i in pl.range(N // TILE_N):
+                n0 = n_i * TILE_N
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="gemm"):
+                    acc = pl.create_tensor([TILE_M, TILE_N], dtype=pl.INT32)
+                    for kb in pl.pipeline(0, K // TILE_K, stage=2):
+                        k0 = kb * TILE_K
+                        a = x[row : row + TILE_M, k0 : k0 + TILE_K]
+                        b = w[wbase + k0 : wbase + k0 + TILE_K, n0 : n0 + TILE_N]
+                        if k0 == 0:
+                            acc = pl.matmul(a, b, out_dtype=pl.INT32)
+                        else:
+                            acc = pl.matmul_acc(acc, a, b)
+                    acc_gm = pl.assemble(acc_gm, acc, [row, n0])
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="deq"):
+                    for r_i in pl.range(TILE_M // DEQ_ROWS):
+                        r0 = r_i * DEQ_ROWS
+                        t = acc_gm[row + r0 : row + r0 + DEQ_ROWS, n0 : n0 + TILE_N]
+                        s = scale[row + r0 : row + r0 + DEQ_ROWS, :]
+                        deq = pl.row_expand_mul(pl.cast(t, target_type=pl.FP32, mode="none"), s)
+                        out = pl.assemble(out, pl.cast(deq, target_type=OUT_DTYPE), [row + r0, n0])
     return out
 
 
