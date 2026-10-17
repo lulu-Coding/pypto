@@ -7,40 +7,35 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""High-parallelism INT8 group matmul on A5 at G=32 scale, manual-dependency edition.
+"""High-parallelism INT8 group matmul on A5 at G=32 scale, raw-INT32-output edition.
 
-    x    : [GROUP*M, K]   INT8   group g's activations at rows [g*M, (g+1)*M)
-    w    : [GROUP*K, N]   INT8   group g's weights      at rows [g*K, (g+1)*K)
-    scale: [GROUP*M, 1]   FP32   per-row scale (fill a band with one value for per-group scale)
-    out  : [GROUP*M, N]   FP16
-    acc_gm (device-side scratch): [GROUP*M, N] INT32, ~3.2 GB at the default shape.
+    x  : [GROUP*M, K]  INT8   group g's activations at rows [g*M, (g+1)*M)
+    w  : [GROUP*K, N]  INT8   group g's weights      at rows [g*K, (g+1)*K)
+    out: [GROUP*M, N]  INT32  = x @ w per group, NO dequant / scale / cast.
 
-Why manual deps (this is the load-bearing design decision):
+INT32 accumulators store to an INT32 GM tensor with zero conversion (the one
+conversion the unscaled fixpipe writeback offers is FP32->FP16/BF16; same-dtype
+INT32->INT32 needs none), so the separate dequant kernel, its 3.2GB acc_gm
+staging buffer and its 6.4GB GM round-trip all disappear. 2048 gemm tasks on
+18 AIC cores, no dependencies at all: every task writes a disjoint row strip.
+
+Why manual deps (see git history for the full saga):
 
     The auto-dependency tensormap emits EVERY older-version entry of the same
     base tensor as a fan-in edge (check_overlap's version gate returns OTHER
-    before the byte-range filter, dep_compute.h), and entries for one-shot
-    disjoint writes are never retired (removal needs same-version COVERED).
-    A long ``acc_gm = pl.assemble(acc_gm, ...)`` chain therefore grows every
-    consumer task's fan-in linearly, and the HBG runtime hard-caps it at
-    CHIP_MAX_FANIN=128 with no spill pool -- 24576 gemm writes cannot fit no
-    matter how the loops are structured. ``pl.manual_scope()`` bypasses the
-    tensormap entirely (compute_task_fanin returns immediately); the only true
-    dependency is declared explicitly: deq(row-tile) waits for gemm(row-tile).
-    Everything else is disjoint by construction.
+    before the byte-range filter), and entries for one-shot disjoint writes are
+    never retired, so a long assemble chain grows each consumer task's fan-in
+    linearly past CHIP_MAX_FANIN=128. pl.manual_scope() bypasses the tensormap
+    entirely; with disjoint strips there is nothing left to depend on.
 
-Task shape: one gemm task + one deq task per [TILE_M, N] row strip
-(N // TILE_N output tiles strip-walked inside each kernel):
-
-    gemm_tile: head-peel + pl.pipeline K loop per n-tile, INT32 acc, assembles
-               acc_gm                                        (cube)
-    deq_tile : DEQ_ROWS strips, cast -> row-scale -> FP16    (vector)
-    2048 row strips x 2 = 49152 tasks; 18 AIC + 36 AIV saturated, deq(i)
-    overlaps gemm(j != i) via the single explicit edge per pair.
+Kernel (gemm_tile, pure cube): one [TILE_M, N] row strip per task; inside,
+N // TILE_N output tiles each computed by a head-peel + pl.pipeline stage=2
+K loop (MTE1 loads double-buffered against MAD). The group's w band offset is
+derived kernel-side as (row // M) * K -- orchestration-level FloorDiv lowers
+to arith.divsi on the MLIR index type, which is not a legal op.
 
 Run:
     python examples/advanced/05_group_matmul_i8.py                # a5, device 0
-    python examples/advanced/05_group_matmul_i8.py -p a5sim      # simulator first
 """
 
 import argparse
@@ -56,34 +51,27 @@ from pypto.runtime import RunConfig
 GROUP = 32
 M, K, N = 8192, 3584, 3072
 TILE_M, TILE_K, TILE_N = 128, 512, 256   # acc 128KB = L0C/2; K panels x2 = 384KB Mat
-DEQ_ROWS = 64                            # dequant strip rows (Vec peak ~128KB)
-OUT_DTYPE = pl.FP16
-SCALE = 0.001                            # guarded: 127*127*K*SCALE must stay < 65504
 # ===================================================
 
 L0C_BYTES = 256 * 1024                   # A5 Acc (L0C)
 MAT_BYTES = 512 * 1024                   # A5 Mat (L1)
-VEC_BYTES = 240 * 1024                   # A5 safe Vec (UB)
-CUBE_CORES, AIV_CORES = 18, 36
+CUBE_CORES = 18
 
 N_ROW_TILES = GROUP * M // TILE_M
-ROWS_X = GROUP * M                       # x / scale / acc_gm / out rows
+ROWS_X = GROUP * M                       # x / out rows
 ROWS_W = GROUP * K                       # w rows
 
 # Config sanity: every hardware bound is checked here so a bad edit fails at
 # import with the reason, never silently on device.
 assert M % TILE_M == 0 and N % TILE_N == 0 and K % TILE_K == 0, "tiles must divide their dims"
-assert K // TILE_K >= 2 and TILE_M % DEQ_ROWS == 0
-for _d in (M, K, N, TILE_M, TILE_K, TILE_N, DEQ_ROWS):
+assert K // TILE_K >= 2
+for _d in (M, K, N, TILE_M, TILE_K, TILE_N):
     assert _d % 16 == 0, f"{_d} is not a multiple of 16 (cube fractal alignment)"
 assert TILE_M * TILE_N * 4 <= L0C_BYTES, "acc tile exceeds A5 L0C (256KB)"
 assert TILE_M * TILE_N * 8 <= L0C_BYTES, "acc tile > L0C/2: dbC ping-pong will not fit"
 assert 2 * (TILE_M * TILE_K + TILE_K * TILE_N) <= MAT_BYTES, \
     "K panels x pipeline double-buffer exceed Mat (512KB); lower TILE_K"
-assert DEQ_ROWS * TILE_N * 8 <= VEC_BYTES, \
-    "dequant strip live set (INT32+FP32) exceeds safe Vec (240KB); lower DEQ_ROWS"
-assert 127 * 127 * K * SCALE < 65504, \
-    f"scale {SCALE} overflows FP16 at K={K}: need < {65504 / (127 * 127 * K):.2e}"
+assert 127 * 127 * K < 2**31, "INT32 accumulator overflow at this K"
 
 
 @pl.program
@@ -93,16 +81,14 @@ class GroupMatmulI8:
         self,
         x: pl.Tensor[[ROWS_X, K], pl.INT8],
         w: pl.Tensor[[ROWS_W, N], pl.INT8],
-        acc_gm: pl.InOut[pl.Tensor[[ROWS_X, N], pl.INT32]],
+        out: pl.InOut[pl.Tensor[[ROWS_X, N], pl.INT32]],
         row: pl.Scalar[pl.INDEX],
     ) -> pl.Tensor[[ROWS_X, N], pl.INT32]:
         """Cube: full [TILE_M, N] strip, INT8 x INT8 -> INT32, one n-tile at a time.
 
-        Head-peel the first K chunk (initialises the accumulator), pipeline the
-        rest -- no create_tensor seed, no predicated matmul_acc. The group's w
-        band offset is derived kernel-side (row // M): orchestration-level
-        FloorDiv lowers to arith.divsi on the MLIR index type, which is not a
-        legal op -- keep division out of the orchestration body.
+        Head-peel the first K chunk (initialises the accumulator -- the if/else
+        peel form is illegal inside an InCore kernel because its phi merges two
+        Acc-resident producers), pipeline the rest.
         """
         wbase = (row // M) * K
         for n_i in pl.range(N // TILE_N):
@@ -115,26 +101,7 @@ class GroupMatmulI8:
                 a = x[row : row + TILE_M, k0 : k0 + TILE_K]
                 b = w[wbase + k0 : wbase + k0 + TILE_K, n0 : n0 + TILE_N]
                 acc = pl.matmul_acc(acc, a, b)
-            acc_gm = pl.assemble(acc_gm, acc, [row, n0])
-        return acc_gm
-
-    @pl.function(type=pl.FunctionType.InCore)
-    def deq_tile(
-        self,
-        acc_gm: pl.Tensor[[ROWS_X, N], pl.INT32],
-        scale: pl.Tensor[[ROWS_X, 1], pl.FP32],
-        out: pl.InOut[pl.Tensor[[ROWS_X, N], OUT_DTYPE]],
-        row: pl.Scalar[pl.INDEX],
-    ) -> pl.Tensor[[ROWS_X, N], OUT_DTYPE]:
-        """Vector: INT32 -> FP32 -> xrow-scale -> FP16, DEQ_ROWS strips at a time."""
-        for n_i in pl.range(N // TILE_N):
-            n0 = n_i * TILE_N
-            for r_i in pl.range(TILE_M // DEQ_ROWS):
-                r0 = r_i * DEQ_ROWS
-                t = acc_gm[row + r0 : row + r0 + DEQ_ROWS, n0 : n0 + TILE_N]
-                s = scale[row + r0 : row + r0 + DEQ_ROWS, :]
-                deq = pl.row_expand_mul(pl.cast(t, target_type=pl.FP32, mode="none"), s)
-                out = pl.assemble(out, pl.cast(deq, target_type=OUT_DTYPE), [row + r0, n0])
+            out = pl.assemble(out, acc, [row, n0])
         return out
 
     @pl.function(type=pl.FunctionType.Orchestration)
@@ -142,18 +109,15 @@ class GroupMatmulI8:
         self,
         x: pl.Tensor[[ROWS_X, K], pl.INT8],
         w: pl.Tensor[[ROWS_W, N], pl.INT8],
-        scale: pl.Tensor[[ROWS_X, 1], pl.FP32],
-        out: pl.Out[pl.Tensor[[ROWS_X, N], OUT_DTYPE]],
-    ) -> pl.Tensor[[ROWS_X, N], OUT_DTYPE]:
-        acc_gm = pl.create_tensor([GROUP * M, N], dtype=pl.INT32)
-        # Manual deps: the auto tensormap cannot carry 24576 one-shot writes
-        # under CHIP_MAX_FANIN=128 (see module docstring). The only true
-        # dependency is deq(strip) <- gemm(strip); every region is disjoint.
+        out: pl.Out[pl.Tensor[[ROWS_X, N], pl.INT32]],
+    ) -> pl.Tensor[[ROWS_X, N], pl.INT32]:
+        # Manual deps: 2048 one-shot writes into one tensor cannot ride the
+        # auto tensormap under CHIP_MAX_FANIN=128. The strips are disjoint, so
+        # there is no true dependency to declare at all.
         with pl.manual_scope():
             for t in pl.parallel(0, N_ROW_TILES):
                 row = t * TILE_M
-                acc_gm, g_tid = pl.submit(self.gemm_tile, x, w, acc_gm, row)
-                out, _ = pl.submit(self.deq_tile, acc_gm, scale, out, row, deps=[g_tid])
+                out, _ = pl.submit(self.gemm_tile, x, w, out, row)
         return out
 
 
@@ -176,27 +140,26 @@ def main() -> None:
     print("generating inputs ...")
     x = torch.randint(-127, 128, (GROUP * M, K), dtype=torch.int8)
     w = torch.randint(-127, 128, (GROUP * K, N), dtype=torch.int8)
-    scale = torch.full((GROUP * M, 1), SCALE, dtype=torch.float32)
-    out = torch.zeros(GROUP * M, N, dtype=torch.float16)
+    out = torch.zeros(GROUP * M, N, dtype=torch.int32)
 
-    print(f"compiling: {2 * N_ROW_TILES} tasks (gemm+deq per row strip), "
-          f"acc_gm = {GROUP * M * N * 4 / 2**30:.1f} GB ...")
+    print(f"compiling: {N_ROW_TILES} gemm tasks (no dequant), out = "
+          f"{GROUP * M * N * 4 / 2**30:.1f} GB INT32 ...")
     t0 = time.perf_counter()
     compiled = ir.compile(GroupMatmulI8, backend_type=_BACKENDS[args.platform])
     print(f"compiled in {time.perf_counter() - t0:.1f}s")
 
     t0 = time.perf_counter()
-    compiled(x, w, scale, out, config=cfg)
+    compiled(x, w, out, config=cfg)
     print(f"done in {time.perf_counter() - t0:.1f}s")
 
-    print("verifying per group ...")
+    print("verifying per group (FP64 reference is exact: |acc| < 2^53) ...")
     for g in range(GROUP):
-        ref = (x[g * M : (g + 1) * M].float() @ w[g * K : (g + 1) * K].float() * scale).half()
+        ref = (x[g * M : (g + 1) * M].double() @ w[g * K : (g + 1) * K].double()).to(torch.int32)
         got = out[g * M : (g + 1) * M]
-        assert torch.allclose(got.float(), ref.float(), rtol=1e-2, atol=1e-2), (
-            f"group {g}: max err = {(got.float() - ref.float()).abs().max().item()}"
+        assert torch.equal(got, ref), (
+            f"group {g}: max err = {(got - ref).abs().max().item()}"
         )
-    print(f"OK  tasks = {2 * N_ROW_TILES}  (AIC x{CUBE_CORES} + AIV x{AIV_CORES} saturated)")
+    print(f"OK  bit-exact  tasks = {N_ROW_TILES}  (AIC x{CUBE_CORES} saturated)")
 
 
 if __name__ == "__main__":
