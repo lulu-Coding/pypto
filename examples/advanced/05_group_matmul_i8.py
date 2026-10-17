@@ -98,23 +98,22 @@ class GroupMatmulI8:
     ) -> pl.Tensor[[ROWS_X, N], pl.INT32]:
         """Cube: full [TILE_M, N] strip, INT8 x INT8 -> INT32, one n-tile at a time.
 
-        Head-peel the first K chunk (initialises the accumulator), pipeline the
-        rest -- no create_tensor seed, no predicated matmul_acc. The group's w
-        band offset is derived kernel-side (row // M): orchestration-level
-        FloorDiv lowers to arith.divsi on the MLIR index type, which is not a
-        legal op -- keep division out of the orchestration body.
+        The canonical projection.py K-loop form: pipeline from 0 with the
+        ``if k0 == 0`` peel inside the body. The group's w band offset is
+        derived kernel-side (row // M): orchestration-level FloorDiv lowers to
+        arith.divsi on the MLIR index type, which is not a legal op.
         """
         wbase = (row // M) * K
         for n_i in pl.range(N // TILE_N):
             n0 = n_i * TILE_N
-            a = x[row : row + TILE_M, 0:TILE_K]
-            b = w[wbase : wbase + TILE_K, n0 : n0 + TILE_N]
-            acc = pl.matmul(a, b, out_dtype=pl.INT32)
-            for kb in pl.pipeline(1, K // TILE_K, stage=2):
+            for kb in pl.pipeline(0, K // TILE_K, stage=2):
                 k0 = kb * TILE_K
                 a = x[row : row + TILE_M, k0 : k0 + TILE_K]
                 b = w[wbase + k0 : wbase + k0 + TILE_K, n0 : n0 + TILE_N]
-                acc = pl.matmul_acc(acc, a, b)
+                if k0 == 0:
+                    acc = pl.matmul(a, b, out_dtype=pl.INT32)
+                else:
+                    acc = pl.matmul_acc(acc, a, b)
             acc_gm = pl.assemble(acc_gm, acc, [row, n0])
         return acc_gm
 
