@@ -95,13 +95,16 @@ class GroupMatmulI8:
         w: pl.Tensor[[ROWS_W, N], pl.INT8],
         acc_gm: pl.InOut[pl.Tensor[[ROWS_X, N], pl.INT32]],
         row: pl.Scalar[pl.INDEX],
-        wbase: pl.Scalar[pl.INDEX],
     ) -> pl.Tensor[[ROWS_X, N], pl.INT32]:
         """Cube: full [TILE_M, N] strip, INT8 x INT8 -> INT32, one n-tile at a time.
 
         Head-peel the first K chunk (initialises the accumulator), pipeline the
-        rest -- no create_tensor seed, no predicated matmul_acc.
+        rest -- no create_tensor seed, no predicated matmul_acc. The group's w
+        band offset is derived kernel-side (row // M): orchestration-level
+        FloorDiv lowers to arith.divsi on the MLIR index type, which is not a
+        legal op -- keep division out of the orchestration body.
         """
+        wbase = (row // M) * K
         for n_i in pl.range(N // TILE_N):
             n0 = n_i * TILE_N
             a = x[row : row + TILE_M, 0:TILE_K]
@@ -149,8 +152,7 @@ class GroupMatmulI8:
         with pl.manual_scope():
             for t in pl.parallel(0, N_ROW_TILES):
                 row = t * TILE_M
-                wbase = (row // M) * K
-                acc_gm, g_tid = pl.submit(self.gemm_tile, x, w, acc_gm, row, wbase)
+                acc_gm, g_tid = pl.submit(self.gemm_tile, x, w, acc_gm, row)
                 out, _ = pl.submit(self.deq_tile, acc_gm, scale, out, row, deps=[g_tid])
         return out
 
