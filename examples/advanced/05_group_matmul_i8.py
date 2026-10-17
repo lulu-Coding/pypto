@@ -35,6 +35,12 @@ Parallelism:
     Within a gemm task: pl.pipeline stage=2 double-buffers the K panels; the
     [TILE_M, TILE_N] INT32 accumulator is L0C/2, leaving room for AutoTile dbC.
 
+    Dependency topology: pl.parallel is the OUTERMOST loop (flattened over
+    GROUP*M row tiles, group band derived as row // M). Never put a loop level
+    above it that keeps threading the written tensors: the next iteration's
+    first tasks would consume the 64-lane parallel join and blow the per-task
+    fan-in capacity (finalize code -4, SIMPLER_ERROR_FANIN_CAPACITY_EXCEEDED).
+
 Run:
     python examples/advanced/05_group_matmul_i8.py                # a5, device 0
     python examples/advanced/05_group_matmul_i8.py -p a5sim      # simulator first
@@ -86,29 +92,36 @@ def group_matmul_i8(x: pl.Tensor, w: pl.Tensor, scale: pl.Tensor, out: pl.Out[pl
     matter how large GROUP / N grow.
     """
     acc_gm = pl.create_tensor([GROUP * M, N], dtype=pl.INT32)
-    for g in pl.range(GROUP):
-        for m0 in pl.parallel(0, M, TILE_M):
-            for n_i in pl.range(N // TILE_N):
-                n0 = n_i * TILE_N
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="gemm"):
-                    acc = pl.create_tensor([TILE_M, TILE_N], dtype=pl.INT32)
-                    for kb in pl.pipeline(0, K // TILE_K, stage=2):
-                        k0 = kb * TILE_K
-                        a = x[g * M + m0 : g * M + m0 + TILE_M, k0 : k0 + TILE_K]
-                        b = w[g * K + k0 : g * K + k0 + TILE_K, n0 : n0 + TILE_N]
-                        if k0 == 0:
-                            acc = pl.matmul(a, b, out_dtype=pl.INT32)
-                        else:
-                            acc = pl.matmul_acc(acc, a, b)
-                    acc_gm = pl.assemble(acc_gm, acc, [g * M + m0, n0])
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="deq"):
-                    for r_i in pl.range(TILE_M // DEQ_ROWS):
-                        r0 = r_i * DEQ_ROWS
-                        row = g * M + m0 + r0
-                        t = acc_gm[row : row + DEQ_ROWS, n0 : n0 + TILE_N]
-                        s = scale[row : row + DEQ_ROWS, :]
-                        deq = pl.row_expand_mul(pl.cast(t, target_type=pl.FP32, mode="none"), s)
-                        out = pl.assemble(out, pl.cast(deq, target_type=OUT_DTYPE), [row, n0])
+    # Single outermost parallel loop over the flattened row-tile space. The group
+    # index is derived per lane (row // M), so no range(g)-level loop ever
+    # consumes the parallel join: consuming it made every next group's first
+    # tasks wait on all 64 lanes' last writers of acc_gm/out, and one task's
+    # dependency fan-in blew the ring-buffer per-task capacity
+    # (SIMPLER_ERROR_FANIN_CAPACITY_EXCEEDED, surfaced as finalize code -4).
+    # The join now only reaches the function return (parent-child completion
+    # accounting), never another device task.
+    for row in pl.parallel(0, GROUP * M, TILE_M):
+        wbase = (row // M) * K
+        for n_i in pl.range(N // TILE_N):
+            n0 = n_i * TILE_N
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="gemm"):
+                acc = pl.create_tensor([TILE_M, TILE_N], dtype=pl.INT32)
+                for kb in pl.pipeline(0, K // TILE_K, stage=2):
+                    k0 = kb * TILE_K
+                    a = x[row : row + TILE_M, k0 : k0 + TILE_K]
+                    b = w[wbase + k0 : wbase + k0 + TILE_K, n0 : n0 + TILE_N]
+                    if k0 == 0:
+                        acc = pl.matmul(a, b, out_dtype=pl.INT32)
+                    else:
+                        acc = pl.matmul_acc(acc, a, b)
+                acc_gm = pl.assemble(acc_gm, acc, [row, n0])
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="deq"):
+                for r_i in pl.range(TILE_M // DEQ_ROWS):
+                    r0 = r_i * DEQ_ROWS
+                    t = acc_gm[row + r0 : row + r0 + DEQ_ROWS, n0 : n0 + TILE_N]
+                    s = scale[row + r0 : row + r0 + DEQ_ROWS, :]
+                    deq = pl.row_expand_mul(pl.cast(t, target_type=pl.FP32, mode="none"), s)
+                    out = pl.assemble(out, pl.cast(deq, target_type=OUT_DTYPE), [row + r0, n0])
     return out
 
 
