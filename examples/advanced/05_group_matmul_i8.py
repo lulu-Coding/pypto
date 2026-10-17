@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""High-parallelism INT8 group matmul on A5 at G=32 scale: staged GEMM || dequant dual pipeline.
+"""High-parallelism INT8 group matmul on A5 at G=32 scale, manual-dependency edition.
 
     x    : [GROUP*M, K]   INT8   group g's activations at rows [g*M, (g+1)*M)
     w    : [GROUP*K, N]   INT8   group g's weights      at rows [g*K, (g+1)*K)
@@ -15,36 +15,28 @@
     out  : [GROUP*M, N]   FP16
     acc_gm (device-side scratch): [GROUP*M, N] INT32, ~3.2 GB at the default shape.
 
-Why staged-only (no mixed epilogue) at this scale:
+Why manual deps (this is the load-bearing design decision):
 
-    1. ChipCallable registers at most 1024 distinct child kernels (MaxChildren,
-       runtime/src/common/task_interface/callable.h). pl.unroll'ed pl.at scopes
-       each become their own kernel (baked literal offsets), so GROUP x N_TILES
-       unrolled copies -- split further into AIC+AIV by ExpandMixedKernel --
-       blew past that limit at G=32 x N/128. All loops here are runtime
-       range/parallel instead: the whole program is exactly TWO child kernels
-       (gemm + deq) regardless of GROUP/N.
-    2. The vector epilogue's live set (INT32 tile + FP32 tile, ~8B/elem) must
-       fit the 240KB safe Vec UB, so the dequant works on DEQ_ROWS strips.
+    The auto-dependency tensormap emits EVERY older-version entry of the same
+    base tensor as a fan-in edge (check_overlap's version gate returns OTHER
+    before the byte-range filter, dep_compute.h), and entries for one-shot
+    disjoint writes are never retired (removal needs same-version COVERED).
+    A long ``acc_gm = pl.assemble(acc_gm, ...)`` chain therefore grows every
+    consumer task's fan-in linearly, and the HBG runtime hard-caps it at
+    CHIP_MAX_FANIN=128 with no spill pool -- 24576 gemm writes cannot fit no
+    matter how the loops are structured. ``pl.manual_scope()`` bypasses the
+    tensormap entirely (compute_task_fanin returns immediately); the only true
+    dependency is declared explicitly: deq(row-tile) waits for gemm(row-tile).
+    Everything else is disjoint by construction.
 
-Parallelism:
+Task shape: one gemm task + one deq task per [TILE_M, N] row strip
+(N // TILE_N output tiles strip-walked inside each kernel):
 
-    AIC 18 cores: GROUP x (M/TILE_M) x (N/TILE_N) gemm tasks (24576 at defaults)
-    AIV 36 cores: one deq task per gemm tile, strip-looped inside; SSA deps let
-                  deq(i) overlap gemm(j != i), so both pipe lanes stay saturated.
-    Within a gemm task: pl.pipeline stage=2 double-buffers the K panels; the
-    [TILE_M, TILE_N] INT32 accumulator is L0C/2, leaving room for AutoTile dbC.
-
-    Dependency topology: pl.parallel is the OUTERMOST loop (flattened over
-    GROUP*M row tiles, group band derived as row // M). Never put a loop level
-    above it that keeps threading the written tensors: the next iteration's
-    first tasks would consume the 64-lane parallel join and blow the per-task
-    fan-in capacity (finalize code -4, SIMPLER_ERROR_FANIN_CAPACITY_EXCEEDED).
-
-    The HBG runtime hard-caps each task's dependency fan-in at
-    CHIP_MAX_FANIN=128 with no spill pool, so the parallel lane count is
-    bounded (LANES=32 -> the terminal join carries ~64 edges) and each lane
-    walks its share of the row tiles with an inner runtime range loop.
+    gemm_tile: head-peel + pl.pipeline K loop per n-tile, INT32 acc, assembles
+               acc_gm                                        (cube)
+    deq_tile : DEQ_ROWS strips, cast -> row-scale -> FP16    (vector)
+    2048 row strips x 2 = 49152 tasks; 18 AIC + 36 AIV saturated, deq(i)
+    overlaps gemm(j != i) via the single explicit edge per pair.
 
 Run:
     python examples/advanced/05_group_matmul_i8.py                # a5, device 0
@@ -56,6 +48,8 @@ import time
 
 import pypto.language as pl
 import torch
+from pypto import ir
+from pypto.backend import BackendType
 from pypto.runtime import RunConfig
 
 # ============ shape config (edit freely) ============
@@ -63,7 +57,6 @@ GROUP = 32
 M, K, N = 8192, 3584, 3072
 TILE_M, TILE_K, TILE_N = 128, 512, 256   # acc 128KB = L0C/2; K panels x2 = 384KB Mat
 DEQ_ROWS = 64                            # dequant strip rows (Vec peak ~128KB)
-LANES = 32                               # parallel dispatch lanes (fan-in bounded, see below)
 OUT_DTYPE = pl.FP16
 SCALE = 0.001                            # guarded: 127*127*K*SCALE must stay < 65504
 # ===================================================
@@ -72,10 +65,8 @@ L0C_BYTES = 256 * 1024                   # A5 Acc (L0C)
 MAT_BYTES = 512 * 1024                   # A5 Mat (L1)
 VEC_BYTES = 240 * 1024                   # A5 safe Vec (UB)
 CUBE_CORES, AIV_CORES = 18, 36
-CHIP_MAX_FANIN = 128                     # HBG per-task fan-in cap, no spill pool
 
 N_ROW_TILES = GROUP * M // TILE_M
-TILES_PER_LANE = N_ROW_TILES // LANES
 
 # Config sanity: every hardware bound is checked here so a bad edit fails at
 # import with the reason, never silently on device.
@@ -83,12 +74,6 @@ assert M % TILE_M == 0 and N % TILE_N == 0 and K % TILE_K == 0, "tiles must divi
 assert K // TILE_K >= 2 and TILE_M % DEQ_ROWS == 0
 for _d in (M, K, N, TILE_M, TILE_K, TILE_N, DEQ_ROWS):
     assert _d % 16 == 0, f"{_d} is not a multiple of 16 (cube fractal alignment)"
-assert N_ROW_TILES % LANES == 0, "LANES must divide GROUP*M/TILE_M"
-# The run's terminal wait joins one edge per lane per threaded tensor
-# (~2 x LANES: lane-final acc_gm and out writers). Keep it under CHIP_MAX_FANIN
-# with headroom for per-task chain edges.
-assert 2 * LANES + 8 < CHIP_MAX_FANIN, \
-    f"LANES={LANES} joins ~{2 * LANES} edges into the terminal wait, too close to CHIP_MAX_FANIN=128"
 assert TILE_M * TILE_N * 4 <= L0C_BYTES, "acc tile exceeds A5 L0C (256KB)"
 assert TILE_M * TILE_N * 8 <= L0C_BYTES, "acc tile > L0C/2: dbC ping-pong will not fit"
 assert 2 * (TILE_M * TILE_K + TILE_K * TILE_N) <= MAT_BYTES, \
@@ -99,47 +84,81 @@ assert 127 * 127 * K * SCALE < 65504, \
     f"scale {SCALE} overflows FP16 at K={K}: need < {65504 / (127 * 127 * K):.2e}"
 
 
-@pl.jit
-def group_matmul_i8(x: pl.Tensor, w: pl.Tensor, scale: pl.Tensor, out: pl.Out[pl.Tensor]):
-    """Staged dual pipeline: cube GEMM into an INT32 GM scratch, vector dequant out.
+@pl.program
+class GroupMatmulI8:
+    @pl.function(type=pl.FunctionType.InCore)
+    def gemm_tile(
+        self,
+        x: pl.Tensor,
+        w: pl.Tensor,
+        acc_gm: pl.InOut[pl.Tensor],
+        row: pl.Scalar[pl.INDEX],
+        wbase: pl.Scalar[pl.INDEX],
+    ) -> pl.Tensor:
+        """Cube: full [TILE_M, N] strip, INT8 x INT8 -> INT32, one n-tile at a time.
 
-    All loops are runtime range/parallel -- the outlined scope bodies are shared,
-    so the compiled program carries exactly two child kernels (gemm, deq) no
-    matter how large GROUP / N grow.
-    """
-    acc_gm = pl.create_tensor([GROUP * M, N], dtype=pl.INT32)
-    # The HBG runtime hard-caps every task's dependency fan-in at
-    # CHIP_MAX_FANIN = 128 with no spill pool (runtime_types.h), and the
-    # parallel loop's join feeds the run's terminal wait with one edge per lane
-    # per threaded tensor (~2 x LANES: the lane-final acc_gm and out writers).
-    # 64 lanes x 2 tensors = 128 edges hit the cap exactly; a flat
-    # parallel over all 2048 row tiles overshot it 16x. Bound the lane count
-    # and walk the row tiles each lane owns with an inner runtime range loop.
-    for lane in pl.parallel(0, LANES):
-        for i in pl.range(TILES_PER_LANE):
-            row = (lane * TILES_PER_LANE + i) * TILE_M
-            wbase = (row // M) * K
-            for n_i in pl.range(N // TILE_N):
-                n0 = n_i * TILE_N
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="gemm"):
-                    acc = pl.create_tensor([TILE_M, TILE_N], dtype=pl.INT32)
-                    for kb in pl.pipeline(0, K // TILE_K, stage=2):
-                        k0 = kb * TILE_K
-                        a = x[row : row + TILE_M, k0 : k0 + TILE_K]
-                        b = w[wbase + k0 : wbase + k0 + TILE_K, n0 : n0 + TILE_N]
-                        if k0 == 0:
-                            acc = pl.matmul(a, b, out_dtype=pl.INT32)
-                        else:
-                            acc = pl.matmul_acc(acc, a, b)
-                    acc_gm = pl.assemble(acc_gm, acc, [row, n0])
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="deq"):
-                    for r_i in pl.range(TILE_M // DEQ_ROWS):
-                        r0 = r_i * DEQ_ROWS
-                        t = acc_gm[row + r0 : row + r0 + DEQ_ROWS, n0 : n0 + TILE_N]
-                        s = scale[row + r0 : row + r0 + DEQ_ROWS, :]
-                        deq = pl.row_expand_mul(pl.cast(t, target_type=pl.FP32, mode="none"), s)
-                        out = pl.assemble(out, pl.cast(deq, target_type=OUT_DTYPE), [row + r0, n0])
-    return out
+        Head-peel the first K chunk (initialises the accumulator), pipeline the
+        rest -- no create_tensor seed, no predicated matmul_acc.
+        """
+        for n_i in pl.range(N // TILE_N):
+            n0 = n_i * TILE_N
+            a = x[row : row + TILE_M, 0:TILE_K]
+            b = w[wbase : wbase + TILE_K, n0 : n0 + TILE_N]
+            acc = pl.matmul(a, b, out_dtype=pl.INT32)
+            for kb in pl.pipeline(1, K // TILE_K, stage=2):
+                k0 = kb * TILE_K
+                a = x[row : row + TILE_M, k0 : k0 + TILE_K]
+                b = w[wbase + k0 : wbase + k0 + TILE_K, n0 : n0 + TILE_N]
+                acc = pl.matmul_acc(acc, a, b)
+            acc_gm = pl.assemble(acc_gm, acc, [row, n0])
+        return acc_gm
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def deq_tile(
+        self,
+        acc_gm: pl.Tensor,
+        scale: pl.Tensor,
+        out: pl.InOut[pl.Tensor],
+        row: pl.Scalar[pl.INDEX],
+    ) -> pl.Tensor:
+        """Vector: INT32 -> FP32 -> xrow-scale -> FP16, DEQ_ROWS strips at a time."""
+        for n_i in pl.range(N // TILE_N):
+            n0 = n_i * TILE_N
+            for r_i in pl.range(TILE_M // DEQ_ROWS):
+                r0 = r_i * DEQ_ROWS
+                t = acc_gm[row + r0 : row + r0 + DEQ_ROWS, n0 : n0 + TILE_N]
+                s = scale[row + r0 : row + r0 + DEQ_ROWS, :]
+                deq = pl.row_expand_mul(pl.cast(t, target_type=pl.FP32, mode="none"), s)
+                out = pl.assemble(out, pl.cast(deq, target_type=OUT_DTYPE), [row + r0, n0])
+        return out
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+        x: pl.Tensor,
+        w: pl.Tensor,
+        scale: pl.Tensor,
+        out: pl.Out[pl.Tensor],
+    ) -> pl.Tensor:
+        acc_gm = pl.create_tensor([GROUP * M, N], dtype=pl.INT32)
+        # Manual deps: the auto tensormap cannot carry 24576 one-shot writes
+        # under CHIP_MAX_FANIN=128 (see module docstring). The only true
+        # dependency is deq(strip) <- gemm(strip); every region is disjoint.
+        with pl.manual_scope():
+            for t in pl.parallel(0, N_ROW_TILES):
+                row = t * TILE_M
+                wbase = (row // M) * K
+                acc_gm, g_tid = pl.submit(self.gemm_tile, x, w, acc_gm, row, wbase)
+                out, _ = pl.submit(self.deq_tile, acc_gm, scale, out, row, deps=[g_tid])
+        return out
+
+
+_BACKENDS = {
+    "a5": BackendType.Ascend950,
+    "a5sim": BackendType.Ascend950,
+    "a2a3": BackendType.Ascend910B,
+    "a2a3sim": BackendType.Ascend910B,
+}
 
 
 def main() -> None:
@@ -156,12 +175,15 @@ def main() -> None:
     scale = torch.full((GROUP * M, 1), SCALE, dtype=torch.float32)
     out = torch.zeros(GROUP * M, N, dtype=torch.float16)
 
-    n_tiles = GROUP * (M // TILE_M) * (N // TILE_N)
-    print(f"running: {n_tiles} gemm + {n_tiles} deq tasks, "
+    print(f"compiling: {2 * N_ROW_TILES} tasks (gemm+deq per row strip), "
           f"acc_gm = {GROUP * M * N * 4 / 2**30:.1f} GB ...")
     t0 = time.perf_counter()
-    group_matmul_i8(x, w, scale, out, config=cfg)
-    print(f"done in {time.perf_counter() - t0:.1f}s (first call includes compile)")
+    compiled = ir.compile(GroupMatmulI8, backend_type=_BACKENDS[args.platform])
+    print(f"compiled in {time.perf_counter() - t0:.1f}s")
+
+    t0 = time.perf_counter()
+    compiled(x, w, scale, out, config=cfg)
+    print(f"done in {time.perf_counter() - t0:.1f}s")
 
     print("verifying per group ...")
     for g in range(GROUP):
@@ -170,7 +192,7 @@ def main() -> None:
         assert torch.allclose(got.float(), ref.float(), rtol=1e-2, atol=1e-2), (
             f"group {g}: max err = {(got.float() - ref.float()).abs().max().item()}"
         )
-    print(f"OK  tasks = {2 * n_tiles}  (AIC x{CUBE_CORES} + AIV x{AIV_CORES} saturated)")
+    print(f"OK  tasks = {2 * N_ROW_TILES}  (AIC x{CUBE_CORES} + AIV x{AIV_CORES} saturated)")
 
 
 if __name__ == "__main__":
