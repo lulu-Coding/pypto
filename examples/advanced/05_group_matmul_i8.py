@@ -67,6 +67,8 @@ VEC_BYTES = 240 * 1024                   # A5 safe Vec (UB)
 CUBE_CORES, AIV_CORES = 18, 36
 
 N_ROW_TILES = GROUP * M // TILE_M
+ROWS_X = GROUP * M                       # x / scale / acc_gm / out rows
+ROWS_W = GROUP * K                       # w rows
 
 # Config sanity: every hardware bound is checked here so a bad edit fails at
 # import with the reason, never silently on device.
@@ -89,12 +91,12 @@ class GroupMatmulI8:
     @pl.function(type=pl.FunctionType.InCore)
     def gemm_tile(
         self,
-        x: pl.Tensor,
-        w: pl.Tensor,
-        acc_gm: pl.InOut[pl.Tensor],
+        x: pl.Tensor[[ROWS_X, K], pl.INT8],
+        w: pl.Tensor[[ROWS_W, N], pl.INT8],
+        acc_gm: pl.InOut[pl.Tensor[[ROWS_X, N], pl.INT32]],
         row: pl.Scalar[pl.INDEX],
         wbase: pl.Scalar[pl.INDEX],
-    ) -> pl.Tensor:
+    ) -> pl.Tensor[[ROWS_X, N], pl.INT32]:
         """Cube: full [TILE_M, N] strip, INT8 x INT8 -> INT32, one n-tile at a time.
 
         Head-peel the first K chunk (initialises the accumulator), pipeline the
@@ -116,11 +118,11 @@ class GroupMatmulI8:
     @pl.function(type=pl.FunctionType.InCore)
     def deq_tile(
         self,
-        acc_gm: pl.Tensor,
-        scale: pl.Tensor,
-        out: pl.InOut[pl.Tensor],
+        acc_gm: pl.Tensor[[ROWS_X, N], pl.INT32],
+        scale: pl.Tensor[[ROWS_X, 1], pl.FP32],
+        out: pl.InOut[pl.Tensor[[ROWS_X, N], OUT_DTYPE]],
         row: pl.Scalar[pl.INDEX],
-    ) -> pl.Tensor:
+    ) -> pl.Tensor[[ROWS_X, N], OUT_DTYPE]:
         """Vector: INT32 -> FP32 -> xrow-scale -> FP16, DEQ_ROWS strips at a time."""
         for n_i in pl.range(N // TILE_N):
             n0 = n_i * TILE_N
@@ -135,11 +137,11 @@ class GroupMatmulI8:
     @pl.function(type=pl.FunctionType.Orchestration)
     def main(
         self,
-        x: pl.Tensor,
-        w: pl.Tensor,
-        scale: pl.Tensor,
-        out: pl.Out[pl.Tensor],
-    ) -> pl.Tensor:
+        x: pl.Tensor[[ROWS_X, K], pl.INT8],
+        w: pl.Tensor[[ROWS_W, N], pl.INT8],
+        scale: pl.Tensor[[ROWS_X, 1], pl.FP32],
+        out: pl.Out[pl.Tensor[[ROWS_X, N], OUT_DTYPE]],
+    ) -> pl.Tensor[[ROWS_X, N], OUT_DTYPE]:
         acc_gm = pl.create_tensor([GROUP * M, N], dtype=pl.INT32)
         # Manual deps: the auto tensormap cannot carry 24576 one-shot writes
         # under CHIP_MAX_FANIN=128 (see module docstring). The only true
