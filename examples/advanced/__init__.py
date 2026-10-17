@@ -14,6 +14,7 @@ Advanced examples — performance and low-level techniques.
   02_auto_tile_matmul.py — compiler-driven L0 matmul tiling (DDR/Mat-scratch x full-K/split-K)
   03_mixed_kernel.py     — cube and vector in one scope via pl.split (vs. two scopes)
   04_moe_graph_predicate.py — MoE routing in a recorded Graph via dispatch predicates
+  05_group_matmul_i8.py — A5 INT8 group matmul (C2V mixed / staged dequant epilogues)
 """
 
 import importlib
@@ -24,6 +25,7 @@ _ALIASES = {
     "auto_tile_matmul": "02_auto_tile_matmul",
     "mixed_kernel": "03_mixed_kernel",
     "moe_graph_predicate": "04_moe_graph_predicate",
+    "group_matmul_i8": "05_group_matmul_i8",
 }
 
 for _alias, _numbered in _ALIASES.items():
