@@ -36,6 +36,7 @@ Run:
 """
 
 import argparse
+import os
 import time
 
 import pypto.language as pl
@@ -43,6 +44,12 @@ import torch
 from pypto import ir
 from pypto.backend import BackendType
 from pypto.runtime import RunConfig
+
+# All N_TASKS submits share one manual scope, and a scope's task ring only
+# reclaims slots at scope_end: the default ring_task_window deadlocks once the
+# task count passes it (SCOPE_DEADLOCK, orch_error_code=1). Raise it before
+# the runtime initializes. 65536 comfortably covers the default shape's 24576.
+os.environ.setdefault("PTO2_RING_TASK_WINDOW", "65536")
 
 # ============ shape config (edit freely) ============
 GROUP = 32
