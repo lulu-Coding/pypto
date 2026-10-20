@@ -197,6 +197,20 @@ class LowerPipelineMutator : public IRMutator {
  public:
   StmtPtr VisitStmt_(const ForStmtPtr& op) override {
     if (op->kind_ != ForKind::Pipeline || !op->HasAttr(kPipelineStagesAttr)) {
+      // Track sequential loop scope: pipelines inside the same sequential loop
+      // (e.g. a pl.range n-loop) execute their iterations sequentially, so their
+      // pipeline groups can share L0 buffer slots. Save/restore the scope state
+      // so nesting works correctly.
+      if (op->kind_ == ForKind::Sequential) {
+        const bool saved_in_scope = in_sequential_scope_;
+        const int32_t saved_scope_group = sequential_scope_group_;
+        in_sequential_scope_ = true;
+        sequential_scope_group_ = -1;  // fresh scope
+        auto result = IRMutator::VisitStmt_(op);
+        in_sequential_scope_ = saved_in_scope;
+        sequential_scope_group_ = saved_scope_group;
+        return result;
+      }
       return IRMutator::VisitStmt_(op);
     }
     int64_t factor = static_cast<int64_t>(op->GetAttr<int>(kPipelineStagesAttr, 0));
@@ -237,6 +251,23 @@ class LowerPipelineMutator : public IRMutator {
   /// Distinct regions get distinct ids so MemoryReuse only forbids cross-stage
   /// reuse *within* a region, never between unrelated pipelines.
   int32_t next_pipeline_group_ = 0;
+
+  /// Sequential-scope group sharing (the PH-MR-001 L0B fix):
+  ///
+  /// When a `pl.range` n-loop body contains multiple pipeline loops (e.g. a
+  /// head-peel pipeline + an explicit K-pipeline + AutoTile-created inner
+  /// pipelines), each would normally get a distinct group ID. MemoryReuse's
+  /// capacity gate then sums ALL groups' buffer requirements simultaneously,
+  /// over-subscribing L0B even though the pipelines execute sequentially
+  /// across n-iterations -- the depth-2 double-buffering that would fit for
+  /// any ONE group is reported as not fitting (PH-MR-001).
+  ///
+  /// Fix: when inside a sequential loop, all ReplicateBody calls share one
+  /// group ID. The capacity gate then sees only the maximum concurrent
+  /// requirement (the pipeline's own stage count), not the sum of all
+  /// sequential groups' requirements.
+  bool in_sequential_scope_ = false;
+  int32_t sequential_scope_group_ = -1;
 
   /// Empty static trip-count path — no replication needed and nothing for
   /// CanonicalizeIOOrder to cluster (the loop never executes). Demote kind to
@@ -281,7 +312,21 @@ class LowerPipelineMutator : public IRMutator {
     // The main loop and each (static / dynamic-cascade) tail are separate
     // ReplicateBody calls and thus separate groups — main-loop and tail tiles
     // are temporally disjoint and may freely reuse across the group boundary.
-    const int32_t group = next_pipeline_group_++;
+    //
+    // Sequential-scope sharing (PH-MR-001 fix): when inside a sequential
+    // (pl.range) loop, reuse the scope's group ID so MemoryReuse's capacity
+    // gate sees ONE group's concurrent requirement instead of summing all
+    // sequential pipelines' requirements.
+    int32_t group;
+    if (in_sequential_scope_) {
+      if (sequential_scope_group_ < 0) {
+        // First pipeline in this sequential scope: allocate the shared group
+        sequential_scope_group_ = next_pipeline_group_++;
+      }
+      group = sequential_scope_group_;
+    } else {
+      group = next_pipeline_group_++;
+    }
 
     std::vector<StmtPtr> clones;
     clones.reserve(static_cast<size_t>(n_clones));
