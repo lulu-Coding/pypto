@@ -47,9 +47,9 @@ GROUP = 32                               # number of groups
 GROUP_M = 256                            # rows per group
 K, N = 3584, 3072
 M = GROUP_M * GROUP                      # 8192 total rows
-TILE_M, TILE_N = 128, 256               # sim-safe; 256x256 (Huawei exact) crashes old a5sim
+TILE_M, TILE_N = 256, 256               # AscendC arch35 exact: 256x256 fills L0C/L0A/L0B
 L0_K = 128                              # L0 chunk depth: L0B/2/(TILE_N*1B)
-L1_K = 256                              # Mat panel depth (Huawei: 512)
+L1_K = 512                              # AscendC arch35: stepK=4, deep MTE2 prefetch
 # ===================================================
 
 L0C_BYTES = 256 * 1024
@@ -58,7 +58,7 @@ L0B_BYTES = 64 * 1024
 MAT_BYTES = 512 * 1024
 CUBE_CORES = 18
 
-N_STRIPS = M // TILE_M                   # 64 strips
+N_STRIPS = M // TILE_M                   # 32 strips (one per group)
 ROWS_X = M                               # 8192
 ROWS_W = GROUP * K                       # 114688
 
@@ -70,7 +70,8 @@ assert L0_K == (L0B_BYTES // 2) // (TILE_N * 1) & ~15, "L0_K must follow the arc
 assert TILE_M * TILE_N * 4 <= L0C_BYTES, "acc block exceeds A5 L0C (256KB)"
 assert 2 * (TILE_M * L0_K) <= L0A_BYTES, "L0A double-buffer does not fit"
 assert 2 * (L0_K * TILE_N) <= L0B_BYTES, "L0B double-buffer does not fit"
-assert 2 * (TILE_M * L1_K + L1_K * TILE_N) <= MAT_BYTES
+assert 2 * (TILE_M * L1_K + L1_K * TILE_N) <= MAT_BYTES, \
+    "Mat panels x pipeline double-buffer exceed L1; lower L1_K"
 assert 127 * 127 * K < 2**31, "INT32 accumulator overflow at this K"
 
 
