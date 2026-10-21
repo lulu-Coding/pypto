@@ -156,7 +156,7 @@ class GroupMatmulI8Flags:
             # === FIXPIPE: drain L0C (async) ===
             pl.system.wait_flag(pl.PipeType.FIX, pl.PipeType.M, event_id=EV_L0C)
             out = pl.store(acc, [row, n0], out)
-            pl.system.set_flag(pl.PipeType.M, pl.PipeType.FIX, event_id=EV_L0C)
+            pl.system.set_flag(pl.PipeType.FIX, pl.PipeType.M, event_id=EV_L0C)
             # Do NOT wait for FIXPIPE here — next n-block's MTE2 starts now.
 
         return out
