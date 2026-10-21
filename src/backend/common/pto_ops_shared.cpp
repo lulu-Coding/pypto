@@ -205,23 +205,17 @@ codegen::TileTypeComponents InferSubviewTileTypeComponents(const ir::TileType& s
   // Non-subview tile types always render that way (see ExtractTileTypeInfo in
   // pto_type_utils.cpp) — even when the IR's `tile_view_.valid_shape` is set —
   // so reading the parent's IR valid here can diverge from PTOAS. The case
-  // that surfaces in practice is SplitVectorKernel's lane1 [0, 0] sentinel
-  // (set by WithZeroValidShape on cloned lane1 ops): the parent prints as `?`
-  // but its IR valid is `[0, 0]`, producing a `v_row=0, v_col=0` result that
-  // PTOAS rejects (issue #1507).
+  // that surfaces in practice is the lane-1 all-zero sentinel, which would
+  // produce a `v_row=0, v_col=0` result that ccec cannot compile (issue #1507);
+  // `IsZeroValidShapeSentinel` owns that rationale.
   //
-  // Special-case only the all-zero sentinel; for every other narrow valid
-  // (e.g., parent subviews whose deducer propagated a real `v_row/v_col`)
-  // keep the existing inference so nested subviews still type correctly.
+  // Only the sentinel is special-cased; for every other narrow valid (e.g.,
+  // parent subviews whose deducer propagated a real `v_row/v_col`) keep the
+  // existing inference so nested subviews still type correctly.
   std::vector<ir::ExprPtr> source_valid = source_tile_type.shape_;
   if (source_tile_type.tile_view_.has_value() && source_tile_type.tile_view_->valid_shape.size() >= 2) {
     const auto& parent_valid = source_tile_type.tile_view_->valid_shape;
-    const bool is_zero_sentinel =
-        std::all_of(parent_valid.begin(), parent_valid.end(), [](const ir::ExprPtr& e) {
-          auto c = As<ir::ConstInt>(e);
-          return c && c->value_ == 0;
-        });
-    if (!is_zero_sentinel) {
+    if (!ir::tile_view_semantics::IsZeroValidShapeSentinel(parent_valid)) {
       source_valid = parent_valid;
     }
   }
@@ -395,7 +389,7 @@ void RequireStaticValidShapeForPtoas(const std::shared_ptr<const ir::TileType>& 
                                      std::string_view op_name, std::string_view role, const ir::Span& span) {
   CHECK_SPAN(HasStaticValidShape(tile_type), span)
       << op_name << " on A2/A3 requires compile-time static valid_shape on " << role
-      << " for PTOAS level3 tmp verification";
+      << " for PTOAS scratch sizing or verification";
 }
 
 std::string GetTileViewTypeAnnotation(const ir::ExprPtr& expr, codegen::PTOCodegen& codegen) {
@@ -409,24 +403,20 @@ std::string GetTileViewTypeAnnotation(const ir::ExprPtr& expr, codegen::PTOCodeg
 
 std::string EnsureTileViewSsa(const ir::ExprPtr& expr,
                               const std::shared_ptr<const ir::TileType>& view_tile_type,
-                              codegen::PTOCodegen& codegen, const std::string& temp_prefix) {
+                              codegen::PTOCodegen& codegen, const std::string& temp_prefix,
+                              std::optional<MutableTileViewShape> mutable_valid_shape) {
   INTERNAL_CHECK(view_tile_type) << "Internal error: EnsureTileViewSsa requires a TileType view";
-  const std::string view_type = codegen.GetViewTileBufTypeStringFromTileType(view_tile_type);
-  std::string current_ssa = codegen.GetExprAsCode(expr);
-  const std::string current_type = codegen.GetExprTypeAnnotation(expr);
-  if (!current_type.empty() && current_type == view_type) {
-    return current_ssa;
+  const std::string source = codegen.GetExprAsCode(expr);
+  const std::string source_type = codegen.GetExprTypeAnnotation(expr);
+  std::optional<std::pair<std::string, std::string>> valid_shape;
+  if (mutable_valid_shape) {
+    INTERNAL_CHECK_SPAN(codegen.IsMutableTileName(source), expr->span_)
+        << "Internal error: a mutable tile view requires a locally mutable source";
+    INTERNAL_CHECK_SPAN(!mutable_valid_shape->rows.empty() && !mutable_valid_shape->cols.empty(), expr->span_)
+        << "Internal error: a mutable tile view requires both initial valid extents";
+    valid_shape.emplace(mutable_valid_shape->rows, mutable_valid_shape->cols);
   }
-  std::string view_ssa = codegen.NewNamedTemp(temp_prefix);
-  codegen.RegisterTileBufType(view_ssa, view_type);
-  codegen.RegisterTileViewName(view_ssa);
-  std::ostringstream oss;
-  oss << view_ssa << " = pto.treshape " << current_ssa;
-  if (!current_type.empty()) {
-    oss << " : " << current_type << " -> " << view_type;
-  }
-  codegen.Emit(oss.str());
-  return view_ssa;
+  return codegen.EnsureTileView(source, source_type, view_tile_type, temp_prefix, valid_shape);
 }
 
 std::string EnsureStaticViewTileSsa(const ir::ExprPtr& expr, codegen::PTOCodegen& codegen,

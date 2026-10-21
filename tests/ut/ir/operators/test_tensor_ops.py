@@ -148,6 +148,174 @@ def test_tensor_matmul_with_transpose():
     assert _const_shape(call) == [4, 4]
 
 
+@pytest.mark.parametrize("a_trans,b_trans", [(False, False), (True, False), (False, True), (True, True)])
+@pytest.mark.parametrize("valid_m,valid_n", [(17, 32), (32, 24), (17, 24), (32, 32)])
+def test_tensor_matmul_valid_shape(valid_m, valid_n, a_trans, b_trans):
+    """Transpose maps physical and valid axes identically without shrinking storage."""
+    lhs_shape, rhs_shape = [32, 128], [128, 32]
+    lhs_valid, rhs_valid = [valid_m, 128], [128, valid_n]
+    if a_trans:
+        lhs_shape, lhs_valid = lhs_shape[::-1], lhs_valid[::-1]
+    if b_trans:
+        rhs_shape, rhs_valid = rhs_shape[::-1], rhs_valid[::-1]
+    lhs = _partial_tensor_var(lhs_shape, lhs_valid, name="a", dtype=DataType.FP16)
+    rhs = _partial_tensor_var(rhs_shape, rhs_valid, name="b", dtype=DataType.FP16)
+    call = tensor.matmul(lhs, rhs, a_trans=a_trans, b_trans=b_trans, out_dtype=DataType.FP32)
+    assert isinstance(call.type, ir.TensorType)
+    assert _const_shape(call) == [32, 32]
+    assert _valid_of(call.type) == [valid_m, valid_n]
+    assert call.type.dtype == DataType.FP32
+    if (valid_m, valid_n) == (32, 32):
+        assert call.type.tensor_view is None
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_tensor_matmul_full_valid_shape_is_canonical(explicit):
+    """Both omitted and explicit full valid shapes retain the original bare type."""
+    make = _partial_tensor_var if explicit else lambda shape, valid: _tensor_var("t", shape)
+    call = tensor.matmul(make([32, 128], [32, 128]), make([128, 32], [128, 32]))
+    assert isinstance(call.type, ir.TensorType)
+    assert _const_shape(call) == [32, 32]
+    assert call.type.tensor_view is None
+
+
+@pytest.mark.parametrize("a_trans,b_trans", [(False, False), (True, False), (False, True), (True, True)])
+def test_tensor_matmul_symbolic_valid_shape(a_trans, b_trans):
+    """Runtime M/N expressions survive inference verbatim."""
+    span = ir.Span.unknown()
+    m = ir.Var("m", ir.ScalarType(DataType.INDEX), span)
+    n = ir.Var("n", ir.ScalarType(DataType.INDEX), span)
+    valid_m = ir.Add(m, ir.ConstInt(1, DataType.INDEX, span), DataType.INDEX, span)
+    lhs = _partial_tensor_var(
+        [128, 32] if a_trans else [32, 128], [128, valid_m] if a_trans else [valid_m, 128]
+    )
+    rhs = _partial_tensor_var([32, 128] if b_trans else [128, 32], [n, 128] if b_trans else [128, n])
+    result = tensor.matmul(lhs, rhs, a_trans=a_trans, b_trans=b_trans)
+    assert _const_shape(result) == [32, 32]
+    assert isinstance(result.type, ir.TensorType)
+    assert result.type.tensor_view is not None
+    ir.assert_structural_equal(result.type.tensor_view.valid_shape[0], valid_m)
+    ir.assert_structural_equal(result.type.tensor_view.valid_shape[1], n)
+
+
+def test_tensor_matmul_does_not_inherit_input_storage_view():
+    """A product has fresh ND storage, independent of operand strides/layout/pad."""
+    span = ir.Span.unknown()
+    lhs = ir.Var(
+        "a",
+        ir.TensorType(
+            [32, 128],
+            DataType.FP16,
+            memref=ir.MemRef("input_storage", 64, 16384, span),
+            tensor_view=ir.TensorView([256, 1], ir.TensorLayout.NZ, [17, 128], ir.PadValue.zero),
+        ),
+        span,
+    )
+    rhs = _partial_tensor_var([128, 32], [128, 24], dtype=DataType.FP16)
+    result = tensor.matmul(lhs, rhs).type
+    assert isinstance(result, ir.TensorType)
+    assert result.tensor_view is not None
+    assert _valid_of(result) == [17, 24]
+    assert result.memref is None
+    assert result.tensor_view.stride == []
+    assert result.tensor_view.layout == ir.TensorLayout.ND
+    assert result.tensor_view.pad == ir.PadValue.null
+
+
+@pytest.mark.parametrize("a_trans,b_trans", [(False, False), (True, False), (False, True), (True, True)])
+@pytest.mark.parametrize("lhs_k,rhs_k", [(128, 128), (64, 128), (128, 64)])
+def test_tensor_matmul_valid_k_matches_tile_contract(a_trans, b_trans, lhs_k, rhs_k):
+    """RHS must cover LHS valid K; a smaller RHS is rejected instead of taking min."""
+    lhs = _partial_tensor_var([128, 32] if a_trans else [32, 128], [lhs_k, 17] if a_trans else [17, lhs_k])
+    rhs = _partial_tensor_var([32, 128] if b_trans else [128, 32], [24, rhs_k] if b_trans else [rhs_k, 24])
+    if lhs_k > rhs_k:
+        with pytest.raises(ValueError, match="rhs valid K to cover lhs valid K"):
+            tensor.matmul(lhs, rhs, a_trans=a_trans, b_trans=b_trans)
+    else:
+        result = tensor.matmul(lhs, rhs, a_trans=a_trans, b_trans=b_trans)
+        assert _const_shape(result) == [32, 32]
+        assert _valid_of(result.type) == [17, 24]
+
+
+def test_tensor_matmul_rejects_physical_k_mismatch_even_with_equal_valid_k():
+    """Valid extents cannot make incompatible physical K boxes legal."""
+    with pytest.raises(ValueError, match="matching inner dimensions"):
+        tensor.matmul(_partial_tensor_var([32, 128], [17, 64]), _partial_tensor_var([64, 32], [64, 24]))
+
+
+@pytest.mark.parametrize(
+    "lhs_shape,lhs_valid,rhs_shape,rhs_valid,expected",
+    [
+        ([128], [64], [128], [64], []),
+        ([32, 128], [17, 128], [128], [128], [32]),
+        ([128], [128], [128, 32], [128, 24], [32]),
+        ([2, 32, 128], [2, 17, 128], [2, 128, 32], [2, 128, 24], [2, 32, 32]),
+    ],
+)
+def test_tensor_matmul_other_ranks_keep_existing_inference(
+    lhs_shape, lhs_valid, rhs_shape, rhs_valid, expected
+):
+    """The 2D fix does not introduce vector or batched valid-shape semantics."""
+    result = tensor.matmul(
+        _partial_tensor_var(lhs_shape, lhs_valid), _partial_tensor_var(rhs_shape, rhs_valid)
+    )
+    assert _const_shape(result) == expected
+    assert isinstance(result.type, ir.TensorType)
+    assert result.type.tensor_view is None
+
+
+@pytest.mark.parametrize("window_side", ["lhs", "rhs", "both"])
+def test_tensor_matmul_partial_window_keeps_existing_inference(window_side):
+    """Distributed operands still produce the existing fresh full-valid local tensor."""
+    lhs_factory = _partial_distributed_tensor_var if window_side in ("lhs", "both") else _partial_tensor_var
+    rhs_factory = _partial_distributed_tensor_var if window_side in ("rhs", "both") else _partial_tensor_var
+    result = tensor.matmul(lhs_factory([32, 128], [17, 128]), rhs_factory([128, 32], [128, 24]))
+    assert _const_shape(result) == [32, 32]
+    assert isinstance(result.type, ir.TensorType)
+    assert not isinstance(result.type, ir.DistributedTensorType)
+    assert result.type.tensor_view is None
+
+
+def test_tensor_matmul_acc_partial_inputs_keep_existing_inference():
+    """Accumulator inference is independent of fresh-product valid-shape propagation."""
+    result = tensor.matmul_acc(
+        _partial_tensor_var([32, 32], [17, 24]),
+        _partial_tensor_var([32, 128], [17, 128]),
+        _partial_tensor_var([128, 32], [128, 24]),
+    )
+    assert _const_shape(result) == [32, 32]
+    assert isinstance(result.type, ir.TensorType)
+    assert result.type.tensor_view is None
+
+
+@pytest.mark.parametrize("side", ["lhs", "rhs"])
+def test_tensor_matmul_rejects_invalid_valid_shape_rank(side):
+    lhs_valid, rhs_valid = ([17], [128, 24]) if side == "lhs" else ([17, 128], [24])
+    with pytest.raises(ValueError, match="valid_shape rank"):
+        tensor.matmul(_partial_tensor_var([32, 128], lhs_valid), _partial_tensor_var([128, 32], rhs_valid))
+
+
+def test_tensor_matmul_symbolic_valid_shape_roundtrip():
+    """Inferred tensor views survive the ordinary parser and printer."""
+
+    @pl.program
+    class Program:
+        @pl.function
+        def main(
+            self,
+            a: pl.Tensor[[32, 128], pl.FP16],
+            b: pl.Tensor[[128, 32], pl.FP16],
+            m: pl.Scalar[pl.INDEX],
+            n: pl.Scalar[pl.INDEX],
+        ):
+            av = pl.slice(a, [32, 128], [0, 0], valid_shape=[m + 1, 128])
+            bv = pl.slice(b, [128, 32], [0, 0], valid_shape=[128, n])
+            c = pl.matmul(av, bv, out_dtype=pl.FP32)
+            return c
+
+    ir.assert_structural_equal(pl.parse(ir.python_print(Program)), Program)
+
+
 def test_tensor_matmul_mat_vec_honors_a_trans():
     """2D x 1D contracts over dim 0 of the lhs when a_trans is set."""
     # lhs stored [K=128, M=64] with a_trans, rhs [K=128] -> [64]
@@ -408,6 +576,19 @@ def test_tensor_row_sum():
     # Check result type - should be [64, 1]
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
+
+
+@pytest.mark.parametrize("is_binary", [False, True])
+def test_tensor_col_sum_strategy_roundtrip(is_binary):
+    @pl.program
+    class Program:
+        @pl.function
+        def main(self, x: pl.Tensor[[63, 192], pl.FP32]) -> pl.Tensor[[1, 192], pl.FP32]:
+            result = pl.col_sum(x, is_binary=is_binary)
+            return result
+
+    reparsed = pl.parse(ir.python_print(Program))
+    ir.assert_structural_equal(reparsed, Program)
 
 
 def test_tensor_col_sum():
@@ -1287,6 +1468,30 @@ def test_tensor_cast():
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.FP32
     assert len(result_type.shape) == 2
+
+
+def test_tensor_cast_fp4e2m1x2_rebuilds_contiguous_strides():
+    """Unpack cast must not scale a non-contiguous source stride (e.g. 64→128)."""
+    span = ir.Span.unknown()
+    shape = [ir.ConstInt(16, DataType.INDEX, span), ir.ConstInt(32, DataType.INDEX, span)]
+    # Non-contiguous row pitch 64 (contiguous would be 32).
+    view = ir.TensorView(
+        [ir.ConstInt(64, DataType.INDEX, span), ir.ConstInt(1, DataType.INDEX, span)],
+        ir.TensorLayout.ND,
+    )
+    tensor_var = ir.Var("packed", ir.TensorType(shape, DataType.FP4E2M1X2, None, view), span)
+
+    call = ir.op.tensor.cast(tensor_var, DataType.BF16)
+    result = call.type
+    assert isinstance(result, ir.TensorType)
+    assert result.dtype == DataType.BF16
+    assert _const_shape(call) == [16, 64]
+    assert result.tensor_view is not None
+    assert [d.value for d in result.tensor_view.stride if isinstance(d, ir.ConstInt)] == [64, 1]
+
+    # Fresh contiguous BF16 must accept a dense reshape/view collapse.
+    flat = ir.op.tensor.view(call, [1, 1024])
+    assert _const_shape(flat) == [1, 1024]
 
 
 def test_tensor_cast_rejects_same_dtype():
@@ -2176,10 +2381,67 @@ class TestTensorReinterpretViewIR:
         with pytest.raises(ValueError, match="does not support target dtype"):
             tensor.reinterpret_view(self._var([8, 16], DataType.FP32), DataType.INT4)
 
+    @pytest.mark.parametrize(
+        ("source_dtype", "target_dtype"),
+        [
+            (DataType.UINT8, DataType.FP4E2M1X2),
+            (DataType.INT8, DataType.FP4E2M1X2),
+            (DataType.FP4E2M1X2, DataType.UINT8),
+            (DataType.FP4E2M1X2, DataType.INT8),
+        ],
+    )
+    def test_fp4_byte_alias_preserves_partial_valid_shape(self, source_dtype, target_dtype):
+        # InCore lowers these tensor aliases to the same checked UB aliases as
+        # the tile API; both extents still count one-byte carriers.
+        view = ir.TensorView([], ir.TensorLayout.ND, valid_shape=[16, 128], pad=ir.PadValue.zero)
+        call = tensor.reinterpret_view(self._var([32, 256], source_dtype, view), target_dtype)
+        assert isinstance(call.type, ir.TensorType)
+        assert call.type.tensor_view is not None
+        assert _const_int_values(call.type.tensor_view.valid_shape) == [16, 128]
+        assert call.type.tensor_view.pad == ir.PadValue.zero
+
     def test_rejects_strided_tensor(self):
         view = ir.TensorView([32, 1], ir.TensorLayout.ND)
         with pytest.raises(ValueError, match="only supports packed tensors"):
             tensor.reinterpret_view(self._var([8, 16], DataType.FP32, view), DataType.INT16)
+
+    @pytest.mark.parametrize(
+        ("source_dtype", "target_dtype"),
+        [
+            (DataType.FP4E2M1X2, DataType.UINT8),
+            (DataType.UINT8, DataType.FP4E2M1X2),
+            (DataType.FP4E2M1X2, DataType.INT8),
+            (DataType.INT8, DataType.FP4E2M1X2),
+        ],
+    )
+    def test_fp4e2m1x2_byte_alias_preserves_shape(self, source_dtype, target_dtype):
+        call = tensor.reinterpret_view(self._var([4, 64], source_dtype), target_dtype)
+
+        assert isinstance(call.type, ir.TensorType)
+        assert call.type.dtype == target_dtype
+        assert self._shape_values(call.type) == [4, 64]
+
+    @pytest.mark.parametrize(
+        ("source_dtype", "target_dtype"),
+        [
+            (DataType.FP4E2M1X2, DataType.UINT8),
+            (DataType.UINT8, DataType.FP4E2M1X2),
+            (DataType.FP4E2M1X2, DataType.INT8),
+            (DataType.INT8, DataType.FP4E2M1X2),
+        ],
+    )
+    @pytest.mark.parametrize("shape", [[2, 128], [256]])
+    def test_fp4e2m1x2_byte_alias_rejects_shape_change(self, source_dtype, target_dtype, shape):
+        with pytest.raises(ValueError, match="FP4E2M1X2 aliases require the same shape"):
+            tensor.reinterpret_view(self._var([4, 64], source_dtype), target_dtype, shape=shape)
+
+    def test_rejects_logical_fp4_reinterpret(self):
+        with pytest.raises(ValueError, match="does not support source dtype"):
+            tensor.reinterpret_view(self._var([4, 64], DataType.FP4), DataType.UINT8)
+
+    def test_rejects_fp4e2m1x2_to_bf16_reinterpret(self):
+        with pytest.raises(ValueError, match="FP4E2M1X2 aliases"):
+            tensor.reinterpret_view(self._var([4, 64], DataType.FP4E2M1X2), DataType.BF16)
 
 
 class TestTensorReinterpretViewDSL:
@@ -2508,6 +2770,80 @@ def test_tensor_slice_drop_dims_drops_valid_shape_axes():
     assert [d.value for d in result_type.shape if isinstance(d, ir.ConstInt)] == [8, 64]
     assert result_type.tensor_view is not None
     assert [d.value for d in result_type.tensor_view.valid_shape if isinstance(d, ir.ConstInt)] == [4, 64]
+
+
+def _layout_of(call: ir.Call) -> ir.TensorLayout:
+    """The layout a call's result type claims; an absent view means the ND default."""
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    if result_type.tensor_view is None:
+        return ir.TensorLayout.ND
+    return result_type.tensor_view.layout
+
+
+def _result_dims(call: ir.Call) -> list[int]:
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    return [d.value for d in result_type.shape if isinstance(d, ir.ConstInt)]
+
+
+def _view_var(shape, layout, name="t"):
+    span = ir.Span.unknown()
+    view = ir.TensorView([], layout)
+    return ir.Var(name, ir.TensorType(shape, DataType.FP32, None, view), span)
+
+
+def test_tensor_slice_keeps_dn_layout():
+    """A slice is a view into the source bytes, so it cannot become row-major ND."""
+    call = ir.op.tensor.slice(_view_var([32, 32], ir.TensorLayout.DN), [16, 32], [0, 0])
+
+    assert _layout_of(call) == ir.TensorLayout.DN
+
+
+def test_tensor_slice_keeps_nz_layout():
+    """The same rule for NZ: the fractal order of the selected bytes is unchanged."""
+    call = ir.op.tensor.slice(_view_var([512, 256], ir.TensorLayout.NZ), [256, 128], [0, 0])
+
+    assert _layout_of(call) == ir.TensorLayout.NZ
+
+
+def test_tensor_slice_keeps_layout_when_only_leading_axes_are_dropped():
+    """Dropping a batch axis leaves the trailing plane -- and so the layout -- intact."""
+    call = ir.op.tensor.slice(
+        _view_var([4, 512, 256], ir.TensorLayout.NZ), [1, 512, 256], [2, 0, 0], drop_dims=[0]
+    )
+
+    assert _result_dims(call) == [512, 256]
+    assert _layout_of(call) == ir.TensorLayout.NZ
+
+
+def test_tensor_slice_drops_layout_when_a_trailing_axis_is_dropped():
+    """DN and NZ are claims about the trailing pair; erasing one of those axes ends them."""
+    call = ir.op.tensor.slice(
+        _view_var([512, 256, 1], ir.TensorLayout.DN), [512, 256, 1], [0, 0, 0], drop_dims=[2]
+    )
+
+    assert _result_dims(call) == [512, 256]
+    assert _layout_of(call) == ir.TensorLayout.ND
+
+
+def test_tensor_slice_drops_layout_for_a_lower_rank_window():
+    """A lower-rank window re-associates the source axes, so its layout is not inherited."""
+    call = ir.op.tensor.slice(_view_var([4, 512, 256], ir.TensorLayout.NZ), [512, 256], [0, 0])
+
+    assert _layout_of(call) == ir.TensorLayout.ND
+
+
+def test_tensor_slice_of_nd_source_still_carries_no_view():
+    """The ND path is unchanged: a fully valid ND slice keeps its canonical empty view."""
+    span = ir.Span.unknown()
+    tensor_var = ir.Var("t", ir.TensorType([32, 32], DataType.FP32), span)
+
+    call = ir.op.tensor.slice(tensor_var, [16, 32], [0, 0])
+
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.tensor_view is None
 
 
 def test_tensor_slice_drop_dims_rejects_non_unit_dim():

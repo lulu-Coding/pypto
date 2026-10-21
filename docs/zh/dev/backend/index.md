@@ -10,7 +10,49 @@ pass 从不对 `BackendType` 做分支判断。所有与架构相关的内容 �
 | ---- | ---- |
 | [BackendHandler：有原则的后端分派](00-backend_handler.md) | 该虚接口、pass 如何查询它，以及新增后端需要做什么 |
 
+## 已注册算子清单
+
+通过具体后端查询实际注册的算子：
+
+```python
+from pypto import backend
+
+target = backend.get_backend_instance(backend.BackendType.Ascend910)
+names = target.get_registered_op_names()
+```
+
+返回列表已排序，与注册表相互独立。查询结果反映目标架构的排除项和覆盖项，
+不会改变全局后端选择。检视降低（lowering）覆盖范围时应使用该清单；
+解析注册源码可能误计注释中的示例，或遗漏通过共享表注册的名称。
+算子已注册并不意味着它支持所有数据类型、形状或布局。
+列表也包含 IR 算子定义已不存在的历史后端条目；检视当前 IR 时，
+可通过 `ir.is_op_registered(name)` 区分这些条目。
+
+审核清单位于 `tests/ut/backend/buffer_migration_inventory.py`：
+`MIGRATION_FAMILIES` 将 168 个有效名称分为 22 个算子族，
+`HISTORICAL_CALLBACKS` 记录 8 个历史回调。注册范围变化时，需要同步更新此模块。
+其校验文件 `tests/ut/backend/test_buffer_migration_inventory.py` 将清单与两个实际后端注册表比较，
+检测名称的新增与删除、重复分类、目标架构变化，以及重新获得 IR 定义的历史回调。
+
+清单中的 `PLANNED` 和 `RESTRICTED` 状态描述已声明的迁移成熟度。
+`RESTRICTED` 表示部分形式已实现，不保证所有数据类型、布局、属性或目标架构形式都受支持。
+该检查让清单遗漏触发测试失败；实际实现覆盖范围仍由生产转换规则（conversion recipes）
+及其转换、原生编译和数值测试确认。审核清单不参与降低过程，也不会启用默认切换。
+
+该检查还查询 `backend.get_buffer_elementwise_recipe_names()`，其来源是逻辑转换和原生发射
+实际使用的规则表。每条返回的规则必须对应有效的后端算子及 `RESTRICTED` 审核分类。
+这样既能保持成熟度声明同步，也无需重复生产指令映射，更不会宣称所有形式都已覆盖。
+
 ## 另请参阅
 
 - [Pass、PassContext、PassPipeline 与 PassManager](../passes/00-pass_manager.md) —— handler 的来源。
 - [PTO ISA 参考](../../reference/index.md) —— handler 所抽象掉的硬件差异。
+
+## 后端名称
+
+A2/A3 后端使用 `BackendType.Ascend910`，A5 使用 `BackendType.Ascend950`。
+Python 和 C++ 中的 `BackendType.Ascend910B` 均保留为 `BackendType.Ascend910`
+的兼容别名，两个名称选择相同目标。规范的 `.name` 和新写入的产物元数据使用
+`Ascend910`。包含 `Ascend910B` 的旧产物仍可读取；较旧版本的 PyPTO 可能无法
+识别包含 `Ascend910` 的新产物。平台字符串（`a2a3`、`a2a3sim`、`a5`、
+`a5sim`）与枚举整数值保持不变。

@@ -23,6 +23,8 @@
 
 `PassProperties` 为空（`include/pypto/ir/transforms/pass_properties.h` 中的 `kSimplifyProperties`）是有意为之：Simplify 足够保守，会保留调用方此前可能已经建立的所有属性（`SSAForm`、`NormalizedStmtStructure`、`IncoreTileOps` 等）——它只重写表达式、删除标量绑定，从不改变语句结构。
 
+整数及 INDEX 表达式重写保留声明的结果类型。若化简选中的操作数具有不同的整数类型，会保留转换（插入 cast，或折叠为对应类型的常量）。例如，结果声明为 INT32 的 `(index + 1) - 1` 会化简为 `cast(index, INT32)`。
+
 ## 使用时机
 
 - 在 SSA 转换之后、tile pipeline 检查类型/shape 之前，把标量常量传播进去。
@@ -56,13 +58,13 @@ program_simplified = simplify_pass(program)
 
 1. **多次赋值收集**：`MultiAssignCollector` 遍历函数体，记录所有被多次赋值的标量 `Var`。这些 `Var` 不会被绑定到分析器，避免某个过期的值越过后续的重新赋值被使用。仅被赋值一次的 `Var`——即使位于循环体或分支内部——也可以安全绑定：`SimplifyMutator` 会把每个绑定限定在赋值所在的区域内（见阶段 2），在离开该区域时解绑。在 SSA 形式下每个 `Var` 都只被赋值一次，因此不会收集到任何 `Var`。
 2. **`SimplifyMutator` 遍历**：继承自 `arith::IRMutatorWithAnalyzer`。分析器维护一个约束栈（循环变量边界、if 分支条件、标量绑定）。折叠发生在叶子节点而非仅顶层表达式，因为分析器顶层的 `Simplify` 不会递归进入非算术容器（`Call`、`MakeTuple`）：
-   - `VarPtr`：先按变量重映射表替换，再交给分析器化简。
+   - `VarPtr` / `IterArgPtr`：先按变量重映射表替换，再交给分析器化简。循环携带变量的使用点视为叶子节点：仅在循环头重建其类型与初值。在使用点重新处理携带变量的 MemRef 偏移可能产生新的未定义变量，尤其是在作用域独立的不同分支中。
    - `BinaryExpr` / `UnaryExpr`：先访问子节点，再折叠重建后的节点。
    - `CallPtr`：刷新结果 `type_`，让 shape 参数被折叠后的 Call 与重新解析得到的 Call 在结构上相等。
    - `AssignStmt`：对不在 `multi_assigned_` 中的标量 LHS `Var`，把化简后的 RHS 注册到分析器。函数体顶层的 `ConstInt`/`ConstFloat`/`ConstBool` RHS 会被完整绑定（字面量代入下游使用点）；符号 RHS，或循环/分支内部的常量，只贡献一个 `ConstIntBound`，使恒死的分支守卫得以折叠而不会内联该标量。每个绑定都会被记录，以便所在区域的访问器在退出时解绑。
    - `ForStmt`：在访问循环体前重建 `iter_args_`，使体内的引用对应到新的标识；如果 `start_` 与 `stop_` 都折叠为 `ConstInt` 且 `stop > start`，则在访问循环体期间把循环变量绑定到这一区间，退出时解绑；体内绑定的标量在访问结束后解绑；在访问体之后重建 `return_vars_`，让体内发现的折叠也反映到返回类型中。纯单次/零次循环还会被原地折叠 —— 见下文「控制流折叠」。
    - `IfStmt`：进入 `Analyzer::GetConstraintContext(cond)` 处理 then 分支，进入 `Not(cond)` 处理 else 分支；每个分支内绑定的标量会在该分支结束后解绑，以免泄漏到另一分支或越过 `IfStmt`。可由分析器证明的条件也会被折叠 —— 见下文「控制流折叠」。
-   - `WhileStmt`：除没有循环边界外与 `ForStmt` 相同 —— 在访问条件与循环体前重建 `iter_args_`，在访问循环体前后快照并恢复 `var_remap_`，随后重建 `return_vars_`，并采用同样的区域化标量解绑方式。先重建 `iter_args_` 是必需的，而非可有可无：`IterArg` 的*使用*与其声明是同一个节点并携带 `initValue_`，因此当分析器改写了 init 之后，基类 `IRMutator` 会在第一处使用点新建一个 `IterArg`。以循环头为准写入 `var_remap_`，可使所有引用都解析到同一个节点；若省略这一步，循环头仍指向旧的 `IterArg`，而体内所有使用都指向一个未定义的克隆节点（表现为 `UseAfterDef` 失败）。
+   - `WhileStmt`：除没有循环边界外与 `ForStmt` 相同 —— 在访问条件与循环体前重建 `iter_args_`，在访问循环体前后快照并恢复 `var_remap_`，随后重建 `return_vars_`，并采用同样的区域化标量解绑方式。以循环头为准写入重映射表，确保类型或初值变化后，条件与循环体中的每处引用仍指向声明的节点。
    - `SpmdScopeStmt`：以同样的区域化标量解绑方式访问其语句体，并额外折叠 `core_num_`（如 `MAX // TILE` 这样的闭包算术，可能需要 SSA 之后再化简一次）。
 3. **类型重建**：`SimplifyType` 递归地处理 `TensorType`、`TileType`、`TupleType`，对每一个嵌入的表达式（shape、stride、valid_shape、start_offset、view 字段）调用 `SimplifyExpr`。当无变化时保留原对象，使往返一致性检查仍然便宜。
 4. **标量 DCE + 死 yield 槽位裁剪**：mutator 完成后，`dce::EliminateDeadScalarAssignments` 在展平的函数体上运行，删除所有「全部使用都被折掉了」的标量 `AssignStmt`。该 DCE 是保守的：永远不会删除 Call 支撑的赋值，因为 IR 目前还没有纯度标注，`Call` 可能存在可观察的副作用。两次标量 DCE 之间由 `dce::EliminateDeadYieldSlots` 裁掉没有任何读者的 yield 槽位——`IfStmt` 中无人使用的 phi `return_vars_[i]`，以及 `ForStmt` / `WhileStmt` 中 `iter_args_[i]`（循环体内读）与 `return_vars_[i]`（循环后读）都未被使用的循环携带槽位——同时删除对应的 `YieldStmt` 槽位。跨两个 scope 复用同一个 Python 局部变量恰好会产生这种死携带：SSA 用前一个 scope 的值给第二个循环做初值，循环体每一轮都覆盖它，两端都没有人读。若保留下来，它会让前一个 scope 的值变成 live-out；对设备 scope 而言，这会迫使外提出的 kernel 返回一个 `Scalar`——参见 [08-outline_incore_scopes.md](09-outline_incore_scopes.md)。
@@ -76,6 +78,8 @@ program_simplified = simplify_pass(program)
 - **Fold B —— 纯单次/零次 `ForStmt` 折叠**。仅对*纯*顺序循环触发：`attrs_` 为空、`kind_ == ForKind::Sequential`。对这类循环，用 `CanProveGreaterEqual(step, 1)` 加 `CanProve(stop <= start)`（零次）或 `CanProve(start < stop && stop <= start + step)`（一次）询问分析器以证明循环次数。零次时，为每个 return var 发出 `AssignStmt(return_vars[i], iter_args[i].initValue_)` 并丢弃循环体；一次时，用 `DeepClone` 复制循环体并将 `loop_var → start`、`iter_args[i] → init_values[i]` 直接代入，再次访问克隆体让进一步折叠在同一次 Pass 中发生，最后剥离末尾的 `YieldStmt` 并把 `return_vars[i] → yielded_value[i]` 写入 `var_remap_`（与 Fold A 的提升机制一致）。单次折叠路径对*嵌套*单次循环设有上限 `kMaxNestedSingleTripFolds`（16 层）—— 见[代换深度上限](#代换深度上限fold-b)。
 
 在循环体上使用 `DeepClone` 且 `clone_def_vars=true`（而非就地的 `var_remap_` 覆盖），是为了让展开后的循环体在每个定义点获得全新的 `Var` 标识，与 `LoopUnrollMutator` 保持一致。这样提升后的副本在结构上与原（已丢弃的）循环体相互独立，并使重新访问时能在与外围作用域不同的标识上绑定循环体内的标量。
+
+只有克隆子树内部的定义才获得新身份。引用外层循环的 `IterArg` 时，除非显式提供替换映射，否则必须保留原对象，因为其定义所在的循环并未被克隆。子树内部 `ForStmt` 和 `WhileStmt` 的 carry 会在访问其使用点之前通过 `DefField` 注册。这样，折叠两个相邻的单次循环时就不会为同一个外层 carry 创建两个未绑定副本（issue #2955），也不会在后续 outlining 中产生非法的 SPMD 调用实参。
 
 `return_vars` 通过 `var_remap_` 代换而非直接产出 `AssignStmt(rv, yielded)`，这是有意为之：编排（orchestration）代码生成器的角色感知命名消歧（`role == "out"` 等）会把多个 role 标签的 SSA 版本折叠到同一个 C++ 标识符，于是 `out__rv_v2 = out__co_l0_rv_v3` 这样的别名赋值会下沉为不合法的 `auto out = out;`。在使用点代换可以完全绕开消歧。
 

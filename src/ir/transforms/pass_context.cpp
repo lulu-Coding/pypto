@@ -307,7 +307,7 @@ RuntimeKind RuntimeKindFromName(const std::string& name) {
 PassContext::PassContext(std::vector<PassInstrumentPtr> instruments, VerificationLevel verification_level,
                          DiagnosticPhase diagnostic_phase, DiagnosticCheckSet disabled_diagnostics,
                          MemoryPlanner memory_planner, bool enable_pypto_l0c_double_buffer,
-                         RuntimeKind runtime)
+                         RuntimeKind runtime, bool enable_buffer_ir)
     : instruments_(std::move(instruments)),
       verification_level_(verification_level),
       diagnostic_phase_(diagnostic_phase),
@@ -315,6 +315,7 @@ PassContext::PassContext(std::vector<PassInstrumentPtr> instruments, Verificatio
       memory_planner_(memory_planner),
       enable_pypto_l0c_double_buffer_(enable_pypto_l0c_double_buffer),
       runtime_(runtime),
+      enable_buffer_ir_(enable_buffer_ir),
       previous_(nullptr) {}
 
 VerificationLevel PassContext::GetVerificationLevel() const { return verification_level_; }
@@ -322,6 +323,8 @@ VerificationLevel PassContext::GetVerificationLevel() const { return verificatio
 MemoryPlanner PassContext::GetMemoryPlanner() const { return memory_planner_; }
 
 RuntimeKind PassContext::GetRuntime() const { return runtime_; }
+
+bool PassContext::GetEnableBufferIR() const { return enable_buffer_ir_; }
 
 bool PassContext::GetEnablePyptoL0cDoubleBuffer() const { return enable_pypto_l0c_double_buffer_; }
 
@@ -366,10 +369,12 @@ void PassContext::RunAfterPipeline(const ProgramPtr& program) {
 
 PassContext* PassContext::Current() { return current_; }
 
+const backend::Backend* PassContext::GetBackend() const { return backend::BackendConfig::GetBackend(); }
+
 const backend::BackendHandler* PassContext::GetBackendHandler() const {
   // Handler ownership lives with the Backend itself; PassContext is just a
   // convenient access path that satisfies the "pass-context-config" rule.
-  return backend::BackendConfig::GetBackend()->GetHandler();
+  return GetBackend()->GetHandler();
 }
 
 }  // namespace ir

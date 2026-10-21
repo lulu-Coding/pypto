@@ -97,9 +97,23 @@ enum class IRProperty : uint64_t {
                                     ///< re-deriving it
   AccToGmStoreValid,                ///< Every tile.store whose source tile is Acc-resident targets a GM
                                     ///< tensor whose dtype the backend's fix-pipe can narrow into
-                                    ///< (BackendHandler::SupportsAccToGmDtype). Verifiable only once
+                                    ///< (BackendHandler::SupportsAccToGmDtype). A store carrying a
+                                    ///< FIXPIPE epilogue is judged by the scale-bearing table instead
+                                    ///< (BackendHandler::SupportsFixpipePreQuant), which reaches
+                                    ///< destinations the unscaled one excludes; an epilogue on a
+                                    ///< non-Acc source is rejected outright. Verifiable only once
                                     ///< InferTileMemorySpace has resolved memory spaces -- the same DSL
                                     ///< program is legal when its result routes through Vec instead
+  FixpipeEpilogueValid,             ///< Every tile.assemble carrying a FIXPIPE epilogue (``pre_quant`` /
+                                    ///< ``pre_relu``) is an Acc->Mat writeback the fix-pipe can perform.
+                                    ///< ``pre_relu`` alone rides the unscaled narrowing and is allowed;
+                                    ///< ``pre_quant`` is accepted only for backend-supported dtype
+                                    ///< pairs (currently INT32 Acc -> FP16 Mat on A2/A3 and A5).
+                                    ///< The Acc->GM half of the same contract, which does carry a scale,
+                                    ///< lives in AccToGmStoreValid. Verifiable only once
+                                    ///< InferTileMemorySpace has resolved memory spaces, and an error
+                                    ///< rather than a hint because an unsupported pair is answered by
+                                    ///< dropping the scale, not by failing
   AtomicAddDtypeValid,              ///< Every atomic-add write into GM (tile.store / tensor.assemble /
                                     ///< pld.tensor.put / pld.tile.put / pld.tensor.remote_store /
                                     ///< pld.tile.remote_store) targets a destination dtype the backend's
@@ -135,6 +149,12 @@ enum class IRProperty : uint64_t {
                          ///< written FunctionType::Inline and spliced away by InlineFunctions. Decidable
                          ///< on the user's own IR, so it is a structural property verified at every pass
                          ///< boundary
+  AivSplitLoweredValid,  ///< Lowered split regions or flat split bodies have valid cross-core boundaries
+  BufferIR,              ///< InCore/AIC/AIV use explicit buffer handles and valid registered buffer calls;
+             ///< composes SSA, lexical use-after-definition, and assignment symmetry, not lifetime or
+             ///< initialization checks
+  TileStorageLegalized,  ///< Device If/For/While boundaries use canonical, nonoverlapping allocation windows
+  TileStorageAllocated,  ///< Canonical device storage also has nonoverlapping effective address windows
   kCount                 ///< Sentinel (must be last)
 };
 
@@ -264,13 +284,14 @@ enum class VerificationLevel {
 /**
  * @brief Get the set of properties automatically verified during compilation
  *
- * Returns {SSAForm, TypeChecked, MixedKernelExpanded, AllocatedMemoryAddr,
+ * Returns {SSAForm, TypeChecked, InlineFunctionsEliminated,
+ * MixedKernelExpanded, AllocatedMemoryAddr,
  * BreakContinueValid, NoRedundantBlocks, InOutUseValid,
  * CallDirectionsResolved, ManualDepsOnSubmitOnly, ReturnParamsExplicit,
- * AivSplitValid, TileMemoryInferred, TileOps2D, HardSyncallOccupancyValid,
+ * AivSplitValid, AivSplitLoweredValid, TileMemoryInferred, TileOps2D, HardSyncallOccupancyValid,
  * IterArgCarryClassified, RuntimeScopesMaterialized,
  * DistTensorCtxMaterialized, GraphBoundaryLegalized, AccToGmStoreValid,
- * AccCompactValid, AtomicAddDtypeValid, AccStorePhaseValid} —
+ * FixpipeEpilogueValid, AccCompactValid, AtomicAddDtypeValid, AccStorePhaseValid} —
  * lightweight checks that catch the most common IR errors.
  */
 const IRPropertySet& GetVerifiedProperties();
@@ -278,11 +299,12 @@ const IRPropertySet& GetVerifiedProperties();
 /**
  * @brief Structural invariants that must hold at all pipeline stages
  *
- * These are verified automatically at pipeline start and never declared
- * in per-pass PassProperties. Returns {TypeChecked, BreakContinueValid,
- * NoRedundantBlocks, UseAfterDef, OutParamNotShadowed, NoNestedInCore,
+ * Never declared in per-pass PassProperties. VerificationInstrument checks
+ * them before and after every pass; at pipeline start PassPipeline checks only
+ * the intersection with GetVerifiedProperties(). Returns {TypeChecked,
+ * BreakContinueValid, NoRedundantBlocks, UseAfterDef, OutParamNotShadowed, NoNestedInCore,
  * InOutUseValid, PipelineLoopValid, ArrayNotEscaped, ManualDepsOnSubmitOnly,
- * AtomicAddDtypeValid, NoScalarKernelReturn}.
+ * AtomicAddDtypeValid, NoScalarKernelReturn, AssignTypeSymmetry}.
  */
 const IRPropertySet& GetStructuralProperties();
 

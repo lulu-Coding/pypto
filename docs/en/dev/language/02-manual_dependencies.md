@@ -130,6 +130,15 @@ lowers to `rt_submit_dummy_task(...)`, returns invalid without submitting when
 all deps are invalid, and coexists with automatic `ExpandManualPhaseFence`
 barriers for profitable full-array phase fences.
 
+Runtime-allocated `Out` parameters do **not** add logical return values.
+For a callee `kernel(x, scratch: Out[Tensor]) -> Tensor` that returns `scratch`,
+`pl.submit(self.kernel, x)` has the flat IR type `Tuple[Tensor, Scalar[TASK_ID]]`.
+Supplying `scratch` explicitly changes allocation ownership, not the tuple
+arity. With multiple callee returns, their declared order is preserved and
+`TASK_ID` is the final element. A caller-allocated Out that is not returned by
+the callee contributes no result slot. Hand-built `ir.Submit` nodes must follow
+the same contract as the parser.
+
 `pl.no_dep(arg)` is an auto-scope primitive; inside `pl.manual_scope` it
 has no effect (the whole region already skips auto-tracking).
 
@@ -323,4 +332,13 @@ a `TaskId[N_BRANCHES]` array. Each task in phase `N+1` waits for all
 
 - [Statements and Control Flow](01-statements.md) — the scope context managers these build on
 - [Orchestration Codegen](../codegen/01-orchestration_codegen.md) — how these lower
-- [AutoDeriveTaskDependencies](../passes/42-auto_derive_task_dependencies.md) — the pass that consumes them
+- [AutoDeriveTaskDependencies](../passes/44-auto_derive_task_dependencies.md) — the pass that consumes them
+
+## Potentially empty SPMD launches
+
+A dynamic `pl.spmd_submit` whose count cannot be proven positive requires all
+Out/InOut buffers to be supplied, including non-returned outputs. The compiler
+merges each output with its supplied buffer and merges the TaskId with an
+empty-path `task_dummy` carrying the original explicit dependencies. Thus a
+consumer using `deps=[tid]` remains ordered when the compute launch is skipped.
+See [LegalizeSpmdLaunches](../passes/42-legalize_spmd_launches.md).

@@ -13,6 +13,7 @@
 #define PYPTO_IR_BUILDER_H_
 
 #include <any>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <optional>
@@ -85,12 +86,14 @@ class IRBuilder {
    * @param type Function type (default: Opaque)
    * @param level Hierarchy level (default: nullopt — unspecified)
    * @param role Function role (default: nullopt)
+   * @param ir_stage Function body representation (default: Functional)
    * @throws RuntimeError if already inside a function (no nested functions allowed)
    */
   void BeginFunction(const std::string& name, const Span& span, FunctionType type = FunctionType::Opaque,
                      std::optional<Level> level = std::nullopt, std::optional<Role> role = std::nullopt,
                      std::vector<std::pair<std::string, std::any>> attrs = {},
-                     bool requires_runtime_binding = false);
+                     bool requires_runtime_binding = false,
+                     FunctionIRStage ir_stage = FunctionIRStage::Functional);
 
   /**
    * @brief Add a function parameter
@@ -325,10 +328,15 @@ class IRBuilder {
    * Finalizes the scope statement and pops the context from the stack.
    *
    * @param end_span Source location for end of scope
+   * @param devices CommDomain device indices (empty means all devices)
+   * @param slots CommDomain window slots, resolved after their body definitions
+   * @param extra_attrs Attributes resolved after body-local definitions
    * @return The built scope statement
    * @throws RuntimeError if not inside a scope context
    */
-  StmtPtr EndScope(const Span& end_span);
+  StmtPtr EndScope(const Span& end_span, std::vector<int64_t> devices = {},
+                   std::vector<WindowBufferPtr> slots = {},
+                   std::vector<std::pair<std::string, std::any>> extra_attrs = {});
 
   // ========== Statement Recording ==========
 
@@ -602,14 +610,16 @@ class FunctionContext : public BuildContext {
   FunctionContext(std::string name, Span span, FunctionType func_type = FunctionType::Opaque,
                   std::optional<Level> level = std::nullopt, std::optional<Role> role = std::nullopt,
                   std::vector<std::pair<std::string, std::any>> attrs = {},
-                  bool requires_runtime_binding = false)
+                  bool requires_runtime_binding = false,
+                  FunctionIRStage ir_stage = FunctionIRStage::Functional)
       : BuildContext(Type::FUNCTION, std::move(span)),
         name_(std::move(name)),
         func_type_(func_type),
         level_(level),
         role_(role),
         attrs_(std::move(attrs)),
-        requires_runtime_binding_(requires_runtime_binding) {}
+        requires_runtime_binding_(requires_runtime_binding),
+        ir_stage_(ir_stage) {}
 
   void AddParam(const VarPtr& param, ParamDirection direction = ParamDirection::In) {
     params_.push_back(param);
@@ -631,6 +641,7 @@ class FunctionContext : public BuildContext {
   /// ``IRBuilder::AddFunctionAttrs`` is the checked entry point.
   void AddAttr(std::string key, std::any value) { attrs_.emplace_back(std::move(key), std::move(value)); }
   [[nodiscard]] bool GetRequiresRuntimeBinding() const { return requires_runtime_binding_; }
+  [[nodiscard]] FunctionIRStage GetIRStage() const { return ir_stage_; }
 
  private:
   std::string name_;
@@ -639,6 +650,7 @@ class FunctionContext : public BuildContext {
   std::optional<Role> role_;
   std::vector<std::pair<std::string, std::any>> attrs_;
   bool requires_runtime_binding_ = false;
+  FunctionIRStage ir_stage_ = FunctionIRStage::Functional;
   std::vector<VarPtr> params_;
   std::vector<ParamDirection> param_directions_;
   std::vector<TypePtr> return_types_;

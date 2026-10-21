@@ -9,28 +9,49 @@
 
 """Pass instruments for IR verification beyond the built-in VerificationInstrument."""
 
-import warnings
-
 from pypto.pypto_core import ir as _ir
 from pypto.pypto_core import passes as _passes
 
 
+def _assert_structural_hash_equal(original: _ir.IRNode, restored: _ir.IRNode, pass_name: str) -> None:
+    """Enforce the equal-IR/equal-hash contract after a roundtrip."""
+    try:
+        original_hash = _ir.structural_hash(original, enable_auto_mapping=True)
+        restored_hash = _ir.structural_hash(restored, enable_auto_mapping=True)
+    except Exception as exc:
+        raise RuntimeError(
+            f"[RoundtripInstrument] Structural hash computation failed after pass '{pass_name}'.\n{exc}"
+        ) from exc
+    if original_hash != restored_hash:
+        raise RuntimeError(
+            f"[RoundtripInstrument] Structural hash mismatch after pass '{pass_name}'.\n"
+            f"Original hash: {original_hash}\nRestored hash: {restored_hash}"
+        )
+
+
 def make_roundtrip_instrument() -> _passes.CallbackInstrument:
-    """Create a CallbackInstrument that verifies print→parse roundtrip after each pass.
+    """Create a CallbackInstrument that verifies IR roundtrip after each pass.
 
     After every pass, the instrument:
     1. Prints the resulting IR to Python DSL text (``python_print``).
     2. Parses the text back to an IR Program (``parse``).
     3. Asserts structural equality between the original and re-parsed programs.
+    4. Checks that their structural hashes are equal, using the same mapping policy.
+
+    Reconstruction creates fresh objects for open symbolic references. Both
+    equality and hashing explicitly alpha-map free variables while preserving
+    their reference pattern.
 
     A failure means the printer or parser cannot faithfully represent the IR
-    produced by that pass, which is a bug in the printer/parser layer.
+    produced by that pass, or structural hashing violates the equal-IR/equal-hash contract.
 
-    Known non-failures (instrument emits a warning instead):
+    Buffer-stage programs use binary serialization instead: their Python output
+    is diagnostic text, not executable DSL. The complete program, including
+    orchestration and device stage markers, must still be structurally equal and
+    have equal structural hashes.
 
-    - **Printer InternalError**: Some transitional IR states (e.g. ``ForKind::Unroll``
-      with SSA ``iter_args`` after ``ConvertToSSA``) have no valid Python DSL syntax.
-      The instrument cannot roundtrip what it cannot print; it warns and skips.
+    Transitional Unroll loops with SSA ``iter_args`` use the same text roundtrip
+    as other functional IR. Printer and parser failures are always errors.
 
     Returns:
         A ``CallbackInstrument`` named ``"RoundtripInstrument"``.
@@ -43,22 +64,22 @@ def make_roundtrip_instrument() -> _passes.CallbackInstrument:
 
         pass_name = pass_obj.get_name()
 
+        if any(func.ir_stage == _ir.FunctionIRStage.Buffer for func in program.functions.values()):
+            try:
+                restored = _ir.deserialize(_ir.serialize(program))
+                _ir.assert_structural_equal(program, restored, enable_auto_mapping=True)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"[RoundtripInstrument] Binary roundtrip failed after pass '{pass_name}'.\n{exc}"
+                ) from exc
+            _assert_structural_hash_equal(program, restored, pass_name)
+            return
+
         # --- Step 1: print ---
         try:
             printed = python_print(program, format=False)
         except Exception as exc:
             first_line = str(exc).splitlines()[0] if str(exc) else repr(exc)
-            # Only suppress known transitional IR states that have no valid DSL syntax.
-            # Currently: ForKind::Unroll with SSA iter_args (created when UnrollLoops is
-            # skipped and ConvertToSSA adds loop-carried values to an unroll loop).
-            # All other printer failures are propagated so regressions are visible.
-            if "does not support iter_args" in first_line:
-                warnings.warn(
-                    f"[RoundtripInstrument] IR not printable after '{pass_name}' — "
-                    f"skipping roundtrip: {first_line}",
-                    stacklevel=2,
-                )
-                return
             raise RuntimeError(
                 f"[RoundtripInstrument] Printer failed after pass '{pass_name}'.\n\nError: {first_line}"
             ) from exc
@@ -85,7 +106,7 @@ def make_roundtrip_instrument() -> _passes.CallbackInstrument:
 
         # --- Step 3: structural equality ---
         try:
-            _ir.assert_structural_equal(program, reparsed)
+            _ir.assert_structural_equal(program, reparsed, enable_auto_mapping=True)
         except Exception as exc:
             error_msg = str(exc)
             raise RuntimeError(
@@ -95,6 +116,8 @@ def make_roundtrip_instrument() -> _passes.CallbackInstrument:
                 f"\n"
                 f"--- Printed IR ---\n{printed}"
             ) from exc
+
+        _assert_structural_hash_equal(program, reparsed, pass_name)
 
     return _passes.CallbackInstrument(
         after_pass=_after_pass,

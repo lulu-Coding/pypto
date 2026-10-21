@@ -58,6 +58,7 @@ from pypto.pypto_core.ir import (
     TileLayout,
 )
 
+from . import _dump as _dump
 from . import arg_direction as adir
 from . import optimizations, parser
 from .dsl_api import (
@@ -137,7 +138,6 @@ from .op.tile_ops import (
     load,
     lrelu,
     matmul_bias,
-    matmul_mx,
     matmul_mx_acc,
     matmul_mx_bias,
     max,
@@ -159,9 +159,6 @@ from .op.tile_ops import (
 )
 from .op.tile_ops import (
     mscatter as mscatter,
-)
-from .op.tile_ops import (
-    quant_mx as quant_mx,
 )
 from .op.tile_ops import (
     tmov_x2zz as tmov_x2zz,
@@ -202,6 +199,7 @@ from .op.unified_ops import (
     log,
     matmul,
     matmul_acc,
+    matmul_mx,
     maximum,
     minimum,
     mrgsort,
@@ -214,6 +212,7 @@ from .op.unified_ops import (
     part_max,
     part_min,
     part_mul,
+    quant_mx,
     read,
     recip,
     reinterpret_view,
@@ -258,6 +257,7 @@ from .typing import (
     Array,
     AsyncEvent,
     AsyncSession,
+    ConstexprMarker,
     DynVar,
     InOut,
     IntLike,
@@ -269,6 +269,7 @@ from .typing import (
     Tensor,
     Tile,
     Tuple,
+    constexpr,
     dynamic,
 )
 
@@ -284,6 +285,7 @@ MX_B_NN = TensorLayout.MX_B_NN
 
 # Re-export DataType constants for convenience
 FP4 = DataType.FP4
+FP4E2M1X2 = DataType.FP4E2M1X2  # packed carrier (PTOAS / Torch)
 FP8E4M3FN = DataType.FP8E4M3FN
 FP8E5M2 = DataType.FP8E5M2
 FP8E8M0 = DataType.FP8E8M0
@@ -325,6 +327,8 @@ __all__ = [
     "Tensor",
     "Tile",
     "Scalar",
+    "constexpr",
+    "ConstexprMarker",
     "Array",
     "Tuple",
     "DynVar",
@@ -544,6 +548,7 @@ __all__ = [
     "MX_A_ZZ",
     "MX_B_NN",
     "FP4",
+    "FP4E2M1X2",
     "FP8E4M3FN",
     "FP8E5M2",
     "FP8E8M0",

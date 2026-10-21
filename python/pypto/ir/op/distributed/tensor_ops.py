@@ -141,7 +141,7 @@ def put(  # noqa: PLR0913
     ``atomic`` (:class:`ir.AtomicType`) selects plain-store vs atomic-add and is
     packed as an ``int`` attr; ``Add`` requires an fp32/bf16/fp16/int32/int16/int8
     destination (the hardware atomic-add dtypes), and a bf16 destination is
-    Ascend910B-only (checked by the ``AtomicAddDtypeValid`` verifier).
+    Ascend910-only (checked by the ``AtomicAddDtypeValid`` verifier).
     Side-effect only — the result is an
     ``UnknownType`` Call. The verifier requires ``dst`` to be a
     :class:`ir.DistributedTensorType`; ``src`` may be either that or a plain
@@ -281,7 +281,7 @@ def allreduce(
     op: ReduceOp = ReduceOp.Sum,
     *,
     mode: str = "mesh",
-    core_num: int = 1,
+    core_num: object = 1,
     span: Span | None = None,
 ) -> Call:
     """Build a ``pld.tensor.allreduce(target[, signal])`` Call.
@@ -463,8 +463,8 @@ def all_to_all_v(
     signal: Expr,
     send_counts: Expr,
     recv_counts: Expr,
+    core_num: int | Expr = 1,
     *,
-    core_num: int = 1,
     span: Span | None = None,
 ) -> Call:
     """Build a ``pld.tensor.all_to_all_v(...)`` Call.
@@ -474,22 +474,30 @@ def all_to_all_v(
     (staging window / result), INT32 barrier signal [NR, 1], INT32
     ``send_counts`` [NR] / [NR, 1] holding the number of rows to send to each
     destination, and window-bound INT32 ``recv_counts`` [NR, 1] that receives
-    per-source valid-row counts after the barrier (published via
-    ``pld.system.notify`` as ``clamp(send_counts[dest], 0, MAX_RECV)``). Powered
-    by LowerCompositeOps into a 2-phase push-based decomposition (push →
-    barrier), returning the target window. Each push transfers exactly
-    ``clamp(send_counts[dest], 0, MAX_RECV)`` rows — the transfer extent is the
-    runtime ``[rows, SIZE]``, so padding up to the capacity never crosses the
+    per-source valid-row counts after the barrier. The hand-written builtin
+    kernel pulls ONE scalar word per peer from that peer's own ``send_counts``
+    window (non-cacheable read; no bulk transfer, so the ``[NR]`` INT32 vector
+    is all the buffer needs) and clamps the value reader-side; the builtin
+    exchange is gated by a two-round credit barrier (Barrier A before the pull,
+    Barrier B before return). The InCore composite rail atomically resets local
+    counts and announces readiness to all peers, then waits for each non-self
+    destination before publishing a positive clamped count with AtomicAdd and
+    pushing payload. Zero-row counts remain zero from the receiver reset,
+    without a publication or transfer. A completion barrier precedes return.
+    Each push transfers exactly ``clamp(send_counts[dest], 0, MAX_RECV)`` rows —
+    the transfer extent is the runtime ``[rows, SIZE]``, so padding never crosses the
     wire; the caller reads back from the window with ``pl.load``, using
     ``recv_counts[src, 0]`` to know how many rows arrived.
 
     ``send_counts`` is read at runtime, so the counts may be data-dependent.
     The clamp is two-sided against the per-peer capacity ``MAX_RECV =
     target.shape[0] // NR``: a count above it is capped, and a **negative**
-    count is floored at ``0`` — so a negative ``send_counts[dest]`` publishes
+    count is floored at ``0`` — so a negative ``send_counts[dest]`` leaves
     ``recv_counts = 0`` rather than the negative value. The barrier signal is
-    self-clearing (restored to zero after each call) and safe to reuse inside a
-    ``for``/``while`` loop.
+    credit-based (zero-initialise once and do not reset it) and reusable across
+    sequential calls. InCore calls support rank-uniform ``for``/``while`` loops;
+    HOST orchestrators reject such loops because loop-carried comm-domain window
+    lifetime management is not modeled.
 
     .. warning::
 
@@ -498,21 +506,25 @@ def all_to_all_v(
        **NaN or Inf**. Trim to ``recv_counts`` **before** computing over the
        dense ``[NR*MAX_RECV, SIZE]`` block, or NaN propagates into valid rows.
 
-    ``core_num`` is the requested AIV block limit for the managed CHIP/L2 rail
-    (``LowerL2TensorCollectives``); the InCore composite rail requires
+    ``core_num`` is the requested AIV block *limit* ``L`` for the managed
+    CHIP/L2 or HOST rail (``LowerL2TensorCollectives`` /
+    ``LowerHostTensorCollectives``) — a maximum, not a promise: the admitted
+    block count ``B`` is computed at the entry (``CalAllToAllVBlocks``) and may
+    be less than ``L``. Accepts a compile-time positive ``int`` or a genuine
+    ``Scalar[INDEX]`` ``Expr`` — a dynamic value is type-checked here but not
+    evaluated at compile time; its positivity is validated at the runtime
+    entry instead. The InCore composite rail requires a compile-time
     ``core_num == 1`` and is rejected otherwise by ``LowerCompositeOps``.
     """
-    if not isinstance(core_num, int) or isinstance(core_num, bool):
-        raise TypeError(
-            "pld.tensor.all_to_all_v core_num must be a positive compile-time int, "
-            f"got {type(core_num).__name__}"
-        )
-    if core_num <= 0:
+    if isinstance(core_num, bool):
+        raise TypeError("pld.tensor.all_to_all_v core_num must be a positive int, got bool")
+    if isinstance(core_num, int) and core_num <= 0:
         raise ValueError(f"pld.tensor.all_to_all_v core_num must be positive, got {core_num}")
 
     actual_span = _get_span_or_capture(span, frame_offset=1)
-    _args: list[Expr] = [input, target, signal, send_counts, recv_counts]
-    return _ir_core.create_op_call("pld.tensor.all_to_all_v", _args, {"core_num": core_num}, actual_span)
+    core_num_expr = _normalize_expr(core_num, actual_span)
+    _args: list[Expr] = [input, target, signal, send_counts, recv_counts, core_num_expr]
+    return _ir_core.create_op_call("pld.tensor.all_to_all_v", _args, {}, actual_span)
 
 
 __all__ = [

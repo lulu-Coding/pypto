@@ -32,7 +32,10 @@ Plus regressions:
   ``allocate_domain`` wrapper.
 """
 
+import os
 import re
+import shutil
+import subprocess
 from importlib import resources
 
 import pypto.language as pl
@@ -56,11 +59,8 @@ NRANKS = 2
 def pass_verification_context(ascend_backend):
     """Override ``ut/conftest.py``'s autouse roundtrip-verification fixture.
 
-    ``MaterializeCommDomainScopes`` materialises ``DistributedTensorType.window_buffer_``
-    back-references that the printer / parser pair has no surface syntax for —
-    the roundtrip check would fail despite the in-memory IR being correct.
-    Mirrors the same override in
-    [tests/ut/ir/transforms/test_materialize_comm_domain_scopes.py](../../ir/transforms/test_materialize_comm_domain_scopes.py).
+    These tests focus on generated host orchestration. The materialization and
+    host-collective transform suites separately run whole-program roundtrips.
     The fixture name MUST be ``pass_verification_context`` to shadow the
     conftest's same-named autouse fixture (pytest fixture override semantics).
     """
@@ -369,9 +369,9 @@ def test_comm_group_program_emits_domain_provider_with_block():
     # window_size is the sum of aligned physical slot sizes. Each spec keeps
     # its exact logical size in count and exposes only its physical size via
     # nbytes.
-    # Single slot → `window_size=((((64 * 4) + 31) // 32) * 32),`. The inner
+    # Single slot → `window_size=((((64 * 4) + 63) // 64) * 64),`. The inner
     # parentheses come from the Mul expression.
-    aligned_size = r"\(\(\(\(64 \* 4\) \+ 31\) // 32\) \* 32\)"
+    aligned_size = r"\(\(\(\(64 \* 4\) \+ 63\) // 64\) \* 64\)"
     assert re.search(rf"window_size=\({aligned_size}\),", code), code
     assert re.search(
         rf'CommBufferSpec\(name="data_buf", dtype="opaque", count=\(64 \* 4\), nbytes={aligned_size}\),',
@@ -408,8 +408,8 @@ def test_comm_buffer_specs_align_each_physical_allocation():
     code = _lower(Prog)
     data_logical = r"\(17 \* 2\)"
     signal_logical = r"\(2 \* 4\)"
-    data_alloc = rf"\(\(\({data_logical} \+ 31\) // 32\) \* 32\)"
-    signal_alloc = rf"\(\(\({signal_logical} \+ 31\) // 32\) \* 32\)"
+    data_alloc = rf"\(\(\({data_logical} \+ 63\) // 64\) \* 64\)"
+    signal_alloc = rf"\(\(\({signal_logical} \+ 63\) // 64\) \* 64\)"
     assert re.search(
         rf'CommBufferSpec\(name="data_buf", dtype="opaque", count={data_logical}, nbytes={data_alloc}\),',
         code,
@@ -422,6 +422,52 @@ def test_comm_buffer_specs_align_each_physical_allocation():
         code,
     ), code
     assert re.search(rf"window_size=\({data_alloc}\) \+ \({signal_alloc}\),", code), code
+
+
+def test_comm_buffer_specs_isolate_signal_and_counts_cache_lines():
+    """Scalar count writeback must not overwrite a peer's signal credits.
+
+    The L2 all_to_all_v P=2, B=4 layout places a 32-byte signal before
+    8-byte counts and recv slots. Rounding each to 32 bytes shares a 64-byte
+    cache line between signal and counts, so a counts DCCI can lose credits.
+    """
+
+    @pl.program
+    class Prog:
+        @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+        def chip_orch(
+            self,
+            stage: pld.DistributedTensor[[8, SIZE], pl.FP32],
+            data: pld.DistributedTensor[[8, SIZE], pl.FP32],
+            signal: pld.DistributedTensor[[2, 4], pl.INT32],
+            counts: pld.DistributedTensor[[2, 1], pl.INT32],
+            recv: pld.DistributedTensor[[2, 1], pl.INT32],
+        ):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            stage_buf = pld.alloc_window_buffer(2048)
+            data_buf = pld.alloc_window_buffer(2048)
+            signal_buf = pld.alloc_window_buffer(32)
+            counts_buf = pld.alloc_window_buffer(8)
+            recv_buf = pld.alloc_window_buffer(8)
+            stage = pld.window(stage_buf, [8, SIZE], dtype=pl.FP32)
+            data = pld.window(data_buf, [8, SIZE], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [2, 4], dtype=pl.INT32)
+            counts = pld.window(counts_buf, [2, 1], dtype=pl.INT32)
+            recv = pld.window(recv_buf, [2, 1], dtype=pl.INT32)
+            self.chip_orch(stage, data, signal, counts, recv, device=0)
+            return 0
+
+    code = _lower(Prog)
+    for name, logical_bytes in (("signal_buf", 32), ("counts_buf", 8), ("recv_buf", 8)):
+        # Each small slot gets one complete cache line; count still exposes
+        # the original logical bytes rather than the padded allocation.
+        alloc_bytes = f"((({logical_bytes} + 63) // 64) * 64)"
+        assert (
+            f'CommBufferSpec(name="{name}", dtype="opaque", count={logical_bytes}, nbytes={alloc_bytes}),'
+        ) in code, code
 
 
 # ---------------------------------------------------------------------------
@@ -501,6 +547,8 @@ def test_world_size_lowers_to_kwarg_in_expression_context():
     # `world_size * 4` expression in place of a constant nbytes literal.
     assert re.search(r"window_size=\(.*\bworld_size\b.*\),", code), code
     assert re.search(r"CommBufferSpec\(.*\bworld_size\b.*\),", code), code
+    # Runtime-sized slots need the same cache-line isolation as static ones.
+    assert re.search(r"nbytes=\(\(\(.*\bworld_size\b.* \+ 63\) // 64\) \* 64\)", code), code
     # The legacy ``len(contexts)`` form must not survive.
     assert "len(contexts)" not in code, code
 
@@ -1166,7 +1214,7 @@ def test_every_next_level_reports_the_selected_runtime(tmp_path, runtime):
 
 
 @pytest.mark.parametrize("ascend_backend", [BackendType.Ascend950], indirect=True)
-def test_backend_950_materializes_allreduce_with_core_num_launch(tmp_path, ascend_backend):
+def test_backend_950_materializes_allreduce_with_block_num_launch(tmp_path, ascend_backend):
     @pl.program
     class Prog:
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -1192,7 +1240,7 @@ def test_backend_950_materializes_allreduce_with_core_num_launch(tmp_path, ascen
 
     base = "next_levels/builtin.tensor.allreduce__sum__fp32"
     entry_cpp = files[f"{base}/orchestration/builtin_tensor_allreduce__sum__fp32.cpp"]
-    assert "params.launch_spec.set_core_num(core_num)" in entry_cpp
+    assert "params.launch_spec.set_block_num(core_num)" in entry_cpp
 
 
 def test_host_allreduce_ring_builtin_codegen_uses_ring_next_level_callable_key():
@@ -1610,6 +1658,365 @@ def test_host_all_to_all_v_builtin_variant_shared_across_max_recv():
     assert variants == {"builtin.tensor.all_to_all_v__fp32"}, specs
     for spec in specs:
         assert "max_recv_cpp" not in spec.template_vars, spec
+
+
+def test_host_all_to_all_v_builtin_variant_shared_across_core_num():
+    """RFC #2521 K2: two host_orch all_to_all_v calls requesting different
+    core_num (2 vs 4) emit ONE shared next-level variant — core_num is a
+    runtime scalar, not baked into the variant key, so one compiled binary
+    serves both requests without recompilation. That is only possible because
+    the value flows as an IR argument and the entry derives B from it at
+    launch time."""
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(
+            self,
+            inp: pld.DistributedTensor[[8, SIZE], pl.FP32],
+            data: pld.DistributedTensor[[8, SIZE], pl.FP32],
+            sig: pld.DistributedTensor[[4, 4], pl.INT32],
+            counts: pld.DistributedTensor[[4, 1], pl.INT32],
+            recv: pld.DistributedTensor[[4, 1], pl.INT32],
+        ):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            input_buf = pld.alloc_window_buffer(8 * SIZE * pl.FP32.get_byte())
+            data_buf = pld.alloc_window_buffer(8 * SIZE * pl.FP32.get_byte())
+            signal_buf = pld.alloc_window_buffer(4 * 4 * pl.INT32.get_byte())
+            counts_buf = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
+            recv_buf = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
+            inp = pld.window(input_buf, [8, SIZE], dtype=pl.FP32)
+            data = pld.window(data_buf, [8, SIZE], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [4, 4], dtype=pl.INT32)
+            counts = pld.window(counts_buf, [4, 1], dtype=pl.INT32)
+            recv = pld.window(recv_buf, [4, 1], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(inp, data, signal, counts, recv, device=r)
+            pld.tensor.all_to_all_v(inp, data, signal, counts, recv, core_num=2)
+
+            input_buf2 = pld.alloc_window_buffer(8 * SIZE * pl.FP32.get_byte())
+            data_buf2 = pld.alloc_window_buffer(8 * SIZE * pl.FP32.get_byte())
+            signal_buf2 = pld.alloc_window_buffer(4 * 4 * pl.INT32.get_byte())
+            counts_buf2 = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
+            recv_buf2 = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
+            inp2 = pld.window(input_buf2, [8, SIZE], dtype=pl.FP32)
+            data2 = pld.window(data_buf2, [8, SIZE], dtype=pl.FP32)
+            signal2 = pld.window(signal_buf2, [4, 4], dtype=pl.INT32)
+            counts2 = pld.window(counts_buf2, [4, 1], dtype=pl.INT32)
+            recv2 = pld.window(recv_buf2, [4, 1], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(inp2, data2, signal2, counts2, recv2, device=r)
+            pld.tensor.all_to_all_v(inp2, data2, signal2, counts2, recv2, core_num=4)
+            return 0
+
+    generated, cg = _lower_host_collectives(Prog)
+
+    assert 'callables["builtin.tensor.all_to_all_v__fp32"]' in generated, generated
+    # Both requested core_num values reach codegen as real scalar values —
+    # neither is folded into the variant name or the template.
+    assert ".add_scalar(2)" in generated, generated
+    assert ".add_scalar(4)" in generated, generated
+
+    specs = cg.get_builtin_next_level_specs()
+    variants = {spec.variant for spec in specs}
+    assert variants == {"builtin.tensor.all_to_all_v__fp32"}, specs
+    for spec in specs:
+        assert "core_num" not in spec.variant, spec
+
+
+def test_host_all_to_all_v_entry_computes_b_and_launches_only_b(tmp_path):
+    """RFC #2521 K2: the materialised entry owns the `L -> B` step and launches B.
+
+    Built at P=4 (the signal's dim 0) with a requested limit L=10, so the frozen
+    mapping gives B=(10//4)*4=8 and a signal at least 8 lanes wide is admissible.
+    The numeric mapping itself is pinned by
+    ``test_entry_cal_all_to_all_v_blocks_matches_the_rfc_table``, which compiles
+    and runs this very function; what this test pins is that the entry is the
+    single point that computes B — from `nranks` and `core_num`, using that same
+    formula — and that both the signal-stride reject and the launch-width call
+    consume `admitted_blocks` rather than the raw `core_num`, so a request of 10
+    can never launch 10.
+    """
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(
+            self,
+            inp: pld.DistributedTensor[[8, SIZE], pl.FP32],
+            data: pld.DistributedTensor[[8, SIZE], pl.FP32],
+            sig: pld.DistributedTensor[[4, 8], pl.INT32],
+            counts: pld.DistributedTensor[[4, 1], pl.INT32],
+            recv: pld.DistributedTensor[[4, 1], pl.INT32],
+        ):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            input_buf = pld.alloc_window_buffer(8 * SIZE * pl.FP32.get_byte())
+            data_buf = pld.alloc_window_buffer(8 * SIZE * pl.FP32.get_byte())
+            signal_buf = pld.alloc_window_buffer(4 * 8 * pl.INT32.get_byte())
+            counts_buf = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
+            recv_buf = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
+            inp = pld.window(input_buf, [8, SIZE], dtype=pl.FP32)
+            data = pld.window(data_buf, [8, SIZE], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [4, 8], dtype=pl.INT32)
+            counts = pld.window(counts_buf, [4, 1], dtype=pl.INT32)
+            recv = pld.window(recv_buf, [4, 1], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(inp, data, signal, counts, recv, device=r)
+            pld.tensor.all_to_all_v(inp, data, signal, counts, recv, core_num=10)
+            return 0
+
+    program = passes.materialize_comm_domain_scopes()(Prog)
+    program = passes.lower_host_tensor_collectives()(program)
+    program = passes.materialize_dist_tensor_ctx()(program)
+    program = _finalize_chip_program_for_generate(program)
+    files = pto_backend.generate(program, str(tmp_path), skip_ptoas=True)
+
+    entry_cpp = files[
+        "next_levels/builtin.tensor.all_to_all_v__fp32/orchestration/builtin_tensor_all_to_all_v__fp32.cpp"
+    ]
+
+    # B is computed once, from the rank count and the requested limit ...
+    assert "CalAllToAllVBlocks(nranks, core_num)" in entry_cpp, entry_cpp
+    # ... with the frozen formula ...
+    assert "l < p ? l : (l / p) * p" in entry_cpp, entry_cpp
+    # ... and B — not L — is what gets validated and launched.
+    assert "signal_stride < admitted_blocks" in entry_cpp, entry_cpp
+    assert ".launch_spec." in entry_cpp and "(admitted_blocks)" in entry_cpp, entry_cpp
+    # ... and both observables RFC #2521 frozen item #10 requires are reported,
+    # by the one site that knows them.
+    assert "requested_core_num=" in entry_cpp, entry_cpp
+    assert "launched_core_num=" in entry_cpp, entry_cpp
+    assert "active_lanes=" in entry_cpp, entry_cpp
+    assert "lanes_per_peer=" in entry_cpp, entry_cpp
+
+
+_RFC_2521_BLOCK_TABLE = (
+    (8, 1, 1),
+    (8, 7, 7),
+    (8, 8, 8),
+    (8, 10, 8),
+    (8, 15, 8),
+    (8, 16, 16),
+    (16, 7, 7),
+    (16, 16, 16),
+)
+
+
+def test_entry_cal_all_to_all_v_blocks_matches_the_rfc_table(tmp_path):
+    """Run the entry's own ``CalAllToAllVBlocks`` against RFC #2521's table.
+
+    The formula has exactly one implementation — the C++ one in
+    ``entry.cpp.in`` — because the template is compiled standalone and cannot
+    link against the compiler's sources. A Python transcription of it could
+    drift from the code that ships without any test noticing, so this extracts
+    the real function from the template, compiles it, and runs the frozen
+    worked-example table through it.
+    """
+    template = (
+        resources.files("pypto.runtime.builtins.collectives.all_to_all_v") / "templates" / "entry.cpp.in"
+    )
+    source = template.read_text(encoding="utf-8")
+    match = re.search(r"^int32_t CalAllToAllVBlocks\(.*$", source, re.MULTILINE)
+    assert match, "CalAllToAllVBlocks is no longer a one-line definition in entry.cpp.in"
+    definition = match.group(0)
+    assert "{{" not in definition, f"definition now needs template substitution: {definition}"
+
+    candidates = (os.environ.get("CXX"), "g++-15", "g++", "c++")
+    compiler = next((found for name in candidates if name and (found := shutil.which(name))), None)
+    if compiler is None:
+        pytest.skip("no C++ compiler available")
+
+    cases = "\n".join(
+        f"  if (CalAllToAllVBlocks({p}, {req_l}) != {b}) "
+        f'{{ std::printf("%d %d\\n", {p}, {req_l}); ok = false; }}'
+        for p, req_l, b in _RFC_2521_BLOCK_TABLE
+    )
+    program = f"""#include <cstdint>
+#include <cstdio>
+{definition}
+int main() {{
+  bool ok = true;
+{cases}
+  return ok ? 0 : 1;
+}}
+"""
+    src = tmp_path / "cal_blocks.cpp"
+    src.write_text(program, encoding="utf-8")
+    binary = tmp_path / "cal_blocks"
+    build = subprocess.run(
+        [compiler, "-std=c++17", str(src), "-o", str(binary)], capture_output=True, text=True, check=False
+    )
+    assert build.returncode == 0, f"entry formula does not compile standalone:\n{build.stderr}"
+
+    run = subprocess.run([str(binary)], capture_output=True, text=True, check=False)
+    assert run.returncode == 0, (
+        "the entry's CalAllToAllVBlocks disagrees with RFC #2521's worked-example table "
+        f"for these (P, L) pairs:\n{run.stdout}"
+    )
+
+
+# Lane geometry (RFC #2521 K3). Same discipline as the admission-formula test
+# above: the kernel template is the only implementation of this mapping, so the
+# properties are checked by compiling and running the kernel's own statements
+# rather than a Python transcription of them.
+_GEOMETRY_ANCHOR = "int32_t lanes_per_peer = active_blocks >= nranks ? active_blocks / nranks : 0;"
+_PEER_LANE_ANCHOR = "int32_t peer_of_block = lanes_per_peer > 0 ? block_idx / lanes_per_peer : 0;"
+_SLICE_ANCHOR = (
+    "int64_t lane_elems = ((valid_numel + lanes_per_peer * align_elem - 1) / "
+    "(lanes_per_peer * align_elem)) * align_elem;"
+)
+
+# (P, B): admitted widths the entry can produce, plus the B < P stride regime.
+_GEOMETRY_POINTS = ((8, 8), (8, 16), (16, 16), (4, 8), (4, 4), (2, 8), (4, 2), (8, 4))
+# (valid_numel, K, align_elem): payloads smaller than K, ragged divisions, and
+# the RFC #2521 32-byte interior boundary rule (INT8: 32, FP16/BF16: 16, FP32: 8 elements).
+_SLICE_POINTS = (
+    (0, 2, 8),
+    (1, 1, 8),
+    (2, 4, 8),
+    (10, 3, 8),
+    (9, 3, 8),
+    (7, 4, 8),
+    (100, 7, 8),
+    (4096, 2, 8),
+    (13, 4, 16),
+    (36, 2, 32),
+    (64, 3, 32),
+)
+
+
+def _extract_kernel_statements(source: str, anchor: str, count: int) -> str:
+    """Take ``count`` consecutive statements from the kernel body at ``anchor``."""
+    lines = source.splitlines()
+    start = next((i for i, line in enumerate(lines) if line.strip() == anchor), None)
+    assert start is not None, f"kernel.cpp.in no longer contains the anchor: {anchor}"
+    block = "\n".join(line.strip() for line in lines[start : start + count])
+    assert "{{" not in block, f"extracted block needs template substitution:\n{block}"
+    return block
+
+
+def _run_kernel_lane_probe(tmp_path):
+    """Compile the kernel's own geometry and slice statements, and run them."""
+    template = (
+        resources.files("pypto.runtime.builtins.collectives.all_to_all_v") / "templates" / "kernel.cpp.in"
+    )
+    source = template.read_text(encoding="utf-8")
+    geometry = _extract_kernel_statements(source, _GEOMETRY_ANCHOR, 1)
+    peer_lane = _extract_kernel_statements(source, _PEER_LANE_ANCHOR, 2)
+    slice_stmts = _extract_kernel_statements(source, _SLICE_ANCHOR, 5)
+
+    geometry_cases = "\n".join(
+        f"  for (int32_t i = 0; i < {b}; ++i) emit_geometry({p}, {b}, i);" for p, b in _GEOMETRY_POINTS
+    )
+    slice_cases = "\n".join(f"  emit_slices({valid}, {k}, {align});" for valid, k, align in _SLICE_POINTS)
+    program = f"""#include <cstdint>
+#include <cstdio>
+
+static void emit_geometry(int32_t nranks, int32_t active_blocks, int32_t block_idx) {{
+{geometry}
+{peer_lane}
+  std::printf("geo %d %d %d %d %d %d\\n", nranks, active_blocks, block_idx, lanes_per_peer,
+              peer_of_block, lane_in_group);
+}}
+
+static void emit_slices(int64_t valid_numel, int32_t lanes_per_peer, int64_t align_elem) {{
+  for (int32_t lane_in_group = 0; lane_in_group < lanes_per_peer; ++lane_in_group) {{
+{slice_stmts}
+    std::printf("slice %lld %d %lld %d %lld %lld\\n", static_cast<long long>(valid_numel),
+                lanes_per_peer, static_cast<long long>(align_elem), lane_in_group,
+                static_cast<long long>(begin), static_cast<long long>(end));
+  }}
+}}
+
+int main() {{
+{geometry_cases}
+{slice_cases}
+  return 0;
+}}
+"""
+    candidates = (os.environ.get("CXX"), "g++-15", "g++", "c++")
+    compiler = next((found for name in candidates if name and (found := shutil.which(name))), None)
+    if compiler is None:
+        pytest.skip("no C++ compiler available")
+
+    src = tmp_path / "lane_probe.cpp"
+    src.write_text(program, encoding="utf-8")
+    binary = tmp_path / "lane_probe"
+    build = subprocess.run(
+        [compiler, "-std=c++17", str(src), "-o", str(binary)], capture_output=True, text=True, check=False
+    )
+    assert build.returncode == 0, f"kernel lane statements do not compile standalone:\n{build.stderr}"
+    run = subprocess.run([str(binary)], capture_output=True, text=True, check=False)
+    assert run.returncode == 0, run.stderr
+
+    geometry_rows: dict[tuple[int, int], list[tuple[int, int, int]]] = {}
+    slice_rows: dict[tuple[int, int, int], list[tuple[int, int]]] = {}
+    for line in run.stdout.splitlines():
+        kind, *fields = line.split()
+        values = [int(f) for f in fields]
+        if kind == "geo":
+            nranks, blocks, _idx, k, peer, lane = values
+            geometry_rows.setdefault((nranks, blocks), []).append((k, peer, lane))
+        else:
+            valid, k, align, _lane, begin, end = values
+            slice_rows.setdefault((valid, k, align), []).append((begin, end))
+    return geometry_rows, slice_rows
+
+
+def test_kernel_lane_geometry_is_a_bijection_over_admitted_blocks(tmp_path):
+    """Every admitted block owns exactly one (peer, lane), and together they tile P x K.
+
+    Two blocks sharing a (peer, lane) would push the same sub-range twice and
+    leave another unsent; a gap would silently drop payload.
+    """
+    geometry_rows, _ = _run_kernel_lane_probe(tmp_path)
+    for (nranks, blocks), rows in geometry_rows.items():
+        k = rows[0][0]
+        assert all(row[0] == k for row in rows), f"P={nranks} B={blocks}: K is not uniform"
+        if blocks < nranks:
+            # Stride regime: no lanes; the kernel walks the peer set in its own loop.
+            assert k == 0, f"P={nranks} B={blocks}: expected K == 0"
+            assert all(row[1:] == (0, 0) for row in rows), f"P={nranks} B={blocks}"
+            continue
+        assert k == blocks // nranks, f"P={nranks} B={blocks}: K={k}"
+        pairs = [(peer, lane) for _k, peer, lane in rows]
+        assert len(set(pairs)) == len(pairs), f"P={nranks} B={blocks}: two blocks share a (peer, lane)"
+        assert set(pairs) == {(p, lane) for p in range(nranks) for lane in range(k)}, (
+            f"P={nranks} B={blocks}: blocks do not tile peer x lane"
+        )
+
+
+def test_kernel_lane_slice_partitions_each_peers_payload(tmp_path):
+    """The K lane ranges tile [0, valid_numel); every non-empty lane starts 32-byte aligned."""
+    _, slice_rows = _run_kernel_lane_probe(tmp_path)
+    for (valid, k, align), parts in slice_rows.items():
+        assert len(parts) == k
+        assert parts[0][0] == 0, f"valid={valid} K={k}: first lane does not start at 0"
+        for (_begin, end), (next_begin, _next_end) in zip(parts, parts[1:]):
+            assert end == next_begin, f"valid={valid} K={k}: lanes are not adjacent"
+        for begin, end in parts:
+            assert 0 <= begin <= end <= valid, f"valid={valid} K={k}: bad range ({begin}, {end})"
+            if end > begin:
+                assert begin % align == 0, (
+                    f"valid={valid} K={k}: lane start {begin} is not {align}-element aligned "
+                    "(RFC #2521 32-byte interiors)"
+                )
+        assert parts[-1][1] == valid, f"valid={valid} K={k}: last lane does not reach the payload end"
+
+
+def test_kernel_lane_slice_worked_examples(tmp_path):
+    """Aligned interior, ragged final tail, and a payload smaller than K so trailing lanes send nothing."""
+    _, slice_rows = _run_kernel_lane_probe(tmp_path)
+    assert slice_rows[(10, 3, 8)] == [(0, 8), (8, 10), (10, 10)]
+    assert slice_rows[(36, 2, 32)] == [(0, 32), (32, 36)]
+    assert slice_rows[(64, 3, 32)] == [(0, 32), (32, 64), (64, 64)]
+    assert slice_rows[(2, 4, 8)] == [(0, 2), (2, 2), (2, 2), (2, 2)]
 
 
 def _assert_host_collective_next_level_files(program_cls, tmp_path, variant, signature, kernel_snippet):

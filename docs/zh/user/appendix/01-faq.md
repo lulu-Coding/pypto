@@ -27,6 +27,11 @@ DSL 需要知道一个循环究竟是编译期展开、设备侧循环，还是�
 **`ptoas compilation failed:` 后面是空的。**
 那是 ptoas 二进制崩了，而不是它拒绝了你的 IR。把 `PTOAS_ROOT` 指向一个能用的版本。
 
+**`ptoas at '...' is version X, but PyPTO requires PTOAS >= vY`。**
+codegen 在汇编之前会检查 `ptoas --version`，而你的 PyPTO 生成的指令形式比这个汇编器新。
+安装报错中给出的版本（即 `toolchain/versions.env` 中的 `PTOAS_VERSION`），并把 `PTOAS_ROOT`
+指向它。
+
 ## 运行
 
 **为什么 `run()` 的时间比 kernel 大那么多？**
@@ -53,7 +58,7 @@ DSL 需要知道一个循环究竟是编译期展开、设备侧循环，还是�
 
 | 限制 | 细节 |
 | ---- | ---- |
-| **PTOAS 下两个 slot 同时存活** | codegen 拒绝：ptoas 只保护一次迭代里的第一个 `multi_tile_get`。该写的形状是一次迭代一个 slot 存活 |
+| **PTOAS 下两个 slot 同时存活** | codegen 拒绝：ptoas 会把比读取提前一轮迭代填充的 slot 同步错（[PTOAS#1519](https://github.com/hw-native-sys/PTOAS/issues/1519)：0.63 修复，0.64 起又回退）。该写的形状是一次迭代一个 slot 存活 |
 | **硬 `syncall` 需要满占用** | 部分发射会在设备上死锁（507018）；PyPTO 在编译期就拒绝。部分占用下用 `mode=pl.SyncAllMode.SOFT` |
 | **ring allreduce 不是加一个参数的事** | 它需要显式的 `[2*(NR-1)+1, NR]` INT32 signal。`src` 可以是任意长度（不必被 `NR` 整除）的不齐（ragged）形状，静态或动态形状均可。见[集合通信](../distributed/01-collectives.md) |
 | **`memory_planner=PTOAS` 与内存图** | 分配 pass 被跳过，pass dump 里没有偏移供工具绘制 |

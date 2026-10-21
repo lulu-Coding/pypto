@@ -47,6 +47,8 @@ import warnings
 from pathlib import Path
 from typing import Any
 
+from pypto._target import _parse_platform
+from pypto.ir.compiled_program import _COMPILED_META_FILENAME, _COMPILED_META_SCHEMA, _load_meta
 from pypto.runtime.runner import (
     _SWIMLANE_CLI_HELP,
     _SWIMLANE_FULL_LEVEL,
@@ -130,9 +132,12 @@ def _reconstruct_artifact(work_dir: Path, platform: str) -> tuple[Any, str, bool
     setup problem, so it is wrapped as :class:`ArtifactSetupError` (the CLI reports
     ``PYPTO_EXEC_RESULT=INFRA``) rather than a device test failure.
     """
-    from pypto.runtime.device_runner import _compile_and_assemble  # noqa: PLC0415
-
     try:
+        meta_path = work_dir / _COMPILED_META_FILENAME
+        if meta_path.exists():
+            _load_meta(meta_path, filename=_COMPILED_META_FILENAME, schema=_COMPILED_META_SCHEMA)
+        from pypto.runtime.device_runner import _compile_and_assemble  # noqa: PLC0415
+
         chip_callable, runtime_name, runtime_config = _compile_and_assemble(work_dir, platform)
     except Exception as exc:  # noqa: BLE001 — reclassified as infra, re-raised below
         raise ArtifactSetupError(f"artifact reconstruction failed for {work_dir}: {exc}") from exc
@@ -209,7 +214,7 @@ def execute_batch_manifest(
     """
     from pypto.runtime import ChipWorker, RunConfig  # noqa: PLC0415
 
-    entries = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    entries: list[dict[str, Any]] = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     if not entries:
         return True
 
@@ -239,7 +244,7 @@ def execute_batch_manifest(
             validate=validate,
         )
 
-    def _run_and_mark(entry: dict) -> None:
+    def _run_and_mark(entry: dict[str, Any]) -> None:
         nonlocal all_ok
         work_dir = Path(entry["work_dir"])
         try:
@@ -272,7 +277,7 @@ def execute_batch_manifest(
     # Reconstruct the whole batch before opening the shared worker so its SDMA
     # capability does not depend on manifest order. Keep setup failures in the
     # prepared list and emit their INFRA markers in manifest order below.
-    prepared: list[tuple[dict, tuple[Any, str, bool] | None, str | None]] = []
+    prepared: list[tuple[dict[str, Any], tuple[Any, str, bool] | None, str | None]] = []
     for entry in entries:
         try:
             rebound = _rebind(Path(entry["work_dir"]), entry["platform"])
@@ -281,7 +286,7 @@ def execute_batch_manifest(
         else:
             prepared.append((entry, rebound, None))
 
-    def _mark_setup_failure(entry: dict, setup_traceback: str | None) -> None:
+    def _mark_setup_failure(entry: dict[str, Any], setup_traceback: str | None) -> None:
         nonlocal all_ok
         assert setup_traceback is not None
         print(setup_traceback, flush=True)
@@ -312,8 +317,13 @@ def execute_batch_manifest(
         if rebound is not None and str(entry["platform"]) == shared_platform and rebound[1] == first_runtime
     )
 
+    backend_type, execution_mode = _parse_platform(shared_platform)
     with ChipWorker(
-        config=RunConfig(platform=shared_platform, device_id=device_id),
+        config=RunConfig(
+            backend_type=backend_type,
+            execution_mode=execution_mode,
+            device_id=device_id,
+        ),
         runtime=first_runtime,
         enable_sdma=shared_enable_sdma,
     ):

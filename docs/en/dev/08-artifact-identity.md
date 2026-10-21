@@ -2,13 +2,13 @@
 
 The internal `pypto._identity` module provides content hashing and deterministic
 record encoding for the persistent JIT cache proposed in [RFC #2653](https://github.com/hw-native-sys/pypto/issues/2653).
-It is not connected to JIT dispatch or artifact lookup. Existing in-process
-cache behavior and dispatch cost are unchanged.
-
-This is the first part of the identity milestone. Automatic inventories of the
-selected compilers, SDK resources, and dynamic dependencies remain a follow-up.
-The runtime's existing compiler-version tokens are not complete content
-identities and must not be promoted to persistent-cache keys.
+The opt-in [JIT integration](10-jit-cache.md) supplies automatic inventories for
+supported Linux toolchains. Unsupported dependency discovery remains unavailable.
+The default build policy combines source hashes with published build/version
+identifiers as described in [JIT caching](10-jit-cache.md#toolchain-support-and-cost).
+Those identifiers are version claims, not proofs of installed contents. The
+inventory completeness rules below describe `PYPTO_CACHE_IDENTITY=content`;
+build-policy evidence uses distinct `reported_version` tags.
 
 ## Typed records
 
@@ -54,7 +54,7 @@ cycles, non-regular files, unreadable inputs, and detected read-time changes
 produce an unavailable digest with a reason. Errors are not silently treated as
 empty files or omitted dependencies. File metadata helps detect races but never
 substitutes for content in an identity. This is not an atomic filesystem
-snapshot: later integration must revalidate mutable source inputs before
+snapshot: the JIT adapter revalidates mutable source inputs before
 publication, and installation inputs must remain immutable within a process.
 
 Additional application sources are reread for each request. An application's
@@ -78,6 +78,77 @@ it does not prove that the file is the complete dependency set.
 result has `usable=False` and `digest=None` if any component is incomplete or
 unreadable. There is no shared `UNKNOWN` key. An extra application fingerprint
 cannot turn this result into a usable toolchain identity.
+
+### Externally verified revisions
+
+`ComponentInputs.verified_revision` is the one exception to reading contents. An
+adapter may set it only when some other mechanism has already proven, in the
+same resolution, that the component's bytes *are* that revision. A version an
+installation reports about itself is not such a proof, and neither is a path
+that contains a version number.
+
+PTO-ISA is the only component that currently qualifies. `ensure_pto_isa_root()`
+returns a checkout only after proving it is clean and at the pinned commit, and
+re-clones it from the pin otherwise; git objects are content-addressed, so a
+clean tree at `HEAD == pin` is byte-for-byte the pinned tree. Hashing that tree
+again re-proves what the resolution established.
+
+That resolution decides cleanliness with `git status --porcelain`, which omits
+paths the checkout ignores, so a build writing generated files into the ISA tree
+would not disturb it. The adapter therefore re-asks with `--ignored`, which
+covers the tracked state again at the same time: anything at all that git does
+not account for — ignored, untracked or modified — sends the component back to
+its contents. That check costs about 18ms against the 0.71s the content read
+costs.
+
+An adapter that cannot read the revision, or cannot get a usable answer about
+the tree, falls back the same way, and `unavailable_reason` still outranks a
+revision, so an incomplete component stays unavailable.
+
+A verified revision is recorded together with its component name, so one
+component's revision can never produce the same digest as another's, nor as any
+content digest.
+
+### Self-reported versions
+
+`ComponentInputs.reported_version` is deliberately weaker and is named for what
+it is: a version the installation states about *itself*, with nothing verifying
+it. It separates installations that say they differ; it cannot see bytes that
+changed while the version stayed put, so a rebuild or a patch applied in place
+is invisible to it.
+
+ptoas uses it. Nothing proves that installation's bytes: it is an external tree
+selected by `PTOAS_ROOT`, its releases carry no manifest the installer checks,
+and the sha256 in `toolchain/versions.env` names the downloaded wheel rather
+than anything reachable from the unpacked tree. The identity therefore rests on
+a deployment property — that ptoas arrives as an unmodified published build —
+not on evidence PyPTO can check.
+
+The complete `--version` text is the identity, not the number parsed from it.
+The accepted-version check keeps only the numeric part, so a dev build's suffix
+— the one marker separating it from the release it was built from — would
+otherwise be discarded, and the two would share an identity.
+
+`reported_version` and `verified_revision` are recorded under different tags, so
+the same string under each yields different digests: a self-reported claim can
+never impersonate a proof. A failed probe falls back to the content inventory,
+and `unavailable_reason` still outranks both.
+
+A component may carry a version *and* contents. The device toolchain does: its
+compiler runs on the host, so its inputs come from the CANN installation, which
+states its own build, and from files the host OS provides, which state nothing.
+Each part is covered by the evidence it actually has. Declared roots are always
+read, so a version never stands in for files the component lists — if that
+inventory cannot be read, the component is unavailable however good the version
+is.
+
+CANN is identified by `innerversion` from `ascend_toolkit_install.info`, in
+preference to `version`: two builds of one release share the release number and
+differ only in the build. An installation reaches its own info file by more than
+one path — `arm64-linux` is a symlink to `aarch64-linux` — so candidates are
+counted by the file they name, not by path. Anything unexpected (no info file,
+two distinct ones, an empty value, an unrecognised install layout) reads every
+input as before.
 
 Successful component reads are memoized by their complete resolved inventory,
 with synchronization for concurrent threads. Changed selection must produce a
@@ -114,4 +185,4 @@ arbitrary reflective Python code. The registry also records non-`PYPTO_*`
 inputs such as `PATH`, compiler include/library search variables, loader
 injection, and locale; the toolchain adapters must account for these before
 claiming complete identity. Unsupported dependency discovery must remain
-unavailable when persistent lookup is eventually connected.
+unavailable during persistent lookup.

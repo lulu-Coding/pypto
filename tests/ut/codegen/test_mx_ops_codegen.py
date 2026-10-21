@@ -51,12 +51,13 @@ class TestMxMatmulCodegen:
         class Program:
             @pl.function(type=pl.FunctionType.InCore)
             def main(self):
-                created = pl.tile.create([16, 64], dtype=pl.FP4, target_memory=pl.Mem.Vec)
-                pl.set_validshape(created, 8, 64)
+                created = pl.tile.create([16, 32], dtype=pl.FP4E2M1X2, target_memory=pl.Mem.Vec)
+                pl.set_validshape(created, 8, 32)
 
         mlir = _emit_incore_mlir(Program)
         alloc = next(line for line in mlir.splitlines() if "pto.alloc_tile" in line and "f4E2M1x2" in line)
         set_valid = next(line for line in mlir.splitlines() if "pto.set_validshape" in line)
+        # Carrier extents are emitted as-is (no /2); logical FP4 would still /2 on Vec.
         assert "valid_row = %c16_index valid_col = %c32_index" in alloc
         assert "v_row=?, v_col=?" in alloc
         assert ", %c8_index, %c32_index :" in set_valid
@@ -87,10 +88,10 @@ class TestMxMatmulCodegen:
                 pl.store(pl.matmul_mx(lhs, lhs_scale, rhs, rhs_scale), [0, 0], out)
 
         with pytest.raises(ValueError, match=r"matmul_mx.*only supported.*Ascend950.*a5.*a2a3"):
-            _run_default_pipeline(Program, BackendType.Ascend910B)
+            _run_default_pipeline(Program, BackendType.Ascend910)
 
     def test_mx_scale_load_accepts_provable_dynamic_offset(self):
-        """Provable MX offsets become FloorDiv in IR; codegen sees divsi + maxsi."""
+        """Provable MX offsets become FloorDiv in IR; codegen sees floordivsi + maxsi."""
 
         @pl.program
         class Program:
@@ -107,13 +108,43 @@ class TestMxMatmulCodegen:
         mlir = _emit_incore_mlir(Program)
         assert "cf.assert" not in mlir
         assert "arith.remui" not in mlir
-        assert "arith.divsi" in mlir or "arith.divui" in mlir
+        assert "arith.floordivsi" in mlir
         assert "pto.tload" in mlir
         assert "{layout = #pto.layout<mx_a_zz>}" in mlir
         partitions = [line for line in mlir.splitlines() if "partition_view" in line]
         assert any(
             "sizes = [%c1_index, %c1_index, %c1_index, %c16_index, %c2_index]" in line for line in partitions
         )
+
+    def test_mx_scale_load_joins_layout_and_cache_policy_in_one_attr_dict(self):
+        """An MX scale load declared `cache=BYPASS` carries BOTH attributes.
+
+        The MX ``layout`` and the L2-bypass ``cache_policy`` (pypto #2680) can
+        co-occur on one ``pto.tload``, and PTOAS takes all present attributes in
+        a single dict — two dicts, or a dropped attribute, would not assemble.
+        ``layout`` stays first so an MX load that declares no policy keeps its
+        byte-identical form.
+
+        Verified against a real ptoas v0.61 run of this emit (accepted; the load
+        lowers to ``TLOAD<pto::TLoadL2Hint::NotAllocKeep>``). UTs themselves run
+        with ``skip_ptoas=True``, so the assertion here is on the emitted text.
+        """
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a_s: pl.Tensor[[128, 8], pl.FP8E8M0, pl.MX_A_ZZ],
+            ):
+                _ = pl.load(a_s, [0, 0], [16, 2], target_memory=pl.Mem.Mat, cache=pl.CachePolicy.BYPASS)
+
+        mlir = _emit_incore_mlir(Program)
+        tloads = [line for line in mlir.splitlines() if "pto.tload" in line]
+        assert len(tloads) == 1, f"expected one MX scale load:\n{mlir}"
+        assert (
+            "{layout = #pto.layout<mx_a_zz>, cache_policy = #pto.load_cache_policy<l2_bypass>}" in tloads[0]
+        ), tloads[0]
 
     def test_mx_scale_load_rejects_unprovable_dynamic_offset(self):
         """Unaligned / unprovable dynamic MX offsets fail at BlockMxScaleTensorViews."""
@@ -214,15 +245,11 @@ class TestMxMatmulCodegen:
                 b_s: pl.Tensor[[2, 64], pl.FP8E8M0, pl.MX_B_NN],
                 out: pl.Tensor[[128, 64], pl.FP32],
             ):
-                ta = pl.load(a, [0, 0], [128, 64], target_memory=pl.Mem.Mat)
-                tas = pl.load(a_s, [0, 0], [128, 2], target_memory=pl.Mem.Mat)
-                tb = pl.load(b, [0, 0], [64, 64], target_memory=pl.Mem.Mat)
-                tbs = pl.load(b_s, [0, 0], [2, 64], target_memory=pl.Mem.Mat)
-                la = pl.move(ta, target_memory=pl.Mem.Left)
-                las = pl.move(tas, target_memory=pl.Mem.LeftScale)
-                rb = pl.move(tb, target_memory=pl.Mem.Right)
-                rbs = pl.move(tbs, target_memory=pl.Mem.RightScale)
-                c = pl.matmul_mx(la, las, rb, rbs)
+                ta = pl.load(a, [0, 0], [128, 64])
+                tas = pl.load(a_s, [0, 0], [128, 2])
+                tb = pl.load(b, [0, 0], [64, 64])
+                tbs = pl.load(b_s, [0, 0], [2, 64])
+                c = pl.matmul_mx(ta, tas, tb, tbs)
                 pl.store(c, [0, 0], out)
 
         mlir = _emit_incore_mlir(Program)
@@ -294,21 +321,17 @@ class TestMxMatmulCodegen:
             @pl.function(type=pl.FunctionType.InCore)
             def main(
                 self,
-                a: pl.Tensor[[128, 64], pl.FP4],
+                a: pl.Tensor[[128, 32], pl.FP4E2M1X2],
                 a_s: pl.Tensor[[128, 2], pl.FP8E8M0, pl.MX_A_ZZ],
                 b: pl.Tensor[[64, 64], pl.FP8E4M3FN],
                 b_s: pl.Tensor[[2, 64], pl.FP8E8M0, pl.MX_B_NN],
                 out: pl.Tensor[[128, 64], pl.FP32],
             ):
-                ta = pl.cast(pl.load(a, [0, 0], [128, 64]), pl.FP8E4M3FN)
-                tas = pl.load(a_s, [0, 0], [128, 2], target_memory=pl.Mem.Mat)
-                tb = pl.load(b, [0, 0], [64, 64], target_memory=pl.Mem.Mat)
-                tbs = pl.load(b_s, [0, 0], [2, 64], target_memory=pl.Mem.Mat)
-                la = pl.move(ta, target_memory=pl.Mem.Left)
-                las = pl.move(tas, target_memory=pl.Mem.LeftScale)
-                rb = pl.move(tb, target_memory=pl.Mem.Right)
-                rbs = pl.move(tbs, target_memory=pl.Mem.RightScale)
-                pl.store(pl.matmul_mx(la, las, rb, rbs), [0, 0], out)
+                ta = pl.cast(pl.load(a, [0, 0], [128, 32]), pl.FP8E4M3FN)
+                tas = pl.load(a_s, [0, 0], [128, 2])
+                tb = pl.load(b, [0, 0], [64, 64])
+                tbs = pl.load(b_s, [0, 0], [2, 64])
+                pl.store(pl.matmul_mx(ta, tas, tb, tbs), [0, 0], out)
 
         mlir = _emit_incore_mlir(Program)
         assert mlir.count("pto.tcvt") == 3
@@ -328,8 +351,8 @@ class TestMxMatmulCodegen:
             ):
                 pl.store(pl.load(src, [0, 0], [16, 64]), [0, 0], out)
 
-        with pytest.raises(ValueError, match=r"4-bit dtype.*not supported.*a2a3.*load/store.*ABI"):
-            _emit_incore_mlir(Program, BackendType.Ascend910B)
+        with pytest.raises(ValueError, match=r"(?:4-bit )?dtype .*not supported.*a2a3"):
+            _emit_incore_mlir(Program, BackendType.Ascend910)
 
     @pytest.mark.parametrize("dtype", [pl.INT4, pl.UINT4, pl.HF4])
     def test_a5_rejects_non_fp4_four_bit_incore_abis(self, dtype):
@@ -343,7 +366,7 @@ class TestMxMatmulCodegen:
             ):
                 pl.store(pl.load(src, [0, 0], [16, 64]), [0, 0], out)
 
-        with pytest.raises(ValueError, match=r"4-bit dtype.*not supported.*a5.*only FP4"):
+        with pytest.raises(ValueError, match=r"4-bit dtype.*not supported.*a5.*packed FP4E2M1X2"):
             _emit_incore_mlir(Program)
 
     def test_matmul_mx_acc_ins_equals_outs(self):

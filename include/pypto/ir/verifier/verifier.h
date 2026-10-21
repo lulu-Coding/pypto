@@ -16,6 +16,8 @@
 #include <string>
 #include <vector>
 
+#include "pypto/backend/common/backend_handler.h"
+#include "pypto/core/dtype.h"
 #include "pypto/core/error.h"
 #include "pypto/ir/program.h"
 
@@ -96,6 +98,33 @@ PropertyVerifierPtr CreateNoNestedCallPropertyVerifier();
  * @return Shared pointer to AccToGmStoreValid PropertyVerifier
  */
 PropertyVerifierPtr CreateAccToGmStoreValidPropertyVerifier();
+
+/**
+ * @brief Factory for the Acc->Mat FIXPIPE-epilogue property verifier
+ *
+ * Checks that every ``tile.assemble`` carrying ``pre_quant`` / ``pre_relu`` is
+ * an Acc-to-Mat writeback whose dtype pair the backend's fix-pipe supports. The
+ * Acc->GM half of the same contract is ``AccToGmStoreValid``.
+ *
+ * @return Shared pointer to FixpipeEpilogueValid PropertyVerifier
+ */
+PropertyVerifierPtr CreateFixpipeEpilogueValidPropertyVerifier();
+
+/**
+ * @brief List the fix-pipe pre-quant destinations reachable from @p src_dtype
+ *
+ * Both halves of the epilogue contract reject a dtype pair, and a diagnostic
+ * that only refuses leaves the author guessing which dtype would work. Shared
+ * so the Acc->Mat and Acc->GM messages cannot drift apart while describing the
+ * same backend table.
+ *
+ * @param handler Backend whose table is consulted
+ * @param src_dtype Accumulator element type
+ * @param dest Which writeback is being described
+ * @return Slash-separated dtype names, or "none" when the source reaches nothing
+ */
+std::string DescribeFixpipePreQuantTargets(const backend::BackendHandler& handler, DataType src_dtype,
+                                           backend::BackendHandler::FixpipeDest dest);
 
 /**
  * @brief Factory for the Acc compact-mode property verifier
@@ -274,6 +303,9 @@ PropertyVerifierPtr CreateMixedKernelExpandedPropertyVerifier();
  */
 PropertyVerifierPtr CreateAivSplitValidPropertyVerifier();
 
+/// Verify the post-LowerAutoVectorSplit region/flat compatibility contract.
+PropertyVerifierPtr CreateAivSplitLoweredValidPropertyVerifier();
+
 /**
  * @brief Factory function for creating AllocatedMemoryAddr property verifier
  *
@@ -330,6 +362,17 @@ PropertyVerifierPtr CreateTileMemoryInferredPropertyVerifier();
  * @return Shared pointer to UseAfterDef PropertyVerifier
  */
 PropertyVerifierPtr CreateUseAfterDefPropertyVerifier();
+
+/**
+ * @brief Create the UseAfterDef check with strict lexical scopes for final SSA IR.
+ *
+ * Branch- and loop-local definitions never leak into their enclosing scope;
+ * only explicit return_vars become visible there. Uses indexed membership and
+ * scope undo records instead of copying the whole visible-definition set.
+ * Type-metadata uses are checked identically to the legacy UseAfterDef property.
+ * This is an internal composition helper, not a separate IR property or pass option.
+ */
+PropertyVerifierPtr CreateLexicalUseAfterDefPropertyVerifier();
 
 /**
  * @brief Factory function for creating StructuredCtrlFlow property verifier
@@ -519,6 +562,20 @@ PropertyVerifierPtr CreateCallDirectionsResolvedPropertyVerifier();
  * @return Shared pointer to TileTypeCoherence PropertyVerifier
  */
 PropertyVerifierPtr CreateTileTypeCoherencePropertyVerifier();
+
+/**
+ * @brief Verify explicit buffer representation in InCore/AIC/AIV functions.
+ *
+ * Validates registered buffer calls and composes SSA, use-after-definition, and
+ * assignment-type checks. Does not prove storage lifetimes or initialized data.
+ */
+PropertyVerifierPtr CreateBufferIRPropertyVerifier();
+
+/// Verify canonical device region storage before allocation addresses are assigned.
+PropertyVerifierPtr CreateTileStorageLegalizedPropertyVerifier();
+
+/// Verify canonical region storage and transfer overlap using effective physical addresses.
+PropertyVerifierPtr CreateTileStorageAllocatedPropertyVerifier();
 
 /**
  * @brief Factory function for creating OrchestrationReferencesResolved property verifier

@@ -43,7 +43,7 @@ golden 是按 rank 顺序的拼接——在每个 rank 上完全相同——因�
 
 ## 走读
 
-两种模式共享一个 `[nr, SIZE]` window：每个 rank 在自己的行 staging，并读回每一行。手工内核：
+两种模式共享一个 `[nr, SIZE]` window：每个 rank 最终都 staging 在自己的行上，并读回每一行——在手工内核里，staging 由调用方显式完成；而在下面的揭示中，push 发生在调用内部。手工内核：
 
 ```python
 @pl.function(type=pl.FunctionType.InCore)
@@ -96,13 +96,20 @@ def hand_step(self, x, y, data, signal):
 - `--mode hand` lowering 为上述三个阶段，是一次 **pull**：一次写入你的行、notify/wait barrier，然后 `P` 次 `pld.tile.remote_load`——每个对端一次；注意 gather 循环并*不*跳过自己那一行，因此你自己的 slice 也走同一条路径读回。barrier 在数据搬运*之前*，因为你不能读取尚未 staging 的对端。
 - `--mode builtin` lowering 为一次 **push**：一个 `P` 次 `pld.tile.put` 的循环，每次把本 rank 的 `[1, SIZE]` chunk 写入该对端 window 的第 `my_rank` 行，*然后*才是 `[nr, 1]` 信号上的 notify/wait barrier。展开结果中根本没有 `remote_load`——上面代码片段里的 `pl.load` 只是对已被各对端填好的 window 做本地读取。barrier 在传输*之后*，因为在这里它的作用是告诉你每个对端的 push 都已落地。
 - push 有两个细节值得在 IR 里看到：每次 `pld.tile.put` 都经由共享的 VEC staging tile（`tile.create`）流式传输，因此比该 tile 更大的行会被 pto-isa 自动分块；而自身 rank 的那次迭代（`peer == my_rank`）并未特判——它通过 HCCL 恒等映射走同一条 TPUT 路径。
-- barrier 之后 composite 会发出**自清理尾声**，把本次调用的信用额度再减回去——这正是同一个信号可以被后续集合通信复用的原因（见步骤 16）。
+- barrier 之后 composite 会发出**自清理尾声**，把本次调用的信用额度再减回去——这正是同一个信号可以被后续集合通信复用的原因（见
+[21-putting_it_together](21-putting_it_together.md)，步骤 16）。
 
 **成本卡（每 rank）：** 每个 rank 向每个对端发送 `N/P` 字节，因此每个 rank 收到 `(P-1)/P · N` 字节——两相 all-reduce（步骤 09）的 gather 一半，其每一相也都移动 `(P-1)/P · N`。
 
 ## 边界情况
 
 > **致命陷阱——把数据 gather 到错误的槽位。** 如果输出偏移与对端 rank 不匹配（从 peer `p` 读出的 `y[p]` 却按 `p+1` 偏移），每个 rank 内部自洽但 golden 仍然失败——顺序就是契约。**修复：** peer `peer` 对应偏移 `peer * SIZE`。
+>
+> **致命陷阱——同一个 window 既作源又作结果。** `target` 会被重绑为结果 window，
+> 但 `local_data` 必须是另一块独立 buffer——这与 `all_to_all` 施加的约束相同
+> （步骤 15）。把同一个 window 同时用作两者是跨进程数据竞争：对端向 `target` 的
+> push 可能在你仍以 `local_data` 读取它时落地。**修复：** 像示例那样让源与目标
+> 保持相互独立——内置实现也会强制这一点。
 
 | 症状 | 可能原因 | 修复 |
 | ---- | -------- | ---- |
@@ -110,6 +117,7 @@ def hand_step(self, x, y, data, signal):
 | 每个 rank 显示自己的 slice | 读取自己的 window 而非对端 | 对每个 `peer` 在 `[peer, 0]` 处 `remote_load` |
 | `pld.tensor.allgather local_data must be a plain Tensor` | InCore 路径上源传入了 `DistributedTensor` window | 源必须是与 `target` 不同的普通 `pl.Tensor [1, SIZE]`；window 形式仅 HOST 路径接受 |
 | `pld.tensor.allgather input must be a Tensor or DistributedTensor` | 源传入的是 tile——更早一步就被类型推导拒绝 | 直接传张量本身，而不是它的 `pl.load` 结果 |
+| `pld.tensor.allgather input and target must be different buffers` | 同一个 window 同时作为 `local_data` 和 `target` 传入 | 另行分配一块独立的源 buffer |
 | 拼接有缺口/重叠 | stage/gather 偏移不匹配 | stage 行 `my_rank`；读行 `peer` |
 | P=4 时数据陈旧 | stage 与 gather 之间缺少 barrier | 读取循环前 notify/wait 覆盖全部 `nr` 个对端 |
 

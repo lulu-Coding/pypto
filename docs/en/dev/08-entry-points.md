@@ -39,6 +39,12 @@ into loadable binaries. It is internal and has no supported entry point.
 | A build directory on disk | One dispatch, no recompile | `CompiledProgram.from_dir(work_dir)(*args, config=...)` |
 | A `CompiledProgram` | Timed dispatches | `benchmark(compiled, args, ...)` |
 
+## Internal torch adaptation
+
+The [kernel-mode integration foundation](runtime/kernel-mode.md) validates NPU
+metadata and captures per-call frames. It does not change the public entry
+points above or provide a kernel launch interface.
+
 ## Compile
 
 | Entry | Layer | Location |
@@ -103,7 +109,12 @@ The L3 one is a plain rename — it already was `from_dir` plus a call:
 execute_distributed_compiled(work_dir, args, config=cfg, platform="a2a3")
 
 # after
-ir.DistributedCompiledProgram.from_dir(work_dir, platform="a2a3")(*args, config=cfg)
+from pypto.backend import BackendType
+from pypto.runtime import ExecutionMode
+
+ir.DistributedCompiledProgram.from_dir(
+    work_dir, backend_type=BackendType.Ascend910, execution_mode=ExecutionMode.ONBOARD,
+)(*args, config=cfg)
 ```
 
 **The L2 one is not**, because the two paths disagree on precedence:
@@ -123,13 +134,40 @@ would move the run to the simulator. Fold them into the config:
 execute_compiled(work_dir, args, platform="a2a3", device_id=0, config=cfg)
 
 # after -- cfg carries every execution setting
-cfg = dataclasses.replace(cfg, platform="a2a3", device_id=0)
+from pypto.backend import BackendType
+from pypto.runtime import ExecutionMode
+
+cfg = dataclasses.replace(
+    cfg, backend_type=BackendType.Ascend910, execution_mode=ExecutionMode.ONBOARD, device_id=0,
+)
 ir.CompiledProgram.from_dir(work_dir)(*args, config=cfg)
 ```
 
 `dfx` and `aicpu_thread_num` need no translation: the DFX toggles and
-`aicpu_thread_num` are already `RunConfig` fields. `from_dir(platform=...)`
-still decides the platform for a call made *without* a config.
+`aicpu_thread_num` are already `RunConfig` fields. The target passed to
+`from_dir(backend_type=..., execution_mode=...)` applies to a call made
+*without* a config.
+
+## Legacy platform examples
+
+Some guides and runnable examples retain `platform=` to illustrate compatibility
+with existing callers and platform-based test fixtures. Those examples are
+explicitly marked **legacy**: the Python argument emits `DeprecationWarning`
+and fails when that warning is treated as an error. For new Python code, import
+`BackendType` from `pypto.backend` and `ExecutionMode` from `pypto.runtime`, then
+replace `platform=` with both fields below:
+
+| Legacy `platform` | `backend_type` | `execution_mode` |
+| ----------------- | -------------- | ---------------- |
+| `"a2a3"` | `BackendType.Ascend910` | `ExecutionMode.ONBOARD` |
+| `"a2a3sim"` | `BackendType.Ascend910` | `ExecutionMode.SIM` |
+| `"a5"` | `BackendType.Ascend950` | `ExecutionMode.ONBOARD` |
+| `"a5sim"` | `BackendType.Ascend950` | `ExecutionMode.SIM` |
+
+This applies to `RunConfig`, `CompileOptions`, `ir.compile`, both artifact
+`from_dir` methods, and `dataclasses.replace(config, ...)`. The CLI `--platform`
+flag, warmup JSON, artifact metadata, and derived `.platform` properties retain
+their existing string format and do not trigger the Python API deprecation.
 
 ## Driving both phases from one config
 
@@ -138,7 +176,10 @@ still decides the platform for a call made *without* a config.
 arguments, so one config object drives both phases:
 
 ```python
-config = RunConfig(platform="a2a3")
+from pypto.backend import BackendType
+from pypto.runtime import ExecutionMode, RunConfig
+
+config = RunConfig(backend_type=BackendType.Ascend910, execution_mode=ExecutionMode.ONBOARD)
 compiled = ir.compile(program, **config.compile_kwargs())
 compiled(*tensors, config=config)
 ```
@@ -147,38 +188,63 @@ Its fields split three ways, and each way is a type:
 
 | Read by | Type | Fields |
 | ------- | ---- | ------ |
-| `ir.compile` | `CompileOptions` | `platform`, `strategy`, `dump_passes`, `dump_ptoas_passes`, `profiling` (`compile_profiling`), `diagnostic_phase`, `disabled_diagnostics`, `analyze_auto_scopes_for_deps`, `output_dir` (`save_kernels_dir`), `memory_planner`, `distributed_config` |
+| `ir.compile` | `CompileOptions` | `backend_type`, `execution_mode` (legacy `platform`), `strategy`, `dump_passes`, `dump_ptoas_passes`, `profiling` (`compile_profiling`), `diagnostic_phase`, `disabled_diagnostics`, `analyze_auto_scopes_for_deps`, `output_dir` (`save_kernels_dir`), `memory_planner`, `distributed_config` |
 | Dispatch | `RunOptions` | `platform`, `device_id`, `aicpu_thread_num`, the `ring_*` overrides ([Ring sizing](05-runtime-ring-sizing.md)), and a nested `DfxOptions` |
 | A dispatch's diagnostics | `DfxOptions` | `enable_chip_swimlane`, `enable_dump_args`, `enable_pmu`, `enable_dep_gen`, `enable_scope_stats` ([DFX](03-runtime-dfx.md)) |
 | The system-test harness only | — | `rtol`, `atol`, `golden_data_dir`, `save_kernels`, `codegen_only` |
-| Nobody — derived | — | `backend_type`, a read-only property over `platform`, not a field |
+| Nobody — derived | — | `backend_type`, RunConfig’s constructor/read alias over its `arch` storage |
 
-**`platform` is two decisions, so `RunConfig` stores two fields.** The string
-packs an architecture (`a2a3` / `a5`) and an execution mode (the `sim` suffix),
-and each is read by a different consumer: compilation takes only the
-architecture — codegen never sees the string — while assembly picks `.so` vs
-`.o` from the suffix and the worker compares the whole token. `RunConfig`
-therefore carries `arch: BackendType` and `execution_mode: ExecutionMode`, with
-`platform` a derived property that serializes them:
+**Choose the target with `backend_type` and `execution_mode`.** Architecture
+selects compiler lowering and codegen; execution mode selects simulator or
+onboard binary assembly and dispatch. Both `RunConfig` and `CompileOptions`
+accept the pair, as does `ir.compile` directly:
 
 ```python
-RunConfig(arch=BackendType.Ascend950, execution_mode=ExecutionMode.ONBOARD).platform  # "a5"
-RunConfig(platform="a5").arch                                                         # Ascend950
+from pypto.backend import BackendType
+from pypto.runtime import CompileOptions, ExecutionMode, RunConfig
+
+config = RunConfig(
+    backend_type=BackendType.Ascend950,
+    execution_mode=ExecutionMode.ONBOARD,
+)
+compiled = ir.compile(program, **config.compile_kwargs())
+# Equivalent direct compilation:
+compiled = ir.compile(
+    program, backend_type=BackendType.Ascend950, execution_mode=ExecutionMode.ONBOARD,
+)
 ```
 
-`platform=` stays constructible — 238 call sites use it — and sets both axes.
-Nothing else moves: `cfg.platform` is still a plain `str`, so the artifact
-sidecars, `--platform`, and simpler's `Worker(platform=...)` are untouched. The
-split lands where a target is *chosen*; the artifact, the worker and the
-assembly layer only *carry* one, and keep the string.
+The default remains Ascend910 + SIM. Compiled programs expose both target
+properties; `from_dir(..., execution_mode=...)` overrides the persisted mode,
+and `from_dir(..., backend_type=...)` retains the persisted mode while updating
+the backend and derived platform. Either axis can be overridden independently
+without rewriting metadata. Existing runtime binding and cache restrictions
+still apply. Reloading does not rerun code generation.
 
-Two things disappear with it. `__post_init__` no longer validates the string
-against four literals or rebuilds it from the backend it implied — a platform
-that disagrees with its own architecture is no longer a value that can be made.
-And `arch` is `BackendType`, not a third enum, so `backend_type` is that field
-under the compiler's name rather than a competing input: `CompileOptions` does
-not carry it, and `ir.compile` keeps its parameter only for callers that pass no
-platform.
+When selecting the target without a legacy `platform`, `CompileOptions` requires
+an `ExecutionMode` enum value. Omit `execution_mode` to use SIM; explicitly
+passing `None` or a string raises `TypeError`.
+
+The `platform=` input is deprecated in `RunConfig`, `CompileOptions` (including
+its positional form), `ir.compile`, `CompiledProgram.from_dir`, and
+`DistributedCompiledProgram.from_dir`. These calls emit `DeprecationWarning`;
+use `backend_type` and `execution_mode` instead. No removal version is scheduled.
+Reading the derived `.platform` property remains silent, and RunConfig's `arch`
+field remains compatible. A legacy platform still selects both axes and wins over backend_type;
+RunConfig retains its warning when those two disagree. `ir.compile` rejects an
+explicit execution_mode that contradicts an explicit platform. In RunConfig and
+CompileOptions the legacy platform wins over both axes, preserving
+`dataclasses.replace(config, platform=...)`. Without platform, backend_type now
+selects the architecture (it is no longer discarded by RunConfig).
+
+`RunConfig` temporarily stores its architecture as `arch`; backend_type is its
+constructor/read alias. CompileOptions stores backend_type and execution_mode.
+Their compile mappings forward `backend_type` and `execution_mode`, so new-style
+compilation does not emit a legacy warning. Artifact sidecars, CLI compatibility
+paths, cache keys, and Simpler SDK calls retain the canonical internal platform
+encoding. New and
+legacy requests therefore identify the same cache entry. This change does not
+alter per-call config defaulting or the process-global backend selection rule.
 
 `RunConfig.compile_options()` / `run_options()` / `dfx_options()` are views onto
 the aggregate, and `compile_kwargs()` is `compile_options().as_compile_kwargs()`.
@@ -187,9 +253,9 @@ the aggregate, and `compile_kwargs()` is `compile_options().as_compile_kwargs()`
 own vocabulary, and it stands alone:
 
 ```python
-from pypto.runtime import CompileOptions
+from pypto.runtime import CompileOptions, ExecutionMode
 
-compiled = ir.compile(program, **CompileOptions(platform="a2a3").as_compile_kwargs())
+compiled = ir.compile(program, **CompileOptions(execution_mode=ExecutionMode.ONBOARD).as_compile_kwargs())
 ```
 
 **Only two of the three are exported**, because only two are things a caller can

@@ -11,7 +11,7 @@
 
 import pytest
 from pypto import DataType, ir
-from pypto.arith import fold_const
+from pypto.arith import Analyzer, CanonicalSimplifier, fold_const
 
 S = ir.Span.unknown()
 INT = DataType.INT64
@@ -108,6 +108,68 @@ class TestFloorDivMod:
     def test_floormod_by_zero_raises(self):
         with pytest.raises(ValueError):
             fold_const(ir.FloorMod(ci(5), ci(0), INT, S))
+
+
+class TestFloorDivModNarrowLiterals:
+    @pytest.mark.parametrize("op", [ir.FloorDiv, ir.FloorMod])
+    @pytest.mark.parametrize("dtype,bits", [(DataType.INT8, 8), (DataType.INT16, 16), (DataType.INT32, 32)])
+    def test_out_of_range_literals_keep_runtime_operation(self, op, dtype, bits):
+        """Stored literals can change sign, become zero, or become one when emitted."""
+        modulus = 1 << bits
+        for lhs, rhs in (
+            (1, modulus - 3),
+            (modulus - 3, 2),
+            (modulus - 3, 1),
+            (5, modulus),
+            (5, modulus + 1),
+            (-(2**63), -1),
+        ):
+            expr = op(ir.ConstInt(lhs, dtype, S), ir.ConstInt(rhs, dtype, S), dtype, S)
+            assert fold_const(expr) is None, (lhs, rhs)
+            # Skipping the direct fold must also prevent later bound-based rewrites
+            # from treating e.g. 253 : i8 as a positive divisor.
+            for simplify in (Analyzer().simplify, CanonicalSimplifier()):
+                ir.assert_structural_equal(simplify(expr), expr)
+
+    @pytest.mark.parametrize("op", [ir.FloorDiv, ir.FloorMod])
+    def test_divisor_narrowed_to_operation_dtype_keeps_runtime_operation(self, op):
+        """Both literals fit their own dtype, but i32 emission turns the divisor into -3."""
+        expr = op(ir.ConstInt(1, DataType.INT32, S), ci(2**32 - 3), DataType.INT32, S)
+        assert fold_const(expr) is None
+        for simplify in (Analyzer().simplify, CanonicalSimplifier()):
+            ir.assert_structural_equal(simplify(expr), expr)
+
+    @pytest.mark.parametrize("op", [ir.FloorDiv, ir.FloorMod])
+    def test_simplified_divisor_keeps_operation_width(self, op):
+        """Rebuilding after the RHS folds must still narrow the divisor to i32 (-3)."""
+        dtype = DataType.INT32
+        lhs = ir.Var("x", ir.ScalarType(dtype), S)
+        rhs = ir.Add(ci(2**32 - 4), ci(1), INT, S)
+        expr = op(lhs, rhs, dtype, S)
+        expected = op(lhs, ci(2**32 - 3), dtype, S)
+        for simplify in (Analyzer().simplify, CanonicalSimplifier()):
+            ir.assert_structural_equal(simplify(expr), expected)
+
+    @pytest.mark.parametrize("op", [ir.FloorDiv, ir.FloorMod])
+    def test_out_of_range_divisor_with_variable_keeps_runtime_operation(self, op):
+        dtype = DataType.INT8
+        lhs = ir.Var("x", ir.ScalarType(dtype), S)
+        expr = op(lhs, ir.ConstInt(253, dtype, S), dtype, S)
+        assert fold_const(expr) is None
+        analyzer = Analyzer()
+        analyzer.bind(lhs, 0, 8)
+        # Raw-value bounds would otherwise rewrite x // 253 to 0 or x % 253 to x.
+        for simplify in (analyzer.simplify, CanonicalSimplifier()):
+            ir.assert_structural_equal(simplify(expr), expr)
+
+    @pytest.mark.parametrize("op,expected", [(ir.FloorDiv, -3), (ir.FloorMod, 2)])
+    def test_in_range_operands_still_fold_with_operation_dtype(self, op, expected):
+        # The result belongs to the operation's dtype even if an operand is wider.
+        expr = op(ci(-7), ir.ConstInt(3, DataType.INT32, S), DataType.INT32, S)
+        result = fold_const(expr)
+        assert isinstance(result, ir.ConstInt)
+        assert result.value == expected
+        assert result.dtype == DataType.INT32
 
 
 # ============================================================================
@@ -493,6 +555,60 @@ class TestOverflowAndEdgeCases:
         result = fold_const(ir.Pow(ci(3), ci(20), INT, S))
         assert isinstance(result, ir.ConstInt)
         assert result.value == 3**20
+
+
+class TestCast:
+    """``cast(<integer constant>, dtype)`` folds to a constant of that dtype.
+
+    Keeps an annotated scalar whose RHS folds to a constant from carrying the
+    parser's dtype cast into codegen (``cast(0, INT64)`` vs ``const(0, INT64)``
+    — see #2779).
+    """
+
+    def test_index_to_int64_folds(self):
+        result = fold_const(ir.Cast(ir.ConstInt(7, DataType.INDEX, S), DataType.INT64, S))
+        assert isinstance(result, ir.ConstInt)
+        assert result.value == 7
+        assert result.dtype == DataType.INT64
+
+    def test_widening_and_narrowing_in_range_fold(self):
+        for value, dtype in ((-128, DataType.INT8), (127, DataType.INT8), (255, DataType.UINT8)):
+            result = fold_const(ir.Cast(ci(value), dtype, S))
+            assert isinstance(result, ir.ConstInt), (value, dtype)
+            assert result.value == value
+            assert result.dtype == dtype
+
+    def test_out_of_range_narrowing_keeps_the_cast(self):
+        """Truncation is the target's runtime behaviour — do not bake it into the IR."""
+        for value, dtype in ((128, DataType.INT8), (-1, DataType.UINT8), (70000, DataType.INT16)):
+            assert fold_const(ir.Cast(ci(value), dtype, S)) is None, (value, dtype)
+
+    def test_operand_out_of_range_for_its_own_dtype_keeps_the_cast(self):
+        """``ConstInt`` does not validate its value against its dtype, and an
+        annotated literal can mint an out-of-range one (``small: pl.Scalar[
+        pl.INT8] = 255``). Folding by copying the value would change the program:
+        codegen lowers that constant as ``arith.constant 255 : i8`` followed by
+        ``arith.extsi ... : i8 to i32``, and sign-extending ``0xff`` yields -1,
+        not 255.
+        """
+        assert fold_const(ir.Cast(ir.ConstInt(255, DataType.INT8, S), DataType.INT32, S)) is None
+        assert fold_const(ir.Cast(ir.ConstInt(-1, DataType.UINT8, S), DataType.INT32, S)) is None
+        assert fold_const(ir.Cast(ir.ConstInt(70000, DataType.INT16, S), DataType.INT64, S)) is None
+
+    def test_in_range_operand_widens(self):
+        """The same widening folds once the source value is representable."""
+        result = fold_const(ir.Cast(ir.ConstInt(-1, DataType.INT8, S), DataType.INT32, S))
+        assert isinstance(result, ir.ConstInt)
+        assert result.value == -1
+        assert result.dtype == DataType.INT32
+
+    def test_float_destination_is_left_alone(self):
+        """Rounding / saturation semantics this fold does not model."""
+        assert fold_const(ir.Cast(ci(3), DataType.FP32, S)) is None
+
+    def test_non_constant_operand_is_left_alone(self):
+        var = ir.Var("i", ir.ScalarType(DataType.INDEX), S)
+        assert fold_const(ir.Cast(var, DataType.INT32, S)) is None
 
 
 if __name__ == "__main__":

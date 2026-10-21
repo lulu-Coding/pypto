@@ -64,21 +64,27 @@ import inspect
 import json
 import os
 import re
-import tempfile
 import textwrap
+import threading
+import types
+import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
+from pypto._cache_config import capture_cache_config, record_stats, time_stage
 from pypto._external_source import external_source_digest
+from pypto._identity import digest_record
+from pypto._target import _platform_string
 from pypto.backend._ptoas_locate import find_ptoas_binary
 from pypto.backend.pto_backend import emit_source_loc_default
 from pypto.compile_profiling import get_active_profiler
-from pypto.ir.compile import _validate_pass_context_conflicts
+from pypto.ir.compile import _validate_pass_context_conflicts, make_default_output_dir
 from pypto.ir.pass_manager import PassDumpLevel, coerce_dump_level
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir
 from pypto.pypto_core import passes as _passes
+from pypto.pypto_core.passes import runtime_kind_to_name
 
 from ._source import cache_in_snapshot, capture_namespaces
 from .cache import CacheKey, compute_source_hash, make_cache_key
@@ -166,7 +172,7 @@ def _get_torch() -> Any:
                 ("float8_e4m3fn", DataType.FP8E4M3FN),
                 ("float8_e5m2", DataType.FP8E5M2),
                 ("float8_e8m0fnu", DataType.FP8E8M0),
-                ("float4_e2m1fn_x2", DataType.FP4),
+                ("float4_e2m1fn_x2", DataType.FP4E2M1X2),
             ):
                 _td = getattr(torch, _torch_name, None)
                 if _td is not None:
@@ -276,15 +282,22 @@ def _extract_tensor_meta(
     tensor: Any,
     dyn_dims: dict[int, DynDim] | None = None,
     layout: _ir.TensorLayout | None = None,
+    expected_dtype: DataType | None = None,
 ) -> TensorMeta:
     """Extract TensorMeta from a torch.Tensor (shape/dtype only — no data read).
 
-    ``layout`` comes from the parameter's annotation, not the tensor: torch has
-    no notion of a PyPTO layout, so the annotation is the only source.
+    ``layout`` and ``expected_dtype`` come from the parameter's annotation, not
+    the tensor: torch has no notion of a PyPTO layout, and ``float4_e2m1fn_x2``
+    alone cannot distinguish logical ``pl.FP4`` (nibble IR, expand last dim) from
+    packed ``pl.FP4E2M1X2`` (carrier IR, no expand). ``expected_dtype`` is only
+    consulted for that FP4-family dual path; other annotations are ignored here.
     """
-    dtype = _torch_dtype_to_pypto(tensor.dtype)
+    torch_dtype = _torch_dtype_to_pypto(tensor.dtype)
     extents = list(tensor.shape)
-    if dtype == DataType.FP4:
+
+    if torch_dtype == DataType.FP4E2M1X2 or (
+        expected_dtype is not None and expected_dtype in (DataType.FP4, DataType.FP4E2M1X2)
+    ):
         if not extents:
             raise TypeError("Packed torch.float4_e2m1fn_x2 tensors must have rank >= 1")
         if extents[-1] <= 0:
@@ -292,10 +305,32 @@ def _extract_tensor_meta(
                 "Packed torch.float4_e2m1fn_x2 tensors require a positive runtime x2 carrier last "
                 f"dimension; got shape {tuple(extents)}"
             )
-        # Torch exposes one x2 carrier per byte. PyPTO IR and PTO-ISA count
-        # logical FP4 nibbles, so expand only at this API boundary and keep the
-        # storage shape out of TensorType/TileType.
+
+    # expected_dtype is FP4-family only (see ``_param_dtypes``). Other annotations
+    # such as ``pl.INDEX`` are semantic IR types whose torch ABI is INT64; do not
+    # introduce a general annotation↔torch strict check here.
+    if expected_dtype is not None and expected_dtype == DataType.FP4:
+        if torch_dtype not in (DataType.FP4, DataType.FP4E2M1X2):
+            raise TypeError(
+                f"Parameter annotated pl.FP4 but got torch dtype mapped to {torch_dtype}; "
+                "pass torch.float4_e2m1fn_x2 or change the annotation"
+            )
+        # Legacy logical FP4 path: expand carrier → nibble extents at the API boundary.
         extents[-1] *= 2
+        dtype = DataType.FP4
+    elif expected_dtype is not None and expected_dtype == DataType.FP4E2M1X2:
+        if torch_dtype not in (DataType.FP4, DataType.FP4E2M1X2):
+            raise TypeError(
+                f"Parameter annotated pl.FP4E2M1X2 but got torch dtype mapped to {torch_dtype}; "
+                "pass torch.float4_e2m1fn_x2 or change the annotation"
+            )
+        # Torch and IR both count packed x2 carriers for FP4E2M1X2; do not expand.
+        dtype = DataType.FP4E2M1X2
+    else:
+        # No FP4-family annotation (or bare pl.Tensor): keep the torch→IR default
+        # (packed FP4E2M1X2 for float4_e2m1fn_x2, no expand).
+        dtype = torch_dtype
+
     return _build_tensor_meta(extents, dtype, dyn_dims, layout)
 
 
@@ -398,6 +433,127 @@ def _param_layouts(func: Any, func_name: str) -> dict[str, _ir.TensorLayout]:
     return layouts
 
 
+def _param_dtypes(func: Any) -> dict[str, DataType]:
+    """Map parameter name → annotated FP4-family dtype, for shaped tensor params.
+
+    Used by the torch-argument path so ``pl.FP4`` vs ``pl.FP4E2M1X2`` can select
+    the expand / no-expand ABI for ``torch.float4_e2m1fn_x2``. Non-FP4 annotations
+    (e.g. ``pl.INDEX``) are omitted: they are not needed for that dual-path and
+    must not drive a general torch↔annotation dtype check.
+    """
+    try:
+        sig = inspect.signature(func)
+    except (TypeError, ValueError):
+        return {}
+    ann_ns = _annotation_namespace(func, sig)
+
+    dtypes: dict[str, DataType] = {}
+    for name, param in sig.parameters.items():
+        if name == "self":
+            continue
+        annotation = _resolve_annotation(param.annotation, ann_ns)
+        dtype = getattr(annotation, "dtype", None)
+        if isinstance(dtype, DataType) and dtype in (DataType.FP4, DataType.FP4E2M1X2):
+            dtypes[name] = dtype
+    return dtypes
+
+
+def _constexpr_params(func: Any) -> list[str]:
+    """Parameter names annotated ``pl.constexpr``, in declaration order.
+
+    Constexpr-ness lives only in the annotation: the call site passes an
+    ordinary Python value, and nothing about that value says whether the kernel
+    wants it folded or dispatched. This recovers the declaration, exactly as
+    :func:`_param_layouts` recovers a layout the passed tensor cannot carry.
+
+    Order is preserved so diagnostics list parameters the way the signature
+    does.
+
+    Args:
+        func: The Python function whose annotations to read
+
+    Returns:
+        Constexpr parameter names; every other parameter is absent
+    """
+    from pypto.language.typing.constexpr import ConstexprMarker  # noqa: PLC0415
+
+    try:
+        sig = inspect.signature(func)
+    except (TypeError, ValueError):
+        return []
+    ann_ns = _annotation_namespace(func, sig)
+
+    return [
+        name
+        for name, param in sig.parameters.items()
+        if name != "self" and isinstance(_resolve_annotation(param.annotation, ann_ns), ConstexprMarker)
+    ]
+
+
+def _request_source_hash(source_hash: str, constexpr_records: Sequence[tuple[Any, ...]]) -> str:
+    """Fold this request's constexpr bindings into the function's source hash.
+
+    A ``pl.constexpr`` argument reaches the generated program exactly as a
+    module-level constant does, so its identity is governed by the same rule:
+    hash the text that gets emitted. Layering it onto ``source_hash`` rather
+    than adding a ``CacheKey`` field keeps that one rule — and carries the
+    identity into the persistent store for free, since the store's digest is
+    derived from the same key.
+
+    The records cover **every** function in the request, not just the entry.
+    ``_get_source_hash`` can only render free *names*, so a value a dep call
+    site reaches through anything else — ``helper(x, cfg.BLOCK)`` — is invisible
+    to it: changing ``cfg.BLOCK`` would change the generated source while the
+    key stood still, and the artifact built for the old value would be served.
+    Keying the *resolved* text closes that for any expression form.
+
+    Args:
+        source_hash: The function's own hash, from ``JITFunction._get_source_hash``
+        constexpr_records: ``(index, module, qualname, param, folded text)`` per
+            resolved constexpr binding, in a deterministic order
+
+    Returns:
+        ``source_hash`` unchanged when there are no constexpr bindings, so a
+        kernel without them keeps the identity it had before they existed
+    """
+    if not constexpr_records:
+        return source_hash
+    return compute_source_hash([source_hash, json.dumps(list(constexpr_records), separators=(",", ":"))])
+
+
+def _resolve_constexpr_value(func_name: str, name: str, value: Any) -> str:
+    """Render one constexpr argument into the source text it folds to.
+
+    The rendered text *is* the value's identity: it is what reaches the
+    generated program and what :meth:`JITFunction._get_source_hash` keys on, so
+    hashing it keeps the compilation key and the emitted code from drifting
+    apart. This is the same rule a module-level constant already follows.
+
+    Args:
+        func_name: Kernel name, for diagnostics
+        name: Parameter name
+        value: The value bound to it at this call site
+
+    Returns:
+        The generated-source text this value folds to
+
+    Raises:
+        TypeError: if the specializer cannot render @p value into source.
+    """
+    from .specializer import constant_source  # noqa: PLC0415
+
+    rendered = constant_source(value)
+    if rendered is None:
+        raise TypeError(
+            f"@pl.jit function '{func_name}': constexpr parameter '{name}' got "
+            f"{value!r}, which has no source form the specializer can fold. A "
+            f"'pl.constexpr' value must be an int, float, bool, str, a pl dtype, an "
+            f"enum member such as pl.Mem.Vec, or a list of those. Annotate '{name}' "
+            f"as 'pl.Scalar[dtype]' if it should instead be a runtime value."
+        )
+    return rendered
+
+
 def _signature_tensor_meta(
     annotation: Any,
     dtype: DataType,
@@ -426,44 +582,102 @@ def _signature_tensor_meta(
     return _build_tensor_meta(extents, dtype, dyn_dims, layout)
 
 
-def _signature_scalar_value(
+def _signature_constexpr_value(
     func_name: str,
     name: str,
     param: inspect.Parameter,
     kwargs: dict[str, Any],
-) -> int | float | bool | None:
-    """Resolve a scalar parameter's value for signature-mode specialization.
+) -> Any:
+    """Resolve a constexpr parameter's value in annotation-driven signature mode.
 
-    Value comes from ``kwargs`` (by param name) or the signature default; a
-    scalar with neither is an error (the signature carries no value).
+    Unlike a scalar, a constexpr parameter has no runtime slot to fall back on:
+    the value *is* what gets compiled, so one must be supplied here. It comes
+    from ``kwargs`` or the signature default.
+
+    Args:
+        func_name: Kernel name, for diagnostics
+        name: Parameter name
+        param: The ``inspect.Parameter``, consulted for its default
+        kwargs: Keyword arguments passed to ``compile()`` / ``lower()``
 
     Returns:
-        The literal to specialize into the compiled artifact, or ``None`` when
-        the caller passed ``pl.RUNTIME`` — the parameter then stays a runtime
-        ``pl.Scalar`` in the generated program instead of being baked in.
+        The value to fold into the artifact
+
+    Raises:
+        TypeError: if the parameter has neither a keyword value nor a default.
+    """
+    if name in kwargs:
+        return kwargs[name]
+    if param.default is not inspect.Parameter.empty:
+        return param.default
+    raise TypeError(
+        f"@pl.jit function '{func_name}': constexpr parameter '{name}' has no value. Its "
+        f"value is resolved at compile time, so it cannot be left to dispatch — pass it as "
+        f"a keyword, e.g. {func_name}.compile({name}=...), or give it a signature default. "
+        f"Annotate '{name}' as 'pl.Scalar[dtype]' instead to make it a runtime value."
+    )
+
+
+def _check_signature_scalar_value(
+    func_name: str,
+    name: str,
+    param: inspect.Parameter,
+    kwargs: dict[str, Any],
+) -> None:
+    """Validate the value a scalar parameter was given in signature mode.
+
+    A scalar parameter is a runtime value, so signature mode needs no value for
+    it and any value supplied is inert. One is still accepted rather than
+    rejected: a signature default (``value: pl.Scalar[pl.FP32] = 3.0``) is
+    legitimate, and refusing a literal here would make signature mode disagree
+    with a direct call, which takes the same literal and dispatches it.
+
+    An explicit keyword is the one form that used to mean "specialize this
+    value", so it warns rather than changing meaning silently.
+
+    Args:
+        func_name: Kernel name, for diagnostics
+        name: Parameter name
+        param: The ``inspect.Parameter``, consulted for its default
+        kwargs: Keyword arguments passed to ``compile()`` / ``lower()``
+
+    Raises:
+        TypeError: if the supplied value is neither a number nor ``pl.RUNTIME``.
     """
     from pypto.language.typing.scalar import RUNTIME  # noqa: PLC0415
 
     if name in kwargs:
         value = kwargs[name]
+        explicit_keyword = True
     elif param.default is not inspect.Parameter.empty:
         value = param.default
+        explicit_keyword = False
     else:
-        raise TypeError(
-            f"@pl.jit function '{func_name}': scalar parameter '{name}' has no value. When "
-            f"specializing from annotations, pass scalar values as keyword arguments, e.g. "
-            f"lower({name}=...) or compile({name}=...). Pass '{name}=pl.RUNTIME' instead to "
-            f"leave it unspecialized (its value is supplied at dispatch)."
-        )
+        return
+
     if value is RUNTIME:
-        return None
+        return
     if not isinstance(value, (int, float, bool)):
         raise TypeError(
             f"@pl.jit function '{func_name}': scalar parameter '{name}' must be an int/float/bool "
-            f"(specializes the value into the artifact) or pl.RUNTIME (leaves it unspecialized), "
-            f"got {type(value).__name__}."
+            f"or pl.RUNTIME, got {type(value).__name__}."
         )
-    return value
+    if explicit_keyword:
+        # The message, not the reported line, carries the identification: it
+        # names the kernel, the parameter and the value, so Python's
+        # (text, category, lineno) dedup still emits one warning per affected
+        # call form. Walking out to the user's frame is not available here —
+        # ``compile()`` reaches this through a ``contextlib`` decorator, so the
+        # first non-PyPTO frame is stdlib rather than user code.
+        warnings.warn(
+            f"@pl.jit function '{func_name}': '{name}' is a scalar parameter, so "
+            f"{func_name}.compile({name}={value!r}) no longer folds that value into the "
+            f"artifact — the parameter stays a runtime value whose value arrives at dispatch. "
+            f"Drop the keyword; to compile against a fixed constant, read it from a "
+            f"module-level or closure name in the body instead of taking it as a parameter.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -602,7 +816,11 @@ def _build_dyndim_map_for_func(
     return out
 
 
-def _scan_dynamic_dims(func: Any, param_names: list[str]) -> set[tuple[str, int]]:
+# Cross-module private helper: the test suite (tests/ut/jit/test_decorator.py) reaches
+# it by underscore import; pyright's unused analysis discounts cross-module refs.
+def _scan_dynamic_dims(  # pyright: ignore[reportUnusedFunction]
+    func: Any, param_names: list[str]
+) -> set[tuple[str, int]]:
     """Return dynamic ``(param, dim)`` pairs declared in ``func`` (union of all sources)."""
     dyn_map = _build_dyndim_map_for_func(func, tuple(param_names))
     return {(p, i) for p, dims in dyn_map.items() for i in dims}
@@ -666,21 +884,6 @@ def _compute_per_func_dyndim_maps(
     return out
 
 
-_PL_DTYPE_MAP: dict[str, Any] = {}
-
-
-def _get_pl_dtype_map() -> dict[str, Any]:
-    """Build a mapping from pl dtype attribute name (e.g. 'FP32') to DataType."""
-    if not _PL_DTYPE_MAP:
-        import pypto.language as _pl  # noqa: PLC0415
-        from pypto.pypto_core import DataType as _DataType  # noqa: PLC0415
-
-        _PL_DTYPE_MAP.update(
-            {name: getattr(_pl, name) for name in dir(_pl) if isinstance(getattr(_pl, name), _DataType)}
-        )
-    return _PL_DTYPE_MAP
-
-
 def _build_dynvar_anchor_index(
     seed_meta: dict[str, TensorMeta],
 ) -> dict[str, list[tuple[str, int]]]:
@@ -714,12 +917,13 @@ class _DepBinding(NamedTuple):
 
 
 @functools.lru_cache(maxsize=512)
-def _constant_dependency_names(func: Any) -> tuple[str, ...]:
-    """Find names that can supply folded constants, excluding body locals.
+def _body_local_names(func: Any) -> set[str]:
+    """Names a body binds locally: its parameters and every assignment target.
 
-    Match the specializer's parameter/Store-target shadowing rules. Annotation
-    names resolve in the defining namespace independently of body locals.
-    Decorators and defaults are already evaluated when the function is defined.
+    A local shadows a same-named module or closure binding, so anything that
+    folds a free name must consult this first. The specializer applies the same
+    rule through ``_BodyTransformer._used_names``; keeping one definition here
+    is what stops a folded value and the emitted source from disagreeing.
     """
     definition = _get_func_def(func)
     local_names = {arg.arg for arg in ast.walk(definition.args) if isinstance(arg, ast.arg)}
@@ -728,6 +932,18 @@ def _constant_dependency_names(func: Any) -> tuple[str, ...]:
         for node in ast.walk(definition)
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
     )
+    return local_names
+
+
+def _constant_dependency_names(func: Any) -> tuple[str, ...]:
+    """Find names that can supply folded constants, excluding body locals.
+
+    Match the specializer's parameter/Store-target shadowing rules. Annotation
+    names resolve in the defining namespace independently of body locals.
+    Decorators and defaults are already evaluated when the function is defined.
+    """
+    definition = _get_func_def(func)
+    local_names = _body_local_names(func)
     names = {
         node.id
         for statement in definition.body
@@ -792,12 +1008,16 @@ class _DepScan(NamedTuple):
     ``io`` and ``funcs`` are both keyed by the name the caller's *source*
     calls the dep by (see :class:`_DepBinding`). ``seen`` holds the ``id()`` of
     every Python function already on the extraction stack, so the recursive
-    descent :func:`_dep_return_metas` performs cannot loop.
+    descent :func:`_dep_return_metas` performs cannot loop. ``constexpr`` and
+    ``scope`` are the caller's own ``pl.constexpr`` binding and namespace, from
+    which that descent resolves the binding each call site gives its callee.
     """
 
     io: dict[str, tuple[list[str], list[str]]]
     funcs: dict[str, JITFunction]
     seen: frozenset[int]
+    constexpr: Mapping[str, str]
+    scope: _StaticScope
 
 
 def _target_names(target: ast.expr) -> list[str]:
@@ -886,7 +1106,6 @@ def _dep_return_metas(
     target: ast.expr,
     deps: _DepScan,
     local: dict[str, TensorMeta],
-    scalars: Mapping[str, int | float | bool],
 ) -> _DepReturn:
     """For ``v1, ..., vk = dep(args)`` where ``dep`` returns tensors it created
     itself, resolve each ``vi`` from the callee's own ``return`` statement.
@@ -922,7 +1141,6 @@ def _dep_return_metas(
         return _DEP_RETURN_DECLINED
     dep_params, _ = deps.io[dep_name]
     seed_meta: dict[str, TensorMeta] = {}
-    seed_scalars: dict[str, int | float | bool] = {}
     for dep_param, caller_arg in _build_param_mapping(dep_params, _call_arg_refs(call)).items():
         # A ``_SlicedArg`` (``chip_orch(x[r], ...)``) seeds nothing: that
         # per-rank dispatch form returns through ``Out`` params, so the
@@ -931,18 +1149,40 @@ def _dep_return_metas(
             continue
         if caller_arg in local:
             seed_meta[dep_param] = local[caller_arg]
-        elif caller_arg in scalars:
-            seed_scalars[dep_param] = scalars[caller_arg]
     callee_metas = _extract_local_tensor_metas(
         dep._func,
         seed_meta=seed_meta,
-        seed_scalars=seed_scalars,
         caller_func_type=dep._func_type,
         dep_seen=deps.seen,
+        constexpr_values=_call_site_constexpr(dep, call, deps),
     )
     resolved = {v: callee_metas[r] for v, r in zip(names, ret_names, strict=True) if r in callee_metas}
     stale = {v for v, r in zip(names, ret_names, strict=True) if r and r not in callee_metas}
     return _DepReturn(resolved, frozenset(stale))
+
+
+def _call_site_constexpr(dep: JITFunction, call: ast.Call, deps: _DepScan) -> dict[str, str]:
+    """The ``pl.constexpr`` binding ``call`` gives ``dep``; empty when there is none.
+
+    A call site that cannot bind is reported, by name, when the variant plan
+    resolves it for compilation. This descent only reads metadata, so it binds
+    nothing rather than raising first with less context.
+    """
+    constexpr_names = _constexpr_params(dep._func)
+    if not constexpr_names:
+        return {}
+    try:
+        return _resolve_call_site_constexpr(
+            dep.__name__,
+            (constexpr_names, dep._param_names()),
+            call,
+            "<caller>",
+            deps.constexpr,
+            deps.scope.namespace,
+            deps.scope.shadowed,
+        )
+    except TypeError:
+        return {}
 
 
 def _dep_out_metas_or_return(
@@ -951,7 +1191,6 @@ def _dep_out_metas_or_return(
     target: ast.expr,
     deps: _DepScan,
     local: dict[str, TensorMeta],
-    scalars: Mapping[str, int | float | bool],
 ) -> _DepReturn:
     """Resolve one ``v1, ..., vk = dep(args)`` target, ``Out`` convention first.
 
@@ -962,7 +1201,7 @@ def _dep_out_metas_or_return(
     out_metas = _dep_out_metas(call, dep_name, target, deps, local)
     if out_metas:
         return _DepReturn(out_metas, frozenset())
-    return _dep_return_metas(call, dep_name, target, deps, local, scalars)
+    return _dep_return_metas(call, dep_name, target, deps, local)
 
 
 def _apply_dep_return(local: dict[str, TensorMeta], dep_return: _DepReturn) -> None:
@@ -1047,8 +1286,54 @@ def _subscript_slice_meta(
     return TensorMeta(shape=tuple(dims), dtype=src_meta.dtype, layout=src_meta.layout)
 
 
+def _call_operand(call: ast.Call, index: int | None, name: str) -> ast.expr | None:
+    """The argument ``call`` binds to parameter ``name``.
+
+    Args:
+        call: The operator call
+        index: The parameter's positional slot, or None when it is keyword-only
+        name: The parameter's keyword name
+
+    Returns:
+        The argument expression, or None when the call does not supply it
+    """
+    if index is not None and len(call.args) > index:
+        return call.args[index]
+    return next((kw.value for kw in call.keywords if kw.arg == name), None)
+
+
+def _tensor_or_input_operand(call: ast.Call) -> ast.expr | None:
+    """The first positional operand of ``pl.slice``/``pl.reshape`` or their
+    ``pl.tensor.*`` siblings — two real spellings, two real parameter names
+    for the same slot (``tensor_ops.py``'s ``tensor`` vs ``unified_ops.py``'s
+    ``input``). A positional call is unaffected either way; only an
+    explicit-keyword one needs both names checked.
+    """
+    operand = _call_operand(call, 0, "tensor")
+    if operand is None:
+        operand = _call_operand(call, 0, "input")
+    return operand
+
+
+def _shape_attr_source(node: ast.expr) -> str | None:
+    """The tensor name ``node`` reads the shape of (``src.shape`` → ``"src"``), or None."""
+    if isinstance(node, ast.Attribute) and node.attr == "shape" and isinstance(node.value, ast.Name):
+        return node.value.id
+    return None
+
+
 def _extract_dim_alias(value: ast.expr | None) -> tuple[str, int] | None:
-    """Return the source and axis for ``pl.tensor.dim(source, axis)``."""
+    """Return the source and axis for ``pl.tensor.dim(source, axis)`` or ``source.shape[axis]``.
+
+    The specializer folds ``source.shape[axis]`` to the same dim ``pl.tensor.dim``
+    names — the static extent, or ``pl.tensor.dim(source, axis)`` when dynamic.
+    """
+    if isinstance(value, ast.Subscript):
+        src = _shape_attr_source(value.value)
+        axis = value.slice
+        if src is not None and isinstance(axis, ast.Constant) and isinstance(axis.value, int):
+            return src, axis.value
+        return None
     if not isinstance(value, ast.Call):
         return None
     fn = value.func
@@ -1068,6 +1353,83 @@ def _extract_dim_alias(value: ast.expr | None) -> tuple[str, int] | None:
     return None
 
 
+def _flatten_dotted_call(fn: ast.expr) -> tuple[str, ...] | None:
+    """Full dotted path of a plain attribute/name chain, e.g. ``pld.tensor.all_to_all_v``
+    -> ``("pld", "tensor", "all_to_all_v")``, or None if ``fn`` isn't a pure chain of
+    ``Attribute`` nodes rooted at a ``Name`` (so this walker cannot reason about it at all —
+    for example the callee of a higher-order call, or an attribute on a subscript)."""
+    segments: list[str] = []
+    node = fn
+    while isinstance(node, ast.Attribute):
+        segments.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    segments.append(node.id)
+    segments.reverse()
+    return tuple(segments)
+
+
+# Qualified (3+-segment) call dispatch: full dotted path -> a handler that
+# computes the result's TensorMeta, or None for an op documented as
+# returning its own rebind target's type unchanged (#2638).
+_QualifiedCallHandlers = dict[tuple[str, ...], Callable[[ast.Call, str | None], TensorMeta | None] | None]
+
+
+def _qualified_call_meta(
+    fn: ast.expr,
+    value: ast.Call,
+    named_target: str | None,
+    qualified_call_handlers: _QualifiedCallHandlers,
+) -> tuple[TensorMeta | None, bool]:
+    """Metadata effect of a qualified call: ``(meta, preserve_existing)``.
+
+    Unlisted paths return ``(None, False)`` — the caller then falls through to
+    ``local.pop()``, exactly like any other unrecognized call.
+    """
+    path = _flatten_dotted_call(fn)
+    if path is None or path not in qualified_call_handlers:
+        return None, False
+    handler = qualified_call_handlers[path]
+    if handler is not None:
+        return handler(value, named_target), False
+    return None, True
+
+
+def _same_operand_meta(
+    local: dict[str, TensorMeta], operand_index: int, operand_name: str
+) -> Callable[[ast.Call, str | None], TensorMeta | None]:
+    """Handler factory for a collective documented as returning a specific
+    argument's own type unchanged (e.g. ``broadcast``'s ``target``,
+    ``barrier``'s ``signal``). Reads that argument's tracked metadata
+    directly rather than assuming the call's LHS name is the same name as
+    the operand: ``old = pld.tensor.broadcast(window, signal, root=0)`` must
+    get ``window``'s metadata, not whatever ``old`` already held — a blind
+    ``preserve_existing`` would silently serve stale metadata when the two
+    names differ (#2638 review). When the two names *are* the same (the
+    documented self-rebind idiom), this reads ``local[operand.id]`` before
+    the assignment takes effect, which is exactly what preserving would
+    have returned anyway — so the self-rebind case is unaffected.
+    """
+
+    def handler(call: ast.Call, target: str | None = None) -> TensorMeta | None:
+        operand = _call_operand(call, operand_index, operand_name)
+        if not isinstance(operand, ast.Name) or operand.id not in local:
+            return None
+        return local[operand.id]
+
+    return handler
+
+
+def _alias_dim(alias: tuple[str, int] | None, local: Mapping[str, TensorMeta]) -> ShapeDim | None:
+    """Dim ``k`` of tensor ``P`` for a ``(P, k)`` dim alias, or None when ``P`` is untracked."""
+    if alias is None:
+        return None
+    src, axis = alias
+    src_meta = local.get(src)
+    return src_meta.shape[axis] if src_meta is not None and axis < len(src_meta.shape) else None
+
+
 def _assignment_parts(stmt: ast.stmt) -> tuple[list[ast.expr], ast.expr | None] | None:
     """Return all targets and the value for a supported assignment."""
     if isinstance(stmt, ast.Assign):
@@ -1077,22 +1439,34 @@ def _assignment_parts(stmt: ast.stmt) -> tuple[list[ast.expr], ast.expr | None] 
     return None
 
 
-def _stmt_calls_dep(stmt: ast.stmt, dep_name: str | None) -> bool:
-    """Check expression fields on ``stmt`` without searching nested bodies."""
-    if dep_name is None:
+def _stmt_calls_dep(stmt: ast.stmt, dep_name: str | None, stop_at_call: ast.Call | None = None) -> bool:
+    """Check expression fields on ``stmt`` without searching nested bodies.
+
+    ``stop_at_call`` narrows the match from "any call to ``dep_name``" to one
+    specific call node. A dep reached with two different ``pl.constexpr``
+    bindings is compiled once per binding, and each of those compilations must
+    read the metadata live at *its own* call site — stopping at the first call
+    to the name would hand every later binding the first site's tensors.
+    """
+    if stop_at_call is None and dep_name is None:
         return False
+
+    def matches(node: ast.AST) -> bool:
+        if stop_at_call is not None:
+            return node is stop_at_call
+        return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == dep_name
+
+    # Nested bodies are skipped here and walked by the caller one statement at a
+    # time, so the metadata a scope defines before the call is still collected.
     nested_stmt_fields = {"body", "orelse", "finalbody", "handlers"}
     for field, value in ast.iter_fields(stmt):
         if field in nested_stmt_fields:
             continue
-        items = value if isinstance(value, list) else [value]
+        items = cast("list[Any]", value) if isinstance(value, list) else [value]
         for item in items:
             if not isinstance(item, ast.AST):
                 continue
-            if any(
-                isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == dep_name
-                for node in ast.walk(item)
-            ):
+            if any(matches(node) for node in ast.walk(item)):
                 return True
     return False
 
@@ -1100,15 +1474,16 @@ def _stmt_calls_dep(stmt: ast.stmt, dep_name: str | None) -> bool:
 def _update_local_tensor_meta(
     stmt: ast.stmt,
     local: dict[str, TensorMeta],
-    dim_aliases: dict[str, tuple[str, int]],
+    dim_values: dict[str, ShapeDim],
     deps: _DepScan,
     resolve_int: Callable[[ast.expr], int | None],
     pl_attr_handlers: dict[str, Callable[[ast.Call, str | None], TensorMeta | None]],
-    scalars: Mapping[str, int | float | bool],
+    qualified_call_handlers: _QualifiedCallHandlers,
 ) -> None:
     """Apply one assignment's metadata effects to the source-ordered state."""
     parts = _assignment_parts(stmt)
     if parts is None:
+        _forget_rebound_dims(stmt, dim_values)
         return
     targets, value = parts
     named_target = next((t.id for t in targets if isinstance(t, ast.Name)), None)
@@ -1137,12 +1512,15 @@ def _update_local_tensor_meta(
                 # result metadata this extractor does not model (for example,
                 # same-shaped pl.assemble rebindings).
                 preserve_existing = True
+        elif isinstance(fn, ast.Attribute) and has_named_target:
+            # A qualified (3+-segment) spelling, e.g. pld.tensor.all_to_all_v(...)
+            # or pl.tensor.slice(...) — invisible to the one-level branch above
+            # since fn.value is itself an Attribute, not a Name (#2638).
+            meta, preserve_existing = _qualified_call_meta(fn, value, named_target, qualified_call_handlers)
         elif isinstance(fn, ast.Name) and fn.id in deps.io:
             # The in-place ``Out``-param convention first; a callee that
             # allocates its own results falls through to its return statement.
-            dep_returns = [
-                _dep_out_metas_or_return(value, fn.id, target, deps, local, scalars) for target in targets
-            ]
+            dep_returns = [_dep_out_metas_or_return(value, fn.id, target, deps, local) for target in targets]
             # Preserve the existing dependency-result behavior when neither
             # rule resolves the callee's results: an already-known target keeps
             # its metadata until a later supported rebinding can refine it.
@@ -1151,7 +1529,7 @@ def _update_local_tensor_meta(
             # ``_dep_return_metas``.
             preserve_existing = True
 
-    alias = _extract_dim_alias(value)
+    _update_dim_values(targets, value, dim_values, local)
     for target, dep_return in zip(targets, dep_returns, strict=True):
         _apply_dep_return(local, dep_return)
         named = target if isinstance(target, ast.Name) else None
@@ -1165,60 +1543,211 @@ def _update_local_tensor_meta(
             # rather than leaving stale metadata visible.
             local.pop(named.id, None)
 
-        if value is not None:
-            if alias is None:
-                dim_aliases.pop(named.id, None)
+
+def _update_dim_values(
+    targets: list[ast.expr],
+    value: ast.expr | None,
+    dim_values: dict[str, ShapeDim],
+    local: Mapping[str, TensorMeta],
+) -> None:
+    """Apply one assignment's effect on the names bound to a tensor dim.
+
+    ``d = pl.tensor.dim(src, k)`` and ``d = src.shape[k]`` bind ``d`` to dim
+    ``k`` of ``src``; ``M, N = src.shape`` binds each name to its position. The
+    dim is read from ``local`` as it stands before the assignment, so a later
+    rebinding of ``src`` cannot change what ``d`` already holds. Any other
+    assignment rebinds its names, which drops the dims they held. A starred
+    unpack shifts the positions, so it binds none.
+    """
+    if value is None:
+        return
+    dim = _alias_dim(_extract_dim_alias(value), local)
+    unpack_src = _shape_attr_source(value)
+    unpack_meta = None if unpack_src is None else local.get(unpack_src)
+    for target in targets:
+        if isinstance(target, ast.Name):
+            if dim is None:
+                dim_values.pop(target.id, None)
             else:
-                dim_aliases[named.id] = alias
+                dim_values[target.id] = dim
+            continue
+        if not isinstance(target, (ast.Tuple, ast.List)):
+            continue
+        starred = any(isinstance(elt, ast.Starred) for elt in target.elts)
+        for axis, elt in enumerate(target.elts):
+            if (
+                unpack_meta is not None
+                and not starred
+                and isinstance(elt, ast.Name)
+                and axis < len(unpack_meta.shape)
+            ):
+                dim_values[elt.id] = unpack_meta.shape[axis]
+                continue
+            _forget_names(elt, dim_values)
+
+
+def _forget_rebound_dims(stmt: ast.stmt, dim_values: dict[str, ShapeDim]) -> None:
+    """A ``for`` or ``with ... as`` target rebinds its names, so the dims they held are gone."""
+    if isinstance(stmt, ast.For):
+        _forget_names(stmt.target, dim_values)
+    elif isinstance(stmt, ast.With):
+        for item in stmt.items:
+            if item.optional_vars is not None:
+                _forget_names(item.optional_vars, dim_values)
+
+
+def _forget_names(target: ast.expr, dim_values: dict[str, ShapeDim]) -> None:
+    for node in ast.walk(target):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            dim_values.pop(node.id, None)
 
 
 def _walk_local_tensor_meta_stmts(
     stmts: list[ast.stmt],
     stop_at_dep: str | None,
     local: dict[str, TensorMeta],
-    dim_aliases: dict[str, tuple[str, int]],
+    dim_values: dict[str, ShapeDim],
     deps: _DepScan,
     resolve_int: Callable[[ast.expr], int | None],
     pl_attr_handlers: dict[str, Callable[[ast.Call, str | None], TensorMeta | None]],
-    scalars: Mapping[str, int | float | bool],
+    qualified_call_handlers: _QualifiedCallHandlers,
+    stop_at_call: ast.Call | None = None,
 ) -> bool:
     """Walk supported DSL scopes in source order until the selected call."""
     for stmt in stmts:
-        if _stmt_calls_dep(stmt, stop_at_dep):
+        if _stmt_calls_dep(stmt, stop_at_dep, stop_at_call):
             return True
-        _update_local_tensor_meta(stmt, local, dim_aliases, deps, resolve_int, pl_attr_handlers, scalars)
+        _update_local_tensor_meta(
+            stmt, local, dim_values, deps, resolve_int, pl_attr_handlers, qualified_call_handlers
+        )
         for attr in ("body", "orelse", "finalbody"):
             nested = getattr(stmt, attr, None)
             if isinstance(nested, list) and _walk_local_tensor_meta_stmts(
-                nested,
+                cast("list[ast.stmt]", nested),
                 stop_at_dep,
                 local,
-                dim_aliases,
+                dim_values,
                 deps,
                 resolve_int,
                 pl_attr_handlers,
-                scalars,
+                qualified_call_handlers,
+                stop_at_call,
             ):
                 return True
     return False
 
 
+@dataclass(frozen=True)
+class _StaticScope:
+    """Resolves an operand to the compile-time value it names in a function.
+
+    Resolution mirrors the specializer's folding: the same namespace, the same
+    shadowing, the same ``pl.constexpr`` binding. It may accept a spelling the
+    generated program then rejects (``Cfg.DT`` on a module-level class); the
+    parser reports that one by name, which is still clearer than a dropped meta.
+
+    Attributes:
+        namespace: The function's globals plus closure cells
+        shadowed: Its parameters and assignment targets, which hide a same-named
+            global here exactly as they do in the specializer's free-name folding
+        constexpr: Its ``pl.constexpr`` binding, each value parsed back to an
+            expression
+    """
+
+    namespace: Mapping[str, Any]
+    shadowed: frozenset[str]
+    constexpr: Mapping[str, ast.expr]
+
+    @classmethod
+    def of(cls, func: Any, constexpr_values: Mapping[str, str] | None) -> _StaticScope:
+        """The scope of ``func``, under its ``pl.constexpr`` binding (name → folded source text)."""
+        return cls(
+            namespace=func_name_lookup(func),
+            shadowed=frozenset(_body_local_names(func)),
+            constexpr={
+                name: ast.parse(text, mode="eval").body for name, text in (constexpr_values or {}).items()
+            },
+        )
+
+    def fold(self, node: ast.expr | None) -> ast.expr | None:
+        """The folded value's expression for a ``pl.constexpr`` parameter, else ``node``."""
+        if isinstance(node, ast.Name) and node.id in self.constexpr:
+            return self.constexpr[node.id]
+        return node
+
+    def value(self, node: ast.expr) -> Any:
+        """The value a constant name or attribute chain is bound to, else None.
+
+        Covers a module-level or closure constant and an attribute chain rooted
+        at a module or class (``pl.FP32``, ``pl.TensorLayout.NZ``). Attributes
+        are read only off modules and classes, so resolving an operand never
+        runs an instance property.
+        """
+        if isinstance(node, ast.Name):
+            return None if node.id in self.shadowed else self.namespace.get(node.id)
+        if isinstance(node, ast.Attribute):
+            base = self.value(node.value)
+            if isinstance(base, (types.ModuleType, type)):
+                return getattr(base, node.attr, None)
+        return None
+
+    def int_shape(self, node: ast.expr) -> tuple[int, ...] | None:
+        """A shape constant: a name bound to a list or tuple of ints."""
+        value = self.value(node) if isinstance(node, ast.Name) else None
+        if not isinstance(value, (list, tuple)):
+            return None
+        seq = cast("Sequence[Any]", value)
+        return tuple(seq) if all(isinstance(d, int) and not isinstance(d, bool) for d in seq) else None
+
+
+def _drop_dims_is_noop(drop_dims_node: ast.expr | None, scope: _StaticScope) -> bool:
+    """True when ``drop_dims`` is a no-op: omitted, ``None``, an empty
+    list/tuple literal, or a ``Name`` bound to one of those. ``scope.fold()``
+    resolves a ``pl.constexpr`` parameter binding first (its own, narrower
+    mechanism — a name outside ``constexpr`` passes through unchanged); what
+    remains is then resolved as a module-level or closure constant
+    (e.g. ``EMPTY = []`` or ``NONE_DIMS = None``) if it's still a ``Name`` —
+    read directly off ``scope.namespace``/``scope.shadowed`` rather than
+    through ``scope.value()``, whose bare ``None`` return is ambiguous
+    between "genuinely bound to None" and "a local parameter, unresolvable
+    here" (e.g. ``def body(src, drop_dims): ... drop_dims=drop_dims``) — the
+    latter must never be assumed empty, or a real non-empty runtime value
+    would advertise the wrong, pre-drop rank.
+    """
+    node = scope.fold(drop_dims_node)
+    if isinstance(node, ast.Name):
+        if node.id in scope.shadowed or node.id not in scope.namespace:
+            return False
+        resolved = scope.namespace[node.id]
+        return resolved is None or (isinstance(resolved, (list, tuple)) and not resolved)
+    return (
+        node is None
+        or (isinstance(node, ast.Constant) and node.value is None)
+        or (isinstance(node, (ast.List, ast.Tuple)) and len(node.elts) == 0)
+    )
+
+
 def _extract_local_tensor_metas(
     func: Any,
     seed_meta: dict[str, TensorMeta] | None = None,
-    seed_scalars: dict[str, int | float | bool] | None = None,
     caller_func_type: str = "orchestration",
     stop_at_dep: str | None = None,
     dep_seen: frozenset[int] = frozenset(),
+    stop_at_call: ast.Call | None = None,
+    constexpr_values: Mapping[str, str] | None = None,
 ) -> dict[str, TensorMeta]:
     """Infer ``TensorMeta`` for the local tensor variables in ``func``'s body.
 
     Walks the body in source order, tracking the three ways a local tensor can
     be produced inside a JIT function:
 
-    1. ``var = pl.create_tensor([shape], dtype=pl.XXX)`` — shape from the
-       literal list (literal ints, ``Name`` refs to int globals / seeded
-       scalars, and simple int arithmetic over those), dtype from ``dtype=``.
+    1. ``var = pl.create_tensor([shape], dtype=pl.XXX)`` — each operand by
+       position or keyword. Shape from a list or tuple literal (literal ints,
+       ``Name`` refs to int globals, ``M`` from ``M, N = src.shape`` /
+       ``src.shape[k]``, and simple int arithmetic over those), or whole from
+       ``src.shape`` or a module-level shape constant. Dtype from ``pl.XXX``, a
+       module-level or closure constant bound to one, or ``src.dtype``; a
+       non-ND ``layout`` the same way.
        A shape element that resolves through a dynamic alias — either
        ``tokens = pl.tensor.dim(P, k)`` for a seeded param ``P`` whose dim
        ``k`` is ``DynDim``-bound, or a direct reference to a DynVar
@@ -1251,9 +1780,13 @@ def _extract_local_tensor_metas(
     ``seed_meta`` pre-populates the table with the caller's parameter metas
     (including any ``DynDim`` entries those carry) so a ``pl.slice`` of a
     parameter, a dep call passing a parameter through, or a local
-    ``pl.create_tensor`` sized off a dynamic dim of a parameter all resolve;
-    ``seed_scalars`` lets compile-time-specialized scalar parameters appear
-    as shape dimensions.
+    ``pl.create_tensor`` sized off a dynamic dim of a parameter all resolve.
+
+    A *scalar parameter* is a runtime value and therefore never resolves a
+    shape dim statically; a dim sized off one becomes a synthesized ``DynDim``
+    like any other runtime extent. Size a local off a module-level or closure
+    constant, a ``pl.constexpr`` parameter, or a static dim of another tensor
+    when the shape has to be static.
 
     A ``pl.create_tensor`` / ``pld.window`` dim that no static rule resolves —
     a runtime extent such as ``pld.world_size()``, ``pl.tensor.read(cfg, [0])``,
@@ -1264,14 +1797,19 @@ def _extract_local_tensor_metas(
     When ``stop_at_dep`` is provided, extraction stops
     immediately before the first source-ordered call to that dependency. This
     produces the point-in-time metadata visible to that call and ignores later
-    rebindings.
+    rebindings. ``stop_at_call`` selects one specific call node instead, which
+    is what a dep reached with several ``pl.constexpr`` bindings needs: each
+    binding is a separate compilation and must see the tensors live at its own
+    call site, not at the first call to the same name.
+
+    ``constexpr_values`` is ``func``'s own ``pl.constexpr`` binding (parameter
+    name → folded source text). A shape or dtype operand naming one resolves to
+    that value, as the specializer folds it, instead of to a runtime extent.
     """
     func_def = _get_func_def(func)
     local: dict[str, TensorMeta] = dict(seed_meta or {})
-    dtype_map = _get_pl_dtype_map()
-    func_globals = func_name_lookup(func)
-    scalars: dict[str, int | float | bool] = seed_scalars or {}
-    dim_aliases: dict[str, tuple[str, int]] = {}
+    scope = _StaticScope.of(func, constexpr_values)
+    dim_values: dict[str, ShapeDim] = {}
     dynvar_anchors = _build_dynvar_anchor_index(seed_meta or {})
 
     def _resolve_shape_elt(elt: ast.expr) -> ShapeDim | None:
@@ -1280,25 +1818,28 @@ def _extract_local_tensor_metas(
         Dynamic resolution paths (added on top of the original static integer
         resolver):
 
-        - ``Name`` that's a dim-alias for ``(P, k)`` where ``P`` is a seeded
-          param with a ``DynDim`` at dim ``k`` → returns that DynDim.
+        - ``Name`` bound to dim ``k`` of ``P`` (``pl.tensor.dim(P, k)``,
+          ``P.shape[k]``, or ``M, N = P.shape``) → that dim as it was when the
+          name was bound, a ``DynDim`` flowing through as-is.
         - ``Name`` that's a DynVar declared on a seeded param → returns the
           DynDim of the (first) anchor site.
+        - ``P.shape[k]`` / ``pl.tensor.dim(P, k)`` written inline → dim ``k``
+          of ``P``, the same as through a named alias.
 
         Falls back to integer resolution for literal ints, int globals,
-        seeded scalars, and arithmetic over those (the same combinations the
-        original ``_resolve_int`` covered).
+        ``pl.constexpr`` parameters, and arithmetic over those.
         """
         if isinstance(elt, ast.Constant) and isinstance(elt.value, int):
             return elt.value
+        if isinstance(elt, (ast.Subscript, ast.Call)):
+            return _alias_dim(_extract_dim_alias(elt), local)
         if isinstance(elt, ast.Name):
-            # Dim alias: tokens = pl.tensor.dim(P, k)
-            alias = dim_aliases.get(elt.id)
-            if alias is not None:
-                p, k = alias
-                src_meta = local.get(p)
-                if src_meta is not None and k < len(src_meta.shape):
-                    return src_meta.shape[k]
+            if elt.id in scope.constexpr:
+                return _resolve_shape_elt(scope.constexpr[elt.id])
+            # A name bound to a dim: pl.tensor.dim(P, k) / P.shape[k] / k-th of P.shape
+            dim = dim_values.get(elt.id)
+            if dim is not None:
+                return dim
             # Direct DynVar reference (e.g. M used as a shape entry).
             anchors = dynvar_anchors.get(elt.id)
             if anchors:
@@ -1308,8 +1849,8 @@ def _extract_local_tensor_metas(
                     d = src_meta.shape[k]
                     if isinstance(d, DynDim):
                         return d
-            # Static int via globals or seeded scalars.
-            value = func_globals.get(elt.id, scalars.get(elt.id))
+            # Static int via globals (module-level or closure constants).
+            value = scope.value(elt)
             if isinstance(value, int) and not isinstance(value, bool):
                 return value
             return None
@@ -1339,15 +1880,36 @@ def _extract_local_tensor_metas(
         v = _resolve_shape_elt(elt)
         return v if isinstance(v, int) else None
 
+    def _resolve_whole_shape(node: ast.expr | None) -> tuple[ShapeDim, ...] | None:
+        """Resolve a shape operand that names a whole shape instead of listing it.
+
+        Covers ``src.shape`` of a tracked tensor and a module-level or closure
+        constant holding a list or tuple of ints — both of which the specializer
+        folds into a literal shape in the generated source.
+        """
+        if node is None:
+            return None
+        src = _shape_attr_source(node)
+        if src is not None:
+            return local[src].shape if src in local else None
+        return scope.int_shape(node)
+
     def _resolve_shape(node: ast.expr | None, dyn_base: str | None = None) -> tuple[ShapeDim, ...] | None:
-        """Resolve a shape literal, optionally synthesizing runtime-only dims.
+        """Resolve a shape operand, optionally synthesizing runtime-only dims.
+
+        A list or tuple literal resolves element by element; ``src.shape`` or a
+        shape constant resolves whole (see :func:`_resolve_whole_shape`).
 
         ``dyn_base`` is the name of the local being assigned. When given, a dim
         that no static rule resolves becomes a synthesized ``DynDim`` instead of
         failing the whole shape (see :func:`_synthesized_dyn_dim`). Callers that
         pass ``None`` keep the strict all-or-nothing behaviour.
         """
-        if not isinstance(node, ast.List):
+        node = scope.fold(node)
+        whole = _resolve_whole_shape(node)
+        if whole is not None:
+            return whole
+        if not isinstance(node, (ast.List, ast.Tuple)):
             return None
         dims: list[ShapeDim] = []
         for i, elt in enumerate(node.elts):
@@ -1359,53 +1921,65 @@ def _extract_local_tensor_metas(
             dims.append(v)
         return tuple(dims)
 
-    def _dtype_from_kw(call: ast.Call) -> DataType | None:
-        for kw in call.keywords:
-            if (
-                kw.arg == "dtype"
-                and isinstance(kw.value, ast.Attribute)
-                and isinstance(kw.value.value, ast.Name)
-            ):
-                return dtype_map.get(kw.value.attr)
-        return None
+    def _resolve_dtype(node: ast.expr | None) -> DataType | None:
+        """Resolve a ``dtype`` operand to the ``DataType`` it evaluates to.
+
+        Resolves by value, not by spelling, so the inferred meta agrees with
+        what the specializer folds into the generated source: ``WDT`` bound to
+        ``pl.FP32`` at module or closure scope is ``FP32`` exactly as the
+        literal ``pl.FP32`` is, a ``pl.constexpr`` parameter is its folded
+        value, and ``src.dtype`` is the dtype of the tensor ``src`` holds at
+        this point of the walk.
+        """
+        node = scope.fold(node)
+        if node is None:
+            return None
+        if isinstance(node, ast.Attribute) and node.attr == "dtype" and isinstance(node.value, ast.Name):
+            src_meta = local.get(node.value.id)
+            if src_meta is not None:
+                return src_meta.dtype
+        value = scope.value(node)
+        return value if isinstance(value, DataType) else None
 
     def _create_tensor_meta(call: ast.Call, target: str | None = None) -> TensorMeta | None:
+        # pl.create_tensor(shape, dtype, layout, ...) — each by position or keyword.
         # A runtime-sized extent (``pl.create_tensor([n, 128], ...)`` where ``n``
         # is read from a tensor) synthesizes a dynamic dim rather than dropping
         # the meta -- the allocation itself is runtime-sized either way.
-        shape = _resolve_shape(call.args[0], target) if call.args else None
-        dtype_val = _dtype_from_kw(call)
-        if shape is None or dtype_val is None:
+        shape = _resolve_shape(_call_operand(call, 0, "shape"), target)
+        dtype_val = _resolve_dtype(_call_operand(call, 1, "dtype"))
+        # An omitted layout is ND. One that does not resolve declines the meta:
+        # claiming ND for it would silently mis-declare every dep it reaches.
+        layout_node = scope.fold(_call_operand(call, 2, "layout"))
+        layout = _ir.TensorLayout.ND if layout_node is None else scope.value(layout_node)
+        if shape is None or dtype_val is None or not isinstance(layout, _ir.TensorLayout):
             return None
-        return TensorMeta(shape=shape, dtype=dtype_val)
+        # ND is recorded as no layout — what an omitted annotation slot means.
+        return TensorMeta(
+            shape=shape, dtype=dtype_val, layout=None if layout == _ir.TensorLayout.ND else layout
+        )
 
     def _window_meta(call: ast.Call, target: str | None = None) -> TensorMeta | None:
-        # pld.window(buffer, [shape], dtype=pl.XXX) — a distributed window view
-        # over a window buffer. Shape is the 2nd positional arg; dtype is the
-        # ``dtype=`` keyword (same spelling as create_tensor). Lets a host
-        # orchestrator's per-rank window locals propagate their meta into the
-        # ``pld.DistributedTensor`` parameters of the chip orchestrator it calls.
-        # A runtime-sized dim (``[pld.world_size(), 1]``) synthesizes a dynamic
-        # dim, the same way create_tensor does.
-        shape = _resolve_shape(call.args[1], target) if len(call.args) >= 2 else None
-        dtype_val = _dtype_from_kw(call)
+        # pld.window(buffer, shape, *, dtype) — a distributed window view over a
+        # window buffer. Lets a host orchestrator's per-rank window locals
+        # propagate their meta into the ``pld.DistributedTensor`` parameters of
+        # the chip orchestrator it calls. A runtime-sized dim
+        # (``[pld.world_size(), 1]``) synthesizes a dynamic dim, the same way
+        # create_tensor does.
+        shape = _resolve_shape(_call_operand(call, 1, "shape"), target)
+        dtype_val = _resolve_dtype(_call_operand(call, None, "dtype"))
         if shape is None or dtype_val is None:
             return None
         return TensorMeta(shape=shape, dtype=dtype_val)
 
     def _reshape_meta(call: ast.Call, target: str | None = None) -> TensorMeta | None:
-        # pl.reshape(input, shape) — dtype inherited from source tensor.
-        src = (
-            call.args[0] if call.args else next((kw.value for kw in call.keywords if kw.arg == "input"), None)
-        )
+        # pl.reshape(input, shape) / pl.tensor.reshape(tensor, shape) — dtype
+        # inherited from source tensor.
+        src = _tensor_or_input_operand(call)
         if not isinstance(src, ast.Name) or src.id not in local:
             return None
         src_meta = local[src.id]
-        shape_node = (
-            call.args[1]
-            if len(call.args) >= 2
-            else next((kw.value for kw in call.keywords if kw.arg == "shape"), None)
-        )
+        shape_node = _call_operand(call, 1, "shape")
         if shape_node is None:
             return None
         # Strict on purpose (no ``target``): a reshape's dims are constrained by
@@ -1424,17 +1998,28 @@ def _extract_local_tensor_metas(
         return TensorMeta(shape=shape, dtype=src_meta.dtype)
 
     def _slice_meta(call: ast.Call, target: str | None = None) -> TensorMeta | None:
-        # pl.slice(tensor, shape, offset, ...) — shape is positional index 1 or kw `shape=`.
-        src = call.args[0] if call.args else None
+        # pl.slice(input, shape, offset, ...) / pl.tensor.slice(tensor, shape,
+        # offset, ...) — shape/offset/drop_dims/etc. share the same names in
+        # both real spellings; only the first param's name differs.
+        #
+        # drop_dims rank-reduces the result; this handler doesn't model that,
+        # so decline rather than advertise the pre-drop shape at the wrong
+        # rank — UNLESS drop_dims is a no-op (see _drop_dims_is_noop).
+        # Pre-existing gap for the 2-segment spelling too, not introduced by
+        # qualified dispatch — just newly reachable through it.
+        if not _drop_dims_is_noop(_call_operand(call, 4, "drop_dims"), scope):
+            return None
+        src = _tensor_or_input_operand(call)
         if not isinstance(src, ast.Name) or src.id not in local:
             return None
         src_meta = local[src.id]
-        shape_node = (
-            call.args[1]
-            if len(call.args) >= 2
-            else next((kw.value for kw in call.keywords if kw.arg == "shape"), None)
-        )
-        if not isinstance(shape_node, ast.List) or len(shape_node.elts) != len(src_meta.shape):
+        shape_node = scope.fold(_call_operand(call, 1, "shape"))
+        whole = _resolve_whole_shape(shape_node)
+        if whole is not None:
+            if len(whole) != len(src_meta.shape):
+                return None
+            return TensorMeta(shape=whole, dtype=src_meta.dtype, layout=src_meta.layout)
+        if not isinstance(shape_node, (ast.List, ast.Tuple)) or len(shape_node.elts) != len(src_meta.shape):
             return None
         dims: list[ShapeDim] = []
         for elt, parent_dim in zip(shape_node.elts, src_meta.shape, strict=True):
@@ -1451,6 +2036,8 @@ def _extract_local_tensor_metas(
         io=_scan_dep_io(func, caller_func_type),
         funcs={b.call_name: b.dep for b in _discover_dep_bindings(func, caller_func_type)},
         seen=dep_seen | {id(func)},
+        constexpr=dict(constexpr_values or {}),
+        scope=scope,
     )
 
     # Dispatch table: pl.<attr>(...) → meta extraction function.
@@ -1462,15 +2049,46 @@ def _extract_local_tensor_metas(
         "reshape": _reshape_meta,
     }
 
+    # 3-segment spellings this walker also understands, keyed by the FULL
+    # dotted path so a match can never collide across namespaces the way
+    # attr-name-only dispatch could. The pl.tensor.* / pld.tensor.window
+    # entries are DERIVED from _pl_attr_handlers above rather than
+    # hand-duplicated, so a new entry added there is automatically covered
+    # under its 3-segment spelling too — the two tables can't drift apart
+    # for that half. The managed collectives have no 2-segment sugar to
+    # derive from (3-segment-only), so they're listed explicitly, each with
+    # _same_operand_meta reading the real operand its own docstring names as
+    # the rebind target — not a bare `preserve_existing`, which would trust
+    # the LHS name instead of the operand when the two differ (review
+    # finding: `old = pld.tensor.broadcast(window, ...)` must get `window`'s
+    # metadata, not `old`'s stale one). None stays available in the type for
+    # a future op with no derivable operand at all; nothing currently uses
+    # it. Anything NOT listed here safely falls through to local.pop(),
+    # exactly like today's behavior for any other unrecognized call: a new
+    # op starts safe by default and must be added here deliberately, never
+    # silently assumed same-shape (#2638).
+    _qualified_call_handlers: _QualifiedCallHandlers = {
+        **{("pl", "tensor", attr): handler for attr, handler in _pl_attr_handlers.items()},
+        ("pld", "tensor", "window"): _pl_attr_handlers["window"],
+        ("pld", "tensor", "all_to_all_v"): _same_operand_meta(local, 1, "target"),
+        ("pld", "tensor", "all_to_all"): _same_operand_meta(local, 1, "target"),
+        ("pld", "tensor", "allreduce"): _same_operand_meta(local, 0, "target"),
+        ("pld", "tensor", "reduce_scatter"): _same_operand_meta(local, 0, "target"),
+        ("pld", "tensor", "broadcast"): _same_operand_meta(local, 0, "target"),
+        ("pld", "tensor", "allgather"): _same_operand_meta(local, 1, "target"),
+        ("pld", "tensor", "barrier"): _same_operand_meta(local, 0, "signal"),
+    }
+
     _walk_local_tensor_meta_stmts(
         func_def.body,
         stop_at_dep,
         local,
-        dim_aliases,
+        dim_values,
         deps,
         _resolve_int,
         _pl_attr_handlers,
-        scalars,
+        _qualified_call_handlers,
+        stop_at_call,
     )
     return local
 
@@ -1492,8 +2110,10 @@ class _Specialization(NamedTuple):
     param_names: list[str]
     arguments: dict[str, Any]
     tensor_meta: dict[str, TensorMeta]
-    scalar_values: dict[str, int | float | bool]
     scalar_dtypes: dict[str, DataType]
+    # Constexpr parameter name -> the generated-source text its value folds to.
+    # Absent from ``arguments``: nothing is dispatched for a constexpr parameter.
+    constexpr_values: dict[str, str]
     per_func_dyn: dict[int, dict[str, dict[int, DynDim]]]
 
 
@@ -1547,6 +2167,300 @@ def _extract_call_args_for_dep(
     return _call_arg_refs(min(calls, key=lambda call: (call.lineno, call.col_offset)))
 
 
+def _dep_call_nodes(caller_func: Any, dep_call_name: str) -> list[ast.Call]:
+    """Every call to ``dep_call_name`` in ``caller_func``'s body, in source order."""
+    func_def = _get_func_def(caller_func)
+    calls = [
+        node
+        for node in ast.walk(func_def)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == dep_call_name
+    ]
+    return sorted(calls, key=lambda call: (call.lineno, call.col_offset))
+
+
+def _fold_call_site_constant(
+    arg: ast.expr,
+    caller_constexpr: Mapping[str, str],
+    caller_globals: Mapping[str, Any],
+    caller_locals: frozenset[str],
+) -> str | None:
+    """Source text a dep's constexpr argument folds to, or None when it does not.
+
+    A bare name is either one of the caller's own constexpr parameters, which
+    forwards, or a module-level/closure constant. Anything else is evaluated in
+    the caller's namespace and rendered by the same writer the entry path uses,
+    so every documented value form reaches a dep the same way it reaches an
+    entry: ``helper(x, -1)``, ``helper(x, [16, 32])``, ``helper(x, pl.FP32)``,
+    ``helper(x, pl.Mem.Vec)``.
+
+    ``caller_locals`` are the caller's parameters and assignment targets. A
+    local shadows a same-named global, so it is removed from the namespace
+    before anything is resolved: without that, a caller with a runtime scalar
+    ``n`` and an unrelated module-level ``n = 16`` binds the dep's compile-time
+    parameter to 16 instead of rejecting the runtime value, and the dep is
+    compiled against a constant the caller never passed.
+
+    Returns None when there is no compile-time value — a runtime scalar, a
+    tensor, an expression over either — so the caller can report it against the
+    parameter it was bound to.
+    """
+    from .specializer import constant_source  # noqa: PLC0415
+
+    if isinstance(arg, ast.Name):
+        forwarded = caller_constexpr.get(arg.id)
+        if forwarded is not None:
+            return forwarded
+        if arg.id in caller_locals:
+            return None
+        return free_name_source(arg.id, caller_globals)
+    # Trusted input: the caller's own source, evaluated in its own globals with
+    # builtins stripped and its locals removed, so only constant construction
+    # can run and any run-time name is absent and raises — the rejection we
+    # want. Forwarded constexpr parameters are re-bound because they *do* have a
+    # compile-time value, unlike the runtime locals they sit beside.
+    namespace = {k: v for k, v in caller_globals.items() if k not in caller_locals}
+    namespace["__builtins__"] = {}
+    for forwarded_name, text in caller_constexpr.items():
+        try:
+            namespace[forwarded_name] = ast.literal_eval(text)
+        except (ValueError, SyntaxError):
+            continue
+    try:
+        value = eval(ast.unparse(arg), namespace)  # noqa: S307
+    except Exception:  # noqa: BLE001 - any failure means "no compile-time value"
+        return None
+    return constant_source(value)
+
+
+def _resolve_call_site_constexpr(
+    dep_name: str,
+    signature: tuple[list[str], list[str]],
+    call: ast.Call,
+    caller_name: str,
+    caller_binding: Mapping[str, str],
+    caller_globals: Mapping[str, Any],
+    caller_locals: frozenset[str],
+) -> dict[str, str]:
+    """Resolve one call site's ``pl.constexpr`` arguments into folded source text.
+
+    Args:
+        dep_name: The dependency's name, for diagnostics
+        signature: ``(constexpr parameter names, all parameter names)`` for the
+            dependency. Passed in rather than re-derived because the caller
+            resolves every call site of a dep and both lists cost a full
+            ``inspect.signature`` with annotation resolution.
+        call: The call node whose arguments to bind
+        caller_name: The calling function's name, for diagnostics
+        caller_binding: The caller's own resolved constexpr values, so a
+            forwarded parameter (``helper(x, BLOCK)``) carries through
+        caller_globals: The caller's global/closure namespace
+        caller_locals: The caller's parameters and assignment targets, which
+            shadow same-named globals
+
+    Returns:
+        Folded source text per constexpr parameter name
+
+    Raises:
+        TypeError: if a constexpr parameter is unbound at this call site or is
+            bound to something with no compile-time value.
+    """
+    constexpr_names, dep_param_names = signature
+    bound: dict[str, ast.expr] = {}
+    for index, arg in enumerate(call.args):
+        if index < len(dep_param_names):
+            bound[dep_param_names[index]] = arg
+    for keyword in call.keywords:
+        if keyword.arg is not None:
+            bound[keyword.arg] = keyword.value
+
+    resolved: dict[str, str] = {}
+    for name in constexpr_names:
+        arg = bound.get(name)
+        if arg is None:
+            raise TypeError(
+                f"@pl.jit function '{dep_name}': constexpr parameter '{name}' is not "
+                f"bound at the call site in '{caller_name}'. A 'pl.constexpr' parameter is "
+                f"resolved at compile time, so every call must pass it — a signature "
+                f"default is not read for a dep call."
+            )
+        folded = _fold_call_site_constant(arg, caller_binding, caller_globals, caller_locals)
+        if folded is None:
+            raise TypeError(
+                f"@pl.jit function '{dep_name}': constexpr parameter '{name}' is bound "
+                f"to '{ast.unparse(arg)}' at the call site in '{caller_name}', which has "
+                f"no compile-time value. Pass a literal, one of the caller's own "
+                f"'pl.constexpr' parameters, or a module-level/closure constant."
+            )
+        resolved[name] = folded
+    return resolved
+
+
+# A resolved compile-time binding: sorted ``(param, folded source text)`` pairs.
+# Hashable, so it can stand in the identity of one generated function.
+_ConstexprBinding = tuple[tuple[str, str], ...]
+# One generated ``@pl.function``: a Python function plus the compile-time
+# binding it is compiled against. Everything downstream used to key on
+# ``id(func)`` alone, which is why a dep reached with two different constants
+# had to be refused -- there was one slot to put it in.
+_VariantKey = tuple[int, _ConstexprBinding]
+
+
+def _freeze_binding(values: Mapping[str, str]) -> _ConstexprBinding:
+    """Normalise a resolved binding into its hashable identity form."""
+    return tuple(sorted(values.items()))
+
+
+@dataclass
+class _VariantPlan:
+    """Every generated function for one request, and how call sites reach them.
+
+    A ``pl.constexpr`` argument is folded into the callee's body, so two call
+    sites passing different constants need two different generated functions.
+    This plan is the expansion of the (constexpr-independent, cached) dep graph
+    into those per-binding functions, computed fresh per request because the
+    entry's own binding seeds it.
+
+    Attributes:
+        order: Every variant in leaf-first order, entry last — the order the
+            generated ``@pl.program`` must define them in.
+        jit_func: The ``JITFunction`` each variant specializes.
+        binding: Folded constexpr text per parameter, per variant.
+        origin: ``(caller variant, call name, call node)`` for the first call
+            site that produced each dep variant. Metadata is resolved from that
+            site, so each binding reads the tensors live at its own call rather
+            than at the first call sharing its name.
+        call_targets: Per variant, ``(call name, ordinal) -> callee variant``.
+            The ordinal is the call's position among same-named calls in source
+            order, which is how the specializer tells two otherwise identical
+            call sites apart.
+    """
+
+    order: list[_VariantKey]
+    jit_func: dict[_VariantKey, JITFunction]
+    binding: dict[_VariantKey, dict[str, str]]
+    origin: dict[_VariantKey, tuple[_VariantKey, str, ast.Call]]
+    call_targets: dict[_VariantKey, dict[tuple[str, int], _VariantKey]]
+
+    def naming_order(self, entry_key: _VariantKey) -> list[tuple[_VariantKey, JITFunction]]:
+        """The order generated names are handed out in, entry first.
+
+        Functions keep the leaf-first order names were allocated in before
+        variants existed, so a call graph with one binding per dep gets exactly
+        the names it got then. Within one function, variants are ordered by the
+        call site that produced them, so the first site in the source keeps the
+        unsuffixed name and later ones take ``__2``, ``__3``, … — reading the
+        generated program in source order then matches reading the original.
+        """
+        groups: dict[int, list[_VariantKey]] = {}
+        func_order: list[int] = []
+        for key in self.order:
+            if key == entry_key:
+                continue
+            func_id = key[0]
+            if func_id not in groups:
+                groups[func_id] = []
+                func_order.append(func_id)
+            groups[func_id].append(key)
+        result: list[tuple[_VariantKey, JITFunction]] = [(entry_key, self.jit_func[entry_key])]
+        for func_id in func_order:
+            # ``order`` is the reverse of the discovery walk, so one function's
+            # variants sit in reverse source order; flip them back.
+            result.extend((key, self.jit_func[key]) for key in reversed(groups[func_id]))
+        return result
+
+
+def _expand_constexpr_variants(
+    entry: JITFunction,
+    deps_topo: Sequence[JITFunction],
+    callers_by_id: Mapping[int, Sequence[tuple[Any, str]]],
+    entry_constexpr: Mapping[str, str],
+) -> _VariantPlan:
+    """Expand the dep graph into one generated function per compile-time binding.
+
+    Walks caller-first (``reversed(deps_topo)``), so by the time a dep is
+    reached every caller variant that can reach it already exists and its own
+    forwarded values are resolved. Each call site is folded independently; call
+    sites that agree on every value collapse onto one variant, which is what
+    keeps the ordinary single-binding program emitting exactly one function per
+    dep.
+
+    Args:
+        entry: The entry function, whose binding seeds the walk
+        deps_topo: Every reachable dep, leaf-first
+        callers_by_id: ``id(dep func) -> [(caller func, call name), ...]``
+        entry_constexpr: The entry's own resolved binding
+
+    Returns:
+        The full :class:`_VariantPlan` for this request
+
+    Raises:
+        TypeError: if a constexpr parameter is unbound at a call site or bound
+            to something with no compile-time value.
+    """
+    entry_key: _VariantKey = (id(entry._func), _freeze_binding(entry_constexpr))
+    plan = _VariantPlan(
+        order=[entry_key],
+        jit_func={entry_key: entry},
+        binding={entry_key: dict(entry_constexpr)},
+        origin={},
+        call_targets={entry_key: {}},
+    )
+    variants_by_func: dict[int, list[_VariantKey]] = {id(entry._func): [entry_key]}
+
+    for dep in reversed(deps_topo):
+        # Both lists cost a full ``inspect.signature`` with annotation
+        # resolution, so they are derived once per dep rather than per call
+        # site. A dep declaring no constexpr parameter cannot split at all, and
+        # skips call-site folding entirely.
+        signature = (_constexpr_params(dep._func), dep._param_names())
+        splits = bool(signature[0])
+        for caller_func, call_name in callers_by_id.get(id(dep._func), ()):
+            caller_globals = func_name_lookup(caller_func)
+            caller_locals = frozenset(_body_local_names(caller_func))
+            caller_name = getattr(caller_func, "__name__", "<caller>")
+            call_nodes = _dep_call_nodes(caller_func, call_name)
+            for caller_key in variants_by_func.get(id(caller_func), ()):
+                caller_binding = plan.binding[caller_key]
+                for ordinal, call in enumerate(call_nodes):
+                    values = (
+                        _resolve_call_site_constexpr(
+                            dep.__name__,
+                            signature,
+                            call,
+                            caller_name,
+                            caller_binding,
+                            caller_globals,
+                            caller_locals,
+                        )
+                        if splits
+                        else {}
+                    )
+                    dep_key: _VariantKey = (id(dep._func), _freeze_binding(values))
+                    if dep_key not in plan.binding:
+                        plan.order.append(dep_key)
+                        plan.jit_func[dep_key] = dep
+                        plan.binding[dep_key] = values
+                        plan.call_targets[dep_key] = {}
+                        plan.origin[dep_key] = (caller_key, call_name, call)
+                        variants_by_func.setdefault(id(dep._func), []).append(dep_key)
+                    plan.call_targets[caller_key][(call_name, ordinal)] = dep_key
+        if id(dep._func) not in variants_by_func:
+            # Reached by dep discovery but with no ``name(...)`` call node to
+            # fold against. It still has to be emitted -- dropping it would
+            # leave the caller calling an undefined function -- so it gets the
+            # empty binding, exactly what it received before variants existed.
+            fallback: _VariantKey = (id(dep._func), ())
+            plan.order.append(fallback)
+            plan.jit_func[fallback] = dep
+            plan.binding[fallback] = {}
+            plan.call_targets[fallback] = {}
+            variants_by_func[id(dep._func)] = [fallback]
+
+    # Collected caller-first; the generated program must define callees first.
+    plan.order.reverse()
+    return plan
+
+
 def _call_arg_refs(node: ast.Call) -> list[tuple[str | None, str | _SlicedArg | None]]:
     """Unify one call node's positional and keyword args into ``(param, ref)`` pairs.
 
@@ -1589,17 +2503,17 @@ def _resolve_dep_call_metadata(
     dep: JITFunction,
     caller_func: Any,
     caller_tensor_meta: dict[str, TensorMeta],
-    caller_scalar_values: dict[str, int | float | bool],
     caller_scalar_dtypes: dict[str, DataType],
     dep_dyn_map: dict[str, dict[int, DynDim]],
     caller_func_type: str = "orchestration",
     dep_call_name: str | None = None,
+    call_node: ast.Call | None = None,
+    caller_constexpr: Mapping[str, str] | None = None,
 ) -> tuple[
     dict[str, TensorMeta],
-    dict[str, int | float | bool],
     dict[str, DataType],
 ]:
-    """Map ``dep``'s parameter names to TensorMeta / scalar metadata using
+    """Map ``dep``'s parameter names to TensorMeta / scalar dtypes using
     ``caller_func``'s call-site arguments.
 
     The caller may be the entry function or another dep (transitive case);
@@ -1618,23 +2532,37 @@ def _resolve_dep_call_metadata(
     it differs from ``dep.__name__`` under an aliased import or any other
     rebinding. Defaults to ``dep.__name__`` for callers that resolve a dep
     reached under its own name.
+
+    ``call_node`` pins resolution to one specific call site instead of the
+    first one bearing that name. A dep called with two different
+    ``pl.constexpr`` bindings is compiled once per binding, and each of those
+    compilations reads the arguments and the point-in-time metadata of the call
+    site that produced it.
+
+    ``caller_constexpr`` is the caller's own ``pl.constexpr`` binding, so a
+    local the caller sizes off one of its compile-time parameters reaches the
+    dep with that static extent.
     """
     dep_param_names = dep._param_names()
     call_name = dep_call_name or dep.__name__
-    call_args = _extract_call_args_for_dep(caller_func, call_name)
+    call_args = (
+        _call_arg_refs(call_node)
+        if call_node is not None
+        else _extract_call_args_for_dep(caller_func, call_name)
+    )
     intermediate_metas = _extract_local_tensor_metas(
         caller_func,
         seed_meta=caller_tensor_meta,
-        seed_scalars=caller_scalar_values,
         caller_func_type=caller_func_type,
-        stop_at_dep=call_name if call_args is not None else None,
+        stop_at_dep=call_name if call_args is not None and call_node is None else None,
+        stop_at_call=call_node,
+        constexpr_values=caller_constexpr,
     )
     # The extractor starts from caller_tensor_meta, then applies source-ordered
     # rebindings. Its result is therefore the authoritative state at the call.
     all_tensor_meta = intermediate_metas
 
     dep_tensor_meta: dict[str, TensorMeta] = {}
-    dep_scalar_values: dict[str, int | float | bool] = {}
     dep_scalar_dtypes: dict[str, DataType] = {}
 
     if call_args is not None:
@@ -1657,24 +2585,19 @@ def _resolve_dep_call_metadata(
                 continue
             if caller_arg in all_tensor_meta:
                 dep_tensor_meta[dep_param] = all_tensor_meta[caller_arg]
-            else:
-                # A scalar arg carries a value only when the caller specialized
-                # it; a ``pl.RUNTIME`` scalar has a dtype but no value. Forward
-                # each fact independently so the dtype survives either way.
-                if caller_arg in caller_scalar_values:
-                    dep_scalar_values[dep_param] = caller_scalar_values[caller_arg]
-                if caller_arg in caller_scalar_dtypes:
-                    dep_scalar_dtypes[dep_param] = caller_scalar_dtypes[caller_arg]
+            elif caller_arg in caller_scalar_dtypes:
+                # A scalar arg is a runtime value, so only its declared type
+                # crosses the call boundary.
+                dep_scalar_dtypes[dep_param] = caller_scalar_dtypes[caller_arg]
     else:
         # Fallback: name-based matching against the caller's metadata pool.
         dep_tensor_meta = {n: all_tensor_meta[n] for n in dep_param_names if n in all_tensor_meta}
-        dep_scalar_values = {n: caller_scalar_values[n] for n in dep_param_names if n in caller_scalar_values}
         dep_scalar_dtypes = {n: caller_scalar_dtypes[n] for n in dep_param_names if n in caller_scalar_dtypes}
 
     _overlay_dep_declared_dyn_dims(dep_dyn_map, dep_tensor_meta)
     _overlay_dep_declared_layouts(dep, dep_tensor_meta)
 
-    return dep_tensor_meta, dep_scalar_values, dep_scalar_dtypes
+    return dep_tensor_meta, dep_scalar_dtypes
 
 
 def _overlay_dep_declared_dyn_dims(
@@ -1780,6 +2703,12 @@ def _resolve_memory_planner(run_config: Any) -> _passes.MemoryPlanner:
     return _passes.MemoryPlanner.PYPTO
 
 
+def _resolve_enable_buffer_ir() -> bool:
+    """Resolve the staged Buffer IR option inherited by ``ir.compile()``."""
+    ctx = _passes.PassContext.current()
+    return ctx.get_enable_buffer_ir() if ctx is not None else True
+
+
 def _resolve_enable_pypto_l0c_double_buffer() -> bool:
     """Resolve the legacy-PYPTO chooser dbC=2 opt-in for the cache key.
 
@@ -1812,8 +2741,9 @@ def _resolve_compile_request(run_config: Any) -> tuple[dict[str, Any], bool]:
 
     RunConfig's compile mapping is the source for both codegen and cache keys.
     Diagnostics are requests to run the compiler, so decide bypass before any
-    cache lookup (including source-key construction). Tool discovery remains
-    on the compile path and adds no filesystem probes to ordinary cache hits.
+    cache lookup (including source-key construction). With persistence disabled,
+    tool discovery remains on the compile path; persistent hits additionally
+    require a verified installation identity.
     """
     if run_config is None:
         from pypto.runtime import CompileOptions  # noqa: PLC0415
@@ -1837,6 +2767,8 @@ def _resolve_compile_request(run_config: Any) -> tuple[dict[str, Any], bool]:
         or get_active_profiler() is not None
         or kwargs.get("output_dir") is not None
         or bool(os.environ.get("PYPTO_PROG_BUILD_DIR"))
+        or os.environ.get("PYPTO_EMIT_DEBUG_RUNNER") is not None
+        or os.environ.get("PYPTO_REBUILD_FROM_PTO") is not None
         or kwargs.get("verification_level") is not None
         or kwargs["diagnostic_phase"] is not None
         or kwargs["disabled_diagnostics"] is not None
@@ -1856,6 +2788,11 @@ def _resolve_compile_request(run_config: Any) -> tuple[dict[str, Any], bool]:
 
 
 # ---------------------------------------------------------------------------
+
+
+@functools.lru_cache(maxsize=512)
+def _persistent_dynamic_digest(static: str, values: tuple[tuple[int, str, str], ...]) -> str:
+    return digest_record(("source", static, values))
 
 
 class _DepGraph(NamedTuple):
@@ -1883,6 +2820,7 @@ class _CachedDepGraph:
     source_hash: str | None
     layout_dependencies: tuple[tuple[Any, tuple[str, ...]], ...]
     layouts: _CachedLayouts | None = None
+    persistent_source_hash: str | None = None
 
 
 @functools.lru_cache(maxsize=512)
@@ -1963,6 +2901,8 @@ class JITFunction:
         self._external_include_dirs = external_include_dirs
         self._dep_graph_state: _CachedDepGraph | None = None
         self._cache: dict[CacheKey, Any] = {}  # CacheKey → CompiledProgram
+        self._artifact_objects: dict[Any, Any] = {}
+        self._cache_lock = threading.RLock()
 
         # Preserve function metadata
         self.__name__ = func.__name__
@@ -2019,9 +2959,13 @@ class JITFunction:
         cached = state.layouts
         if cached is not None and all(a is b for a, b in zip(bindings, cached.bindings, strict=True)):
             return cached.layouts
-        # Same list ``_build_contexts`` allocates from, so the names agree with
-        # the ones the generated program actually uses.
-        gen_names = _allocate_generated_names(self, state.graph.deps)
+        # Keyed per function, not per ``pl.constexpr`` variant: a parameter's
+        # layout is a property of the declaration, so every variant of a dep
+        # carries the same one and only needs to be counted once. The names
+        # therefore agree with the generated program's for any single-binding
+        # call graph, and stay a stable discriminator when a dep is emitted
+        # more than once.
+        gen_names = _allocate_generated_names([(id(d._func), d) for d in [self, *state.graph.deps]])
         layouts = tuple(
             sorted(
                 (gen_names[id(dep._func)], param, str(layout))
@@ -2155,9 +3099,13 @@ class JITFunction:
         changes this hash by construction, and one that does not fold (an opaque
         object, a JIT dep, ``pl`` itself) contributes nothing because it leaves
         the source unchanged.
+
+        Covers only what the *function* brings. A ``pl.constexpr`` argument
+        folds by the same rule but is bound per call site, so it belongs to the
+        request; :func:`_request_source_hash` layers it on top.
         """
         source_hash = self._get_static_source_hash()
-        records = []
+        records: list[tuple[Any, ...]] = []
         for index, jit_func in enumerate([self, *self._get_deps()]):
             func = jit_func._func
             namespace = func_name_lookup(func)
@@ -2167,6 +3115,74 @@ class JITFunction:
                     continue
                 records.append((index, func.__module__, func.__qualname__, name, folded))
         return compute_source_hash([source_hash, json.dumps(records, separators=(",", ":"))])
+
+    def _resolve_constexpr_bindings(self, entry_constexpr: Mapping[str, str]) -> _VariantPlan:
+        """Expand this request's call graph into one function per constexpr binding.
+
+        Run before the cache key as well as during specialization: a dep's
+        constant is part of what gets compiled, so it has to be part of what
+        the key identifies, and the same walk backing both means the two cannot
+        disagree.
+
+        Args:
+            entry_constexpr: The entry's own bindings, from argument binding
+
+        Returns:
+            The request's :class:`_VariantPlan`
+        """
+        deps_topo, callers_by_id, _, _ = self._get_dep_graph()
+        return _expand_constexpr_variants(self, deps_topo, callers_by_id, entry_constexpr)
+
+    def _constexpr_identity_records(self, plan: _VariantPlan) -> list[tuple[Any, ...]]:
+        """Flatten a variant plan into deterministic cache-identity records.
+
+        Indexed by position in ``[self, *deps]`` and qualified by the defining
+        module, mirroring ``_get_source_hash``'s records so two functions that
+        share a parameter name stay distinguishable. A dep emitted once per
+        binding contributes one record group per binding, so a program that
+        compiles ``helper`` at 16 and at 32 cannot collide with one that
+        compiles it twice at 16.
+
+        Once anything is split, **which** specialization each call site reaches
+        is also part of the identity, because the set of bindings does not
+        determine it. Three calls at ``16``, ``32`` and ``cfg.N`` emit the same
+        two bindings whichever value ``cfg.N`` holds; only the third call's
+        target moves, and an attribute like ``cfg.N`` is invisible to
+        ``_get_source_hash``, which can render free names only. Without the
+        wiring the key stands still while the generated program changes, and
+        the artifact built for the other target is served.
+
+        The wiring is emitted only when some function really is split. With one
+        binding apiece each call name has exactly one possible target, so the
+        call graph in the source hash plus the bindings above already pin it,
+        and staying silent keeps every existing key — and the artifacts behind
+        it — valid.
+        """
+        position = {id(jit_func._func): index for index, jit_func in enumerate([self, *self._get_deps()])}
+        split = len({key[0] for key in plan.order}) != len(plan.order)
+        records: list[tuple[Any, ...]] = []
+        for key in plan.order:
+            func = plan.jit_func[key]._func
+            index = position.get(id(func), -1)
+            binding = _freeze_binding(plan.binding[key])
+            for name, text in binding:
+                records.append((index, func.__module__, func.__qualname__, name, text))
+            if not split:
+                continue
+            for (call_name, ordinal), target in sorted(plan.call_targets[key].items()):
+                records.append(
+                    (
+                        index,
+                        func.__module__,
+                        func.__qualname__,
+                        binding,
+                        call_name,
+                        ordinal,
+                        position.get(target[0], -1),
+                        target[1],
+                    )
+                )
+        return records
 
     @cache_in_snapshot
     def _get_static_source_hash(self) -> str:
@@ -2179,7 +3195,7 @@ class JITFunction:
 
     def _compute_static_source_hash(self, deps: list[JITFunction]) -> str:
         """Compute source structure on graph changes or external-source lookups."""
-        sources = []
+        sources: list[str] = []
         for jit_func in [self, *deps]:
             sources.append(
                 json.dumps(
@@ -2220,11 +3236,19 @@ class JITFunction:
         list[str],
         dict[str, Any],
         dict[str, TensorMeta],
-        dict[str, int | float | bool],
         dict[str, DataType],
+        dict[str, str],
         dict[int, dict[str, dict[int, DynDim]]],
     ]:
         """Bind *args/**kwargs to param names and classify into tensor/scalar metadata.
+
+        A numeric argument to a ``pl.Scalar`` parameter is a **runtime value**:
+        it is dispatched as-is and never folded into the artifact, so it
+        contributes no metadata here and does not split the specialization
+        cache. A ``pl.constexpr`` parameter is the opposite -- its argument is
+        rendered to source text, leaves ``arguments`` so nothing is dispatched
+        for it, and reaches ``_get_source_hash`` so each distinct value selects
+        its own artifact.
 
         Tensor metas carry ``DynDim`` entries for every param dim that is
         either declared dynamic at this function (``bind_dynamic`` / annotation
@@ -2253,39 +3277,55 @@ class JITFunction:
         )
         entry_dyn_map = per_func_dyn_maps[id(self._func)]
         # A layout has no runtime counterpart on a torch tensor, so it comes
-        # from the annotation even on this path.
+        # from the annotation even on this path. FP4 vs FP4E2M1X2 likewise.
         param_layouts = _param_layouts(self._func, self.__name__)
+        param_dtypes = _param_dtypes(self._func)
         tensor_meta: dict[str, TensorMeta] = {}
-        scalar_values: dict[str, int | float | bool] = {}
         scalar_dtypes: dict[str, DataType] = {}
+        constexpr_names = _constexpr_params(self._func)
+        constexpr_values: dict[str, str] = {}
 
         from pypto.language.typing.scalar import RUNTIME  # noqa: PLC0415
 
         for name, value in arguments.items():
             # ``pl.RUNTIME`` is a compile-time marker, not a value. This path
             # binds real arguments (dispatch, or sample-argument compile), where
-            # an unrecognized object would otherwise slip through the
-            # int/float/bool filter below and fail much later with an opaque
-            # "must be real number" from the runtime. Note ``apply_defaults()``
-            # above materializes a ``= pl.RUNTIME`` signature default, so a plain
+            # it would otherwise reach the runtime and fail much later with an
+            # opaque "must be real number". Note ``apply_defaults()`` above
+            # materializes a ``= pl.RUNTIME`` signature default, so a plain
             # ``kernel(a, c)`` call reaches here too.
             if value is RUNTIME:
                 raise TypeError(
                     f"@pl.jit function '{self.__name__}': parameter '{name}' received "
-                    f"pl.RUNTIME, which is a compile-time marker rather than a value. It is "
-                    f"only accepted by annotation-driven signature mode — call compile() or "
-                    f"lower() with no tensor arguments and pass it by keyword, e.g. "
-                    f"{self.__name__}.compile({name}=pl.RUNTIME). To run the kernel, pass "
-                    f"'{name}' its actual value."
+                    f"pl.RUNTIME, which is a compile-time marker rather than a value. This "
+                    f"path binds real arguments, so pass '{name}' its actual value — a scalar "
+                    f"parameter is a runtime value and does not compile a separate artifact "
+                    f"per value. The marker is accepted only by annotation-driven signature "
+                    f"mode ({self.__name__}.compile() with no tensor arguments), where it is "
+                    f"now redundant."
                 )
             if _is_tensor(value):
                 tensor_meta[name] = _extract_tensor_meta(
-                    value, entry_dyn_map.get(name), param_layouts.get(name)
+                    value,
+                    entry_dyn_map.get(name),
+                    param_layouts.get(name),
+                    param_dtypes.get(name),
                 )
-            elif isinstance(value, (int, float, bool)):
-                scalar_values[name] = value
 
-        return param_names, arguments, tensor_meta, scalar_values, scalar_dtypes, per_func_dyn_maps
+        # Drop constexpr bindings out of ``arguments``: they are resolved during
+        # specialization and have no slot in the dispatch ABI, so the ordered
+        # argument list this feeds must not carry them.
+        for name in constexpr_names:
+            constexpr_values[name] = _resolve_constexpr_value(self.__name__, name, arguments.pop(name))
+
+        return (
+            param_names,
+            arguments,
+            tensor_meta,
+            scalar_dtypes,
+            constexpr_values,
+            per_func_dyn_maps,
+        )
 
     def _bind_args_from_signature(
         self, kwargs: dict[str, Any]
@@ -2293,8 +3333,8 @@ class JITFunction:
         list[str],
         dict[str, Any],
         dict[str, TensorMeta],
-        dict[str, int | float | bool],
         dict[str, DataType],
+        dict[str, str],
         dict[int, dict[str, dict[int, DynDim]]],
     ]:
         """Derive the same metadata as ``_bind_args``, but from the kernel's
@@ -2307,17 +3347,24 @@ class JITFunction:
         dynamic and given a placeholder extent. Dynamic dimensions lower to runtime ``pl.tensor.dim`` reads
         and, on the compiled path, collapse to ``None`` in the cache key.
 
-        Scalar parameters carry no value in the signature, so their values must
-        come from ``kwargs`` (or a signature default). A literal is specialized
-        into the artifact; ``pl.RUNTIME`` instead leaves the parameter
-        unspecialized — it is omitted from ``scalar_values`` (and therefore from
-        the cache key) and survives into the generated program as a real
-        ``pl.Scalar`` parameter, exactly like a dynamic dim extent.
+        Scalar parameters need no value: each one survives into the generated
+        program as a real ``pl.Scalar`` parameter whose value arrives at
+        dispatch, exactly like a dynamic dim extent, and drops out of the cache
+        key so one artifact serves every value. A value supplied anyway — a
+        signature default, an explicit keyword, or ``pl.RUNTIME`` — is validated
+        and then contributes nothing (see :func:`_check_signature_scalar_value`).
+
+        A ``pl.constexpr`` parameter is the one kind that *does* need a value
+        here, because its value is the artifact: it comes from ``kwargs`` or a
+        signature default, and a parameter with neither is an error.
 
         Raises:
             TypeError: if a tensor parameter has a bare ``pl.Tensor`` annotation
-                (no shape to read), or a scalar parameter has no supplied value.
+                (no shape to read), a scalar parameter is given a value that is
+                neither a number nor ``pl.RUNTIME``, or a constexpr parameter
+                has no value.
         """
+        from pypto.language.typing.constexpr import ConstexprMarker  # noqa: PLC0415
         from pypto.language.typing.dynamic import DynVar  # noqa: PLC0415
         from pypto.language.typing.scalar import Scalar  # noqa: PLC0415
         from pypto.language.typing.tensor import Tensor  # noqa: PLC0415
@@ -2343,8 +3390,8 @@ class JITFunction:
         entry_dyn_map = per_func_dyn_maps[id(self._func)]
 
         tensor_meta: dict[str, TensorMeta] = {}
-        scalar_values: dict[str, int | float | bool] = {}
         scalar_dtypes: dict[str, DataType] = {}
+        constexpr_values: dict[str, str] = {}
 
         for name in param_names:
             param = sig.parameters[name]
@@ -2382,18 +3429,24 @@ class JITFunction:
             if isinstance(annotation, type) and issubclass(annotation, Tensor):
                 raise TypeError(bare_msg)
 
+            if isinstance(annotation, ConstexprMarker):
+                constexpr_values[name] = _resolve_constexpr_value(
+                    self.__name__,
+                    name,
+                    _signature_constexpr_value(self.__name__, name, param, kwargs),
+                )
+                continue
+
             # Scalar-like annotation: pl.Scalar[dtype] or a bare DataType.
             scalar_dtype = annotation.dtype if isinstance(annotation, Scalar) else None
             if scalar_dtype is None and isinstance(annotation, DataType):
                 scalar_dtype = annotation
             if scalar_dtype is not None:
-                value = _signature_scalar_value(self.__name__, name, param, kwargs)
-                # ``pl.RUNTIME`` -> no ``scalar_values`` entry. The specializer only
-                # substitutes names present in ``scalar_values``, so the parameter
-                # stays symbolic in the generated program; it also drops out of the
-                # cache key, so one artifact serves every runtime value.
-                if value is not None:
-                    scalar_values[name] = value
+                # The specializer never substitutes a scalar parameter, so it
+                # stays symbolic in the generated program and out of the cache
+                # key — one artifact serves every runtime value. Any value the
+                # caller supplied is only validated here.
+                _check_signature_scalar_value(self.__name__, name, param, kwargs)
                 scalar_dtypes[name] = scalar_dtype
                 continue
 
@@ -2405,10 +3458,19 @@ class JITFunction:
                 f"compile(*sample_args)."
             )
 
-        # Signature mode has no tensor sample arguments. Preserve supplied
-        # scalar values in the same arguments mapping returned by _bind_args.
-        arguments = dict(scalar_values)
-        return param_names, arguments, tensor_meta, scalar_values, scalar_dtypes, per_func_dyn_maps
+        # Signature mode binds no runtime arguments at all: it has no tensor
+        # samples, and a scalar's value now arrives at dispatch rather than at
+        # compile time. Its callers (``compile`` / ``lower`` / ``warmup``)
+        # discard the ordered-argument list this feeds.
+        arguments: dict[str, Any] = {}
+        return (
+            param_names,
+            arguments,
+            tensor_meta,
+            scalar_dtypes,
+            constexpr_values,
+            per_func_dyn_maps,
+        )
 
     # ------------------------------------------------------------------
     # Call
@@ -2447,22 +3509,16 @@ class JITFunction:
         # ``compile(a=x)``) must still bind through ``_bind_args``/``sig.bind``;
         # scalar/config kwargs do not block signature mode.
         signature_mode = allow_signature_mode and not args and not any(_is_tensor(v) for v in kwargs.values())
-        if signature_mode:
-            param_names, arguments, tensor_meta, scalar_values, scalar_dtypes, per_func_dyn = (
-                self._bind_args_from_signature(kwargs)
-            )
-        else:
-            param_names, arguments, tensor_meta, scalar_values, scalar_dtypes, per_func_dyn = self._bind_args(
-                args, kwargs
-            )
+        bind = self._bind_args_from_signature(kwargs) if signature_mode else self._bind_args(args, kwargs)
+        param_names, arguments, tensor_meta, scalar_dtypes, constexpr_values, per_func_dyn = bind
 
         return (
             _Specialization(
                 param_names,
                 arguments,
                 tensor_meta,
-                scalar_values,
                 scalar_dtypes,
+                constexpr_values,
                 per_func_dyn,
             ),
             run_config,
@@ -2494,22 +3550,39 @@ class JITFunction:
         )
 
         compile_kwargs, bypass_cache = _resolve_compile_request(run_config)
+        target_platform = _platform_string(compile_kwargs["backend_type"], compile_kwargs["execution_mode"])
+        cache_config = capture_cache_config(getattr(run_config, "cache_config", None))
+        record_stats(requests=1)
+        if not cache_config.enabled:
+            record_stats(disabled_requests=1)
         ordered_args = [
             specialization.arguments[n] for n in specialization.param_names if n in specialization.arguments
         ]
-        if bypass_cache:
-            compiled = self._compile(
-                specialization.tensor_meta,
-                specialization.scalar_values,
-                specialization.scalar_dtypes,
-                specialization.per_func_dyn,
-                pl,
-                **compile_kwargs,
-            )
-            return compiled, ordered_args, run_config
 
+        def build(**overrides: Any) -> Any:
+            record_stats(generation_builds=1)
+            with time_stage("build_ns"):
+                return self._compile(
+                    specialization.tensor_meta,
+                    specialization.scalar_dtypes,
+                    specialization.constexpr_values,
+                    specialization.per_func_dyn,
+                    pl,
+                    **(compile_kwargs | overrides),
+                )
+
+        if bypass_cache:
+            record_stats(forced_rebuilds=1)
+            return build(), ordered_args, run_config
+
+        # Resolved before the key rather than during ``build()``: a dep's
+        # compile-time value is part of what gets compiled, so the key has to
+        # identify it too.
+        constexpr_bindings = self._resolve_constexpr_bindings(specialization.constexpr_values)
         key = make_cache_key(
-            source_hash=self._get_source_hash(),
+            source_hash=_request_source_hash(
+                self._get_source_hash(), self._constexpr_identity_records(constexpr_bindings)
+            ),
             param_names=specialization.param_names,
             tensor_shapes={n: m.static_shape() for n, m in specialization.tensor_meta.items()},
             tensor_dtypes={n: m.dtype for n, m in specialization.tensor_meta.items()},
@@ -2518,39 +3591,86 @@ class JITFunction:
             dynamic_dims={
                 (n, i) for n, m in specialization.tensor_meta.items() for i in m.dynamic_dim_indices()
             },
-            scalar_values=specialization.scalar_values,
-            platform=compile_kwargs["platform"],
+            platform=target_platform,
             strategy=compile_kwargs["strategy"],
             distributed_config=compile_kwargs.get("distributed_config"),
             analyze_auto_scopes_for_deps=compile_kwargs["analyze_auto_scopes_for_deps"],
             emit_source_loc=compile_kwargs["emit_source_loc"],
             memory_planner=compile_kwargs.get("memory_planner", _resolve_memory_planner(None)),
             enable_pypto_l0c_double_buffer=_resolve_enable_pypto_l0c_double_buffer(),
+            enable_buffer_ir=_resolve_enable_buffer_ir(),
             runtime=_resolve_runtime(),
         )
 
-        # L1 cache lookup
-        if key not in self._cache:
-            self._cache[key] = self._compile(
-                specialization.tensor_meta,
-                specialization.scalar_values,
-                specialization.scalar_dtypes,
-                specialization.per_func_dyn,
-                pl,
-                **compile_kwargs,
-            )
+        with self._cache_lock:
+            if cache_config.enabled:
+                from ._persistent import resolve_persistent  # noqa: PLC0415
 
-        return self._cache[key], ordered_args, run_config
+                compiled = resolve_persistent(
+                    self,
+                    key,
+                    cache_config,
+                    build,
+                    self._persistent_source_digest,
+                    platform=target_platform,
+                    runtime_name=runtime_kind_to_name(_resolve_runtime()),
+                    distributed=self._func_type == "host",
+                )
+            elif key in self._cache:
+                record_stats(object_hits=1)
+                compiled = self._cache[key]
+            else:
+                compiled = self._cache[key] = build()
+        return compiled, ordered_args, run_config
+
+    def _persistent_source_digest(self) -> str:
+        """Memoize immutable graph content; refresh folded constants and externs."""
+        state = self._get_dep_graph_state()
+        functions = [self, *state.graph.deps]
+        if state.persistent_source_hash is None:
+            state.persistent_source_hash = digest_record(
+                [
+                    (
+                        _python_source(fn._func),
+                        fn._func.__module__,
+                        fn._func.__qualname__,
+                        fn._func.__code__.co_filename,
+                        fn._func.__code__.co_firstlineno,
+                        fn._func_type,
+                        str(fn._level),
+                        fn._auto_scope,
+                        fn._external_core_type,
+                        fn._external_dual_aiv_dispatch,
+                        tuple(fn._external_source_paths()),
+                        tuple(fn._external_include_dirs),
+                    )
+                    for fn in functions
+                ]
+            )
+        values: list[tuple[Any, ...]] = []
+        for index, fn in enumerate(functions):
+            namespace = func_name_lookup(fn._func)
+            for name in _constant_dependency_names(fn._func):
+                folded = free_name_source(name, namespace)
+                if folded is not None:
+                    values.append((index, name, folded))
+            if fn._func_type == "extern":
+                external = external_source_digest(
+                    fn._external_source_paths(),
+                    include_dirs=fn._external_include_dirs,
+                    metadata=(*fn._external_source_paths(), *fn._external_include_dirs),
+                )
+                values.append((index, "<extern>", external))
+        return _persistent_dynamic_digest(state.persistent_source_hash, tuple(values))
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Specialize, compile (or serve from cache), and execute on device.
 
-        On the first call for a given shape/dtype combination the function is
-        specialized into ``@pl.program`` source, parsed, and compiled via
-        ``ir.compile()`` (passes + codegen).  The resulting ``CompiledProgram``
-        is stored in the L1 in-memory cache so subsequent calls with the same
-        specialization key skip compilation entirely. Diagnostic and explicit
-        output requests bypass both cache lookup and insertion on every call.
+        A compatible compiled object is reused in process. When persistent
+        caching is enabled, a disk hit restores generated code or complete
+        binaries; a miss specializes into ``@pl.program`` and runs passes and
+        codegen. Execution publishes missing binaries automatically. Diagnostic
+        and explicit output requests bypass lookup and insertion on every call.
 
         The compiled kernel is then executed on the NPU device with the given
         torch tensor arguments (Triton-like API).
@@ -2602,8 +3722,10 @@ class JITFunction:
         they affect dispatch, not the compiled artefact.
 
         Subsequent calls (either ``__call__`` or [`compile`][pypto.language.JITFunction.compile]) with the
-        same specialization key hit the L1 cache and return the same
-        ``CompiledProgram`` instance. Dump, compile-profiling, explicit output,
+        same specialization and compatible cache policy return the same
+        ``CompiledProgram`` instance. With persistence enabled, a disk-restored
+        object has ``program is None``; disable persistence when IR is required.
+        Dump, compile-profiling, explicit output,
         and custom pass-diagnostic requests always compile afresh, preserving
         ordinary cached entries. Omitting ``config`` uses ``RunConfig`` defaults,
         including disabled dumps.
@@ -2616,16 +3738,17 @@ class JITFunction:
         requires every tensor parameter to carry a full ``pl.Tensor[[...],
         dtype]`` annotation (a bare ``pl.Tensor`` has no shape to read and
         raises). Dynamic dims (``pl.dynamic`` / ``bind_dynamic``) need no value —
-        the artifact is extent-independent. Scalar parameters have no value in
-        the signature, so pass them as keyword args (or via a signature
-        default); a literal **specializes** that value into the artifact, while
-        ``pl.RUNTIME`` leaves the parameter **unspecialized** — it stays a real
-        ``pl.Scalar`` parameter supplied at dispatch and, like a dynamic dim,
-        drops out of the cache key. A signature-mode call shares a cache entry
-        with an equivalent ``compile(*sample_tensors)`` call whenever the two
-        agree on every specialized scalar; ``pl.RUNTIME`` is its own
-        specialization and is rejected on the sample-argument path, which always
-        specializes the scalar value it is handed.
+        the artifact is extent-independent. Scalar parameters need no value
+        either: a ``pl.Scalar`` parameter is a **runtime value**, so it stays a
+        real parameter in the artifact, its value arrives at dispatch, and —
+        like a dynamic dim — it drops out of the cache key. A signature-mode
+        call therefore always shares a cache entry with an equivalent
+        ``compile(*sample_tensors)`` call. A value supplied anyway is inert: a
+        signature default is accepted silently, an explicit keyword warns
+        (that form used to specialize), and ``pl.RUNTIME`` is accepted here as
+        the no-op it now is. The sample-argument path takes the scalar as an
+        ordinary argument and rejects ``pl.RUNTIME``, which is a compile-time
+        marker rather than a value.
 
         Example::
 
@@ -2640,17 +3763,18 @@ class JITFunction:
             ):
                 ...
 
-            worker = ChipWorker(config=RunConfig(platform="a2a3"))
+            from pypto.runtime import ChipWorker, ExecutionMode, RunConfig
+
+            worker = ChipWorker(config=RunConfig(execution_mode=ExecutionMode.ONBOARD))
 
             # From sample tensors (shape/dtype read; contents ignored):
             compiled = my_kernel.compile(sample_x, sample_w, sample_out, 128)
 
-            # Or straight from the (fully-annotated) signature — no tensors.
-            # num_tokens varies per launch, so keep it out of the artifact: its
-            # value is supplied on each dispatch through the compiled artifact
-            # (below), not by calling my_kernel(...) directly — an eager call
-            # re-specializes and compiles a separate artifact.
-            compiled = my_kernel.compile(num_tokens=pl.RUNTIME)
+            # Or straight from the (fully-annotated) signature — no tensors,
+            # and no value for num_tokens: it is a runtime value, supplied on
+            # each dispatch below. Calling my_kernel(...) eagerly with a
+            # different num_tokens reuses this same artifact.
+            compiled = my_kernel.compile()
 
             w_dev = worker.alloc_tensor(real_w.shape, real_w.dtype, init=real_w)
             h = worker.register(compiled)
@@ -2663,15 +3787,65 @@ class JITFunction:
                 contents are not read. Omit **all** positional args to compile
                 straight from the signature annotations instead.
             **kwargs: Keyword arguments. A ``config`` keyword, if present, is
-                a ``RunConfig``. In signature mode,
-                scalar parameter values are also passed here (by name) — a
-                literal to specialize it, or ``pl.RUNTIME`` to leave it
-                unspecialized.
+                a ``RunConfig``. Signature mode needs no scalar values; one
+                passed by name is validated and then ignored, and an explicit
+                scalar keyword warns rather than specializing.
 
         Returns:
             The cached ``CompiledProgram`` for this specialization.
         """
         compiled, _ordered_args, _run_config = self._resolve_compiled(args, kwargs, allow_signature_mode=True)
+        return compiled
+
+    def warmup(self, *args: Any, **kwargs: Any) -> Any:
+        """Compile and prepare all device binaries without executing the kernel.
+
+        Uses the same arguments, configuration, specialization, and in-process
+        cache as :meth:`compile`. Fully annotated tensors need no sample
+        allocation, and scalar parameters need no value at all — they are
+        runtime values, so one preparation serves every value.
+
+        Unlike :meth:`compile`, this also assembles the kernel and orchestration
+        binaries for every chip-level build before returning. It creates no
+        runtime worker, initializes no NPU, and executes no kernel. The build
+        host still needs the target compiler, SDK, and runtime dependencies.
+        This method does not enable automatic persistent caching.
+
+        Args:
+            *args: Optional sample arguments accepted by :meth:`compile`.
+                Tensor contents are not read.
+            **kwargs: Kernel arguments and an optional ``config=RunConfig(...)``.
+                Omit tensor arguments to use the complete tensor annotations.
+
+        Returns:
+            The same ``CompiledProgram`` or ``DistributedCompiledProgram``
+            selected by :meth:`compile`, with all device binaries prepared.
+            Execution remains a separate operation on the returned object.
+
+        Raises:
+            TypeError: The compiled result does not support device-free warmup.
+            RuntimeError: A required binary cannot be prepared. Compiler and
+                configuration errors propagate; a later warmup can retry.
+        """
+        from pypto.ir.compiled_program import CompiledProgram  # noqa: PLC0415
+        from pypto.ir.distributed_compiled_program import DistributedCompiledProgram  # noqa: PLC0415
+
+        compiled = self.compile(*args, **kwargs)
+        if isinstance(compiled, DistributedCompiledProgram):
+            from pypto.runtime.distributed_runner import _assemble_chip_callables  # noqa: PLC0415
+
+            _assemble_chip_callables(compiled)
+        elif isinstance(compiled, CompiledProgram):
+            if compiled.orchestration_names:
+                for name in compiled.orchestration_names:
+                    compiled[name].load()
+            else:
+                compiled.load()
+        else:
+            raise TypeError(
+                f"@pl.jit function '{self.__name__}': device-free warmup is not supported "
+                f"for compiled result {type(compiled).__name__}"
+            )
         return compiled
 
     @capture_namespaces()
@@ -2723,8 +3897,8 @@ class JITFunction:
         specialization, _ = self._resolve_specialization(args, kwargs, allow_signature_mode=True)
         return self._compile_to_program(
             specialization.tensor_meta,
-            specialization.scalar_values,
             specialization.scalar_dtypes,
+            specialization.constexpr_values,
             specialization.per_func_dyn,
             pl,
         )
@@ -2759,9 +3933,9 @@ class JITFunction:
         Args:
             *args: Positional sample arguments matching the decorated function.
                 Omit tensor samples to specialize from fully shaped annotations.
-            **kwargs: Keyword sample arguments and an optional ``config``. In
-                signature mode a scalar parameter takes a literal (specialized
-                into the IR) or ``pl.RUNTIME`` (left unspecialized).
+            **kwargs: Keyword sample arguments and an optional ``config``. A
+                scalar parameter needs no value in signature mode: it stays a
+                symbolic ``pl.Scalar`` parameter in the returned program.
 
         Returns:
             The specialized ``ir.Program`` after configured passes.
@@ -2776,8 +3950,8 @@ class JITFunction:
         )
         pre_pass, rename_map = self._compile_to_program_with_rename_map(
             specialization.tensor_meta,
-            specialization.scalar_values,
             specialization.scalar_dtypes,
+            specialization.constexpr_values,
             specialization.per_func_dyn,
             pl,
         )
@@ -2804,8 +3978,8 @@ class JITFunction:
     def _compile(
         self,
         tensor_meta: dict[str, TensorMeta],
-        scalar_values: dict[str, int | float | bool],
         scalar_dtypes: dict[str, DataType],
+        constexpr_values: dict[str, str],
         per_func_dyn: dict[int, dict[str, dict[int, DynDim]]],
         pl: Any,
         **ir_compile_kwargs: Any,
@@ -2830,7 +4004,7 @@ class JITFunction:
         """
         from pypto.ir.compile import compile as ir_compile  # noqa: PLC0415
 
-        contexts = self._build_contexts(tensor_meta, scalar_values, scalar_dtypes, per_func_dyn)
+        contexts = self._build_contexts(tensor_meta, scalar_dtypes, constexpr_values, per_func_dyn)
         class_name = f"_jit_{self.__name__}"
         specializer = Specializer(class_name, contexts)
         source = specializer.specialize()
@@ -2839,9 +4013,7 @@ class JITFunction:
             parsed = pl.parse(source, filename=self._diagnostic_filename, source_map=specializer.source_map)
             skip_ptoas = not _ptoas_available()
             if ir_compile_kwargs.get("output_dir") is None:
-                output_root = os.environ.get("PYPTO_PROG_BUILD_DIR") or "build_output"
-                os.makedirs(output_root, exist_ok=True)
-                ir_compile_kwargs["output_dir"] = tempfile.mkdtemp(prefix=f"{parsed.name}_", dir=output_root)
+                ir_compile_kwargs["output_dir"] = make_default_output_dir(parsed.name)
             return ir_compile(parsed, skip_ptoas=skip_ptoas, **ir_compile_kwargs)
         except Exception as exc:
             rewritten = _rewrite_jit_error(exc, rename_map)
@@ -2852,16 +4024,16 @@ class JITFunction:
     def _compile_to_program(
         self,
         tensor_meta: dict[str, TensorMeta],
-        scalar_values: dict[str, int | float | bool],
         scalar_dtypes: dict[str, DataType],
+        constexpr_values: dict[str, str],
         per_func_dyn: dict[int, dict[str, dict[int, DynDim]]],
         pl: Any,
     ) -> Any:
         """Specialize entry + deps and return the parsed pre-pass ``ir.Program``."""
         program, _rename_map = self._compile_to_program_with_rename_map(
             tensor_meta,
-            scalar_values,
             scalar_dtypes,
+            constexpr_values,
             per_func_dyn,
             pl,
         )
@@ -2870,13 +4042,13 @@ class JITFunction:
     def _compile_to_program_with_rename_map(
         self,
         tensor_meta: dict[str, TensorMeta],
-        scalar_values: dict[str, int | float | bool],
         scalar_dtypes: dict[str, DataType],
+        constexpr_values: dict[str, str],
         per_func_dyn: dict[int, dict[str, dict[int, DynDim]]],
         pl: Any,
     ) -> tuple[Any, dict[str, str]]:
         """Return the parsed pre-pass program and specializer rename map."""
-        contexts = self._build_contexts(tensor_meta, scalar_values, scalar_dtypes, per_func_dyn)
+        contexts = self._build_contexts(tensor_meta, scalar_dtypes, constexpr_values, per_func_dyn)
         class_name = f"_jit_{self.__name__}"
         specializer = Specializer(class_name, contexts)
         source = specializer.specialize()
@@ -2893,8 +4065,8 @@ class JITFunction:
     def _build_contexts(
         self,
         tensor_meta: dict[str, TensorMeta],
-        scalar_values: dict[str, int | float | bool],
         scalar_dtypes: dict[str, DataType],
+        constexpr_values: dict[str, str],
         per_func_dyn: dict[int, dict[str, dict[int, DynDim]]],
     ) -> list[SpecializeContext]:
         """Build SpecializeContext list for entry + every transitive dep.
@@ -2917,78 +4089,131 @@ class JITFunction:
         The returned list is in leaf-first order (deps before their
         callers) so the generated source defines callees before callers.
         """
-        deps_topo, callers_by_id, callees_by_id, _ = self._get_dep_graph()
+        _, callers_by_id, callees_by_id, _ = self._get_dep_graph()
         empty_dyn: dict[str, dict[int, DynDim]] = {}
 
         # Map each Python function id → its JIT ``_func_type`` so meta
         # resolution downstream can gate dep discovery on the caller's type
         # (a host orchestrator additionally admits ``orchestration`` deps).
-        func_type_by_id: dict[int, str] = {id(self._func): self._func_type}
-        for d in deps_topo:
-            func_type_by_id[id(d._func)] = d._func_type
+        # Expand the graph into one generated function per compile-time binding.
+        # A dep called with two different ``pl.constexpr`` values is two
+        # functions here, not an error. The same walk backs the cache key, so
+        # the two cannot disagree.
+        plan = self._resolve_constexpr_bindings(constexpr_values)
+        entry_key: _VariantKey = (id(self._func), _freeze_binding(constexpr_values))
 
-        # Walk caller-first to resolve each dep's metadata from its actual
-        # caller's already-resolved metadata.
+        func_type_by_id: dict[int, str] = {id(self._func): self._func_type}
+        for key in plan.order:
+            jit_func = plan.jit_func[key]
+            func_type_by_id[id(jit_func._func)] = jit_func._func_type
+
+        # One generated ``@pl.function`` name per variant, unique across the
+        # program. Two names can collide for two reasons: two distinct deps
+        # sharing a ``__name__`` (two modules each defining ``helper``), and
+        # two bindings of one dep. Either way the later claimant is suffixed,
+        # because emitting both as ``def helper`` made the parser reject the
+        # program with a bare ``Duplicate function name "helper"``.
+        # Entry first, so a clash never moves the name the user called.
+        gen_names = _allocate_generated_names(plan.naming_order(entry_key))
+
+        # Per variant, how its body's calls name the functions they reach.
+        # ``dep_call_variants`` is keyed by ``(call name, ordinal)`` because one
+        # body can now call one name at two constants and must reach a different
+        # generated function at each site. ``dep_func_names`` keeps the
+        # per-name view for the single-binding case, where every ordinal agrees.
+        dep_func_names_by_variant: dict[_VariantKey, dict[str, str]] = {}
+        dep_call_variants_by_variant: dict[_VariantKey, dict[tuple[str, int], str]] = {}
+        for caller_key, targets in plan.call_targets.items():
+            first_by_name: dict[str, str] = {}
+            reached_by_name: dict[str, set[str]] = {}
+            per_site: dict[tuple[str, int], str] = {}
+            # Sorted by ``(call name, ordinal)``, so the first hit per name is
+            # its ordinal 0 — the target ``dep_func_names`` should name.
+            for (call_name, ordinal), dep_key in sorted(targets.items(), key=lambda item: item[0]):
+                per_site[(call_name, ordinal)] = gen_names[dep_key]
+                first_by_name.setdefault(call_name, gen_names[dep_key])
+                reached_by_name.setdefault(call_name, set()).add(gen_names[dep_key])
+            dep_func_names_by_variant[caller_key] = first_by_name
+            # Left empty unless some call name really does reach more than one
+            # generated function: the per-name map already covers the rest, and
+            # an empty map is what tells the specializer it can skip numbering
+            # this body's call sites.
+            dep_call_variants_by_variant[caller_key] = (
+                per_site if any(len(reached) > 1 for reached in reached_by_name.values()) else {}
+            )
+
+        # Walk caller-first (reverse of leaf-first order) so each variant's
+        # caller metadata is already resolved when we get to it; collect
+        # contexts caller-first, then reverse to restore leaf-first emit order.
         resolved: dict[
-            int,
+            _VariantKey,
             tuple[
                 dict[str, TensorMeta],
-                dict[str, int | float | bool],
                 dict[str, DataType],
             ],
-        ] = {id(self._func): (tensor_meta, scalar_values, scalar_dtypes)}
+        ] = {entry_key: (tensor_meta, scalar_dtypes)}
 
-        # One generated ``@pl.function`` name per JIT function, unique across
-        # the program. Two distinct deps may share a ``__name__`` (two modules
-        # each defining ``helper``, or two kernels from the same factory);
-        # emitting both as ``def helper`` made the parser reject the program
-        # with a bare ``Duplicate function name "helper"``.
-        gen_names = _allocate_generated_names(self, deps_topo)
-
-        # Walk caller-first (reverse of leaf-first topo order) so each dep's
-        # caller metadata is already resolved when we get to it; collect
-        # contexts caller-first, then reverse to restore leaf-first emit
-        # order.
-        # Per caller, ``call name → generated function name``. They differ
-        # under an aliased import (the body calls ``kern(...)`` while the
-        # generated ``@pl.function`` is named after ``dep.__name__``) and
-        # under a uniquified name (``helper`` → ``helper__2``).
-        dep_func_names_by_caller: dict[int, dict[str, str]] = {}
-        for dep in deps_topo:
-            for caller_func, call_name in callers_by_id.get(id(dep._func), ()):
-                dep_func_names_by_caller.setdefault(id(caller_func), {})[call_name] = gen_names[id(dep._func)]
-
-        dep_contexts: list[SpecializeContext] = []
-        for dep in reversed(deps_topo):
-            # For metadata resolution we use the first-recorded caller. In a
-            # diamond ``entry -> {A, B} -> shared`` only one specialization
-            # of ``shared`` is emitted, so the call sites in other branches
-            # must agree on shapes/dtypes anyway.
-            caller_func, dep_call_name = callers_by_id[id(dep._func)][0]
-            c_meta, c_sv, c_sd = resolved[id(caller_func)]
+        contexts: list[SpecializeContext] = []
+        for key in reversed(plan.order):
+            dep = plan.jit_func[key]
+            if key == entry_key:
+                contexts.append(
+                    build_specialize_context(
+                        func=self._func,
+                        func_name=gen_names[key],
+                        func_type=self._func_type,
+                        level=self._level,
+                        tensor_meta=tensor_meta,
+                        scalar_dtypes=scalar_dtypes,
+                        constexpr_values=constexpr_values,
+                        dep_names=callees_by_id[id(self._func)],
+                        dep_func_names=dep_func_names_by_variant.get(key, {}),
+                        dep_call_variants=dep_call_variants_by_variant.get(key, {}),
+                        auto_scope=self._auto_scope,
+                    )
+                )
+                continue
+            # Each variant reads the call site that produced it, so its
+            # metadata is the state live at *that* call rather than at the
+            # first call sharing the name. Call sites that collapse onto one
+            # variant still have to agree on shapes/dtypes, as before.
+            origin = plan.origin.get(key)
+            if origin is not None:
+                caller_key, dep_call_name, call_node = origin
+            else:
+                # No call node to pin to (see the fallback in
+                # ``_expand_constexpr_variants``); resolve as before variants
+                # existed, from the first recorded caller.
+                caller_obj, dep_call_name = callers_by_id[id(dep._func)][0]
+                caller_key = next((other for other in resolved if other[0] == id(caller_obj)), entry_key)
+                call_node = None
+            caller_func = plan.jit_func[caller_key]._func
+            c_meta, c_sd = resolved[caller_key]
             caller_ftype = func_type_by_id.get(id(caller_func), "orchestration")
-            dep_meta, dep_sv, dep_sd = _resolve_dep_call_metadata(
+            dep_meta, dep_sd = _resolve_dep_call_metadata(
                 dep,
                 caller_func,
                 c_meta,
-                c_sv,
                 c_sd,
                 per_func_dyn.get(id(dep._func), empty_dyn),
                 caller_func_type=caller_ftype,
                 dep_call_name=dep_call_name,
+                call_node=call_node,
+                caller_constexpr=plan.binding[caller_key],
             )
-            resolved[id(dep._func)] = (dep_meta, dep_sv, dep_sd)
-            dep_contexts.append(
+            resolved[key] = (dep_meta, dep_sd)
+            contexts.append(
                 build_specialize_context(
                     func=dep._func,
-                    func_name=gen_names[id(dep._func)],
+                    func_name=gen_names[key],
                     func_type=dep._func_type,
                     level=dep._level,
                     tensor_meta=dep_meta,
-                    scalar_values=dep_sv,
                     scalar_dtypes=dep_sd,
+                    constexpr_values=plan.binding[key],
                     dep_names=callees_by_id[id(dep._func)],
-                    dep_func_names=dep_func_names_by_caller.get(id(dep._func), {}),
+                    dep_func_names=dep_func_names_by_variant.get(key, {}),
+                    dep_call_variants=dep_call_variants_by_variant.get(key, {}),
                     auto_scope=dep._auto_scope,
                     external_core_type=dep._external_core_type,
                     external_aic_source=dep._external_aic_source,
@@ -2997,21 +4222,8 @@ class JITFunction:
                     external_include_dirs=dep._external_include_dirs,
                 )
             )
-        dep_contexts.reverse()
-
-        entry_ctx = build_specialize_context(
-            func=self._func,
-            func_name=gen_names[id(self._func)],
-            func_type=self._func_type,
-            level=self._level,
-            tensor_meta=tensor_meta,
-            scalar_values=scalar_values,
-            scalar_dtypes=scalar_dtypes,
-            dep_names=callees_by_id[id(self._func)],
-            dep_func_names=dep_func_names_by_caller.get(id(self._func), {}),
-            auto_scope=self._auto_scope,
-        )
-        return dep_contexts + [entry_ctx]
+        contexts.reverse()
+        return contexts
 
     def __repr__(self) -> str:
         return f"JITFunction({self.__name__!r}, func_type={self._func_type!r})"
@@ -3063,7 +4275,11 @@ def _discover_dep_bindings(func: Any, caller_func_type: str = "orchestration") -
     return deps
 
 
-def _discover_deps(func: Any, caller_func_type: str = "orchestration") -> list[JITFunction]:
+# Cross-module private helper: the test suite (tests/ut/jit/test_decorator.py) reaches
+# it by underscore import; pyright's unused analysis discounts cross-module refs.
+def _discover_deps(  # pyright: ignore[reportUnusedFunction]
+    func: Any, caller_func_type: str = "orchestration"
+) -> list[JITFunction]:
     """Discover JIT dep functions called by ``func``, dropping their call names.
 
     Thin view over :func:`_discover_dep_bindings` for callers that only need
@@ -3085,27 +4301,32 @@ def _generated_names_for(jit_func: JITFunction, base: str) -> tuple[str, ...]:
     return (base,)
 
 
-def _allocate_generated_names(entry: JITFunction, deps: list[JITFunction]) -> dict[int, str]:
-    """Map ``id(jit_func._func)`` → the unique name its ``@pl.function`` gets.
+def _allocate_generated_names(items: Sequence[tuple[Any, JITFunction]]) -> dict[Any, str]:
+    """Map each caller-supplied key → the unique name its ``@pl.function`` gets.
 
-    A generated ``@pl.program`` holds one method per JIT function, so their
-    names must be distinct — but two distinct deps may legitimately share a
-    ``__name__`` (two modules each defining ``helper``, or two kernels built by
-    the same factory). A clash is resolved by suffixing the later claimant
-    ``__2``, ``__3``, … so both specializations survive instead of the parser
-    rejecting the program with ``Duplicate function name "helper"``.
+    A generated ``@pl.program`` holds one method per generated function, so
+    their names must be distinct — but two of them may legitimately want the
+    same ``__name__``. That happens for two distinct deps (two modules each
+    defining ``helper``, or two kernels built by the same factory) and for two
+    ``pl.constexpr`` variants of a single dep, which are one Python function
+    compiled against different constants. A clash is resolved by suffixing the
+    later claimant ``__2``, ``__3``, … so every specialization survives instead
+    of the parser rejecting the program with ``Duplicate function name
+    "helper"``.
 
-    The entry is named first, so a clash never moves the name the user called;
-    deps follow in ``deps`` order, which is derived from source order, so the
-    same call graph always yields the same names.
+    ``items`` pairs each key with the function to name, entry first so a clash
+    never moves the name the user called. The key is ``id(func)`` where one
+    name per function is wanted and a ``(func, binding)`` variant key where one
+    name per specialization is. Repeats of a key are ignored, and ``items``
+    order is derived from source order, so the same call graph always yields
+    the same names.
     """
     used: set[str] = set()
-    names: dict[int, str] = {}
+    names: dict[Any, str] = {}
     # Highest suffix already handed out per base name, so N functions sharing a
     # base cost O(N) probes overall rather than rescanning from 2 each time.
     next_suffix: dict[str, int] = {}
-    for jit_func in [entry, *deps]:
-        key = id(jit_func._func)
+    for key, jit_func in items:
         if key in names:
             continue
         base = jit_func.__name__
@@ -3170,9 +4391,11 @@ class _SubFunctionDecorator:
             )
         resolved_auto_scope = True if auto_scope is _AUTO_SCOPE_UNSET else auto_scope
         if func is None:
-            return lambda f: JITFunction(
-                f, func_type=self._func_type, level=level, auto_scope=resolved_auto_scope
-            )
+
+            def _deferred(f: Callable[..., Any]) -> JITFunction:
+                return JITFunction(f, func_type=self._func_type, level=level, auto_scope=resolved_auto_scope)
+
+            return _deferred
         return JITFunction(func, func_type=self._func_type, level=None, auto_scope=resolved_auto_scope)
 
 
@@ -3337,7 +4560,11 @@ class _JITDecorator:
         them by hand with ``with pl.scope()``.
         """
         if func is None:
-            return lambda f: JITFunction(f, func_type="orchestration", level=None, auto_scope=auto_scope)
+
+            def _deferred(f: Callable[..., Any]) -> JITFunction:
+                return JITFunction(f, func_type="orchestration", level=None, auto_scope=auto_scope)
+
+            return _deferred
         return JITFunction(func, func_type="orchestration", level=None, auto_scope=auto_scope)
 
 

@@ -23,6 +23,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -80,6 +81,72 @@ inline TypePtr CloneTypeWithMemRef(const TypePtr& type, const std::optional<MemR
   }
 
   return type;
+}
+
+/// Remove allocation annotations before comparing value descriptors. Keep
+/// window identity, layouts, and every other type field. Memoize tuple DAGs.
+inline TypePtr CloneTypeWithoutMemRef(const TypePtr& root) {
+  std::unordered_map<const Type*, TypePtr> cache;
+  auto strip = [&](auto&& self, const TypePtr& type) -> TypePtr {
+    if (!type) return type;
+    if (auto found = cache.find(type.get()); found != cache.end()) {
+      return found->second;
+    }
+    TypePtr result = type;
+    if (auto tuple = As<TupleType>(type)) {
+      std::vector<TypePtr> elements;
+      bool changed = false;
+      for (const auto& element : tuple->types_) {
+        auto next = self(self, element);
+        changed |= next != element;
+        elements.push_back(std::move(next));
+      }
+      if (changed) result = std::make_shared<TupleType>(std::move(elements));
+    } else if (auto shaped = As<ShapedType>(type); shaped && shaped->memref_) {
+      result = CloneTypeWithMemRef(type, std::nullopt);
+    }
+    cache.emplace(type.get(), result);
+    return result;
+  };
+  return strip(strip, root);
+}
+
+/// Keep newly inferred shape / dtype / view metadata, filling only missing storage metadata.
+/// Op type deduction may omit a declared MemRef or tile memory space. For a
+/// re-deduced assignment, carry them from the assigned Var's type: ConvertToSSA
+/// records allocation metadata there, not on the RHS Call.
+inline TypePtr WithCarriedMemRef(const TypePtr& deduced, const TypePtr& original) {
+  auto memref = GetTypeMemRef(deduced);
+  bool changed = false;
+  if (!memref && GetTypeMemRef(original)) {
+    memref = GetTypeMemRef(original);
+    changed = true;
+  }
+  std::optional<MemorySpace> memory_space;
+  auto tile = As<TileType>(deduced);
+  auto original_tile = As<TileType>(original);
+  if (tile && original_tile && !tile->memory_space_ && original_tile->memory_space_) {
+    memory_space = original_tile->memory_space_;
+    changed = true;
+  }
+  return changed ? CloneTypeWithMemRef(deduced, memref, memory_space) : deduced;
+}
+
+/// Select assignment metadata consistently in inlining and SSA conversion.
+inline TypePtr GetAuthoritativeAssignmentType(const TypePtr& lhs_type, const ExprPtr& value) {
+  auto value_type = value ? value->GetType() : nullptr;
+  const bool rhs_carries_authoritative_metadata = AsVarLike(value) ||
+                                                  std::dynamic_pointer_cast<const ShapedType>(value_type) ||
+                                                  As<TupleType>(value_type);
+  auto chosen = value_type && !As<UnknownType>(value_type) && rhs_carries_authoritative_metadata ? value_type
+                                                                                                 : lhs_type;
+  // The RHS wins on shape / dtype / view metadata. Op type deduction does not
+  // produce a MemRef, so an LHS MemRef supplies additional allocation metadata
+  // (an author-declared allocation or a re-parsed post-allocation dump).
+  if (!GetTypeMemRef(chosen).has_value() && GetTypeMemRef(lhs_type).has_value()) {
+    chosen = CloneTypeWithMemRef(chosen, GetTypeMemRef(lhs_type));
+  }
+  return chosen;
 }
 
 template <typename RemapExprFn>
@@ -223,6 +290,52 @@ inline MemRefPtr GetDefinedMemRef(const std::shared_ptr<const TileType>& tile_ty
   CHECK(tile_type != nullptr) << "TileType must not be null";
   CHECK(tile_type->memref_.has_value()) << "TileType must carry MemRef";
   return *tile_type->memref_;
+}
+
+/// Each MemRef's offset relative to its buffer, as address assignment reads it.
+///
+/// Keyed by MemRef pointer. An entry is the MemRef's `byte_offset_`, with scalar
+/// constants folded in where AllocateMemoryAddr can prove them (see
+/// `FoldRelativeMemRefOffsets` there).
+using RelativeMemRefOffsets = std::unordered_map<const MemRef*, ExprPtr>;
+
+/// The absolute address of @p memref once its buffer has been placed at @p buffer_base.
+///
+/// The address is `buffer_base + relative`, where `relative` is @p memref's entry in
+/// @p relative_offsets. A constant folds into one INT64 `ConstInt` — the dtype the
+/// `pto.alloc_tile` addr operand takes. A still-symbolic offset stays an expression,
+/// which codegen lowers into the tile's runtime address assignment: a declared
+/// allocation's runtime slot index (`l0c[i % 2]`), or a slice at a runtime row.
+///
+/// The offset must never be dropped. A `tile.slice` re-derives it through
+/// `pto.subview`, but a view of that view — a `tile.reshape`, which emits no op of its
+/// own — is addressed only by its `pto.alloc_tile addr`, so dropping the offset
+/// silently aliases it onto the buffer's first bytes.
+inline ExprPtr MakeAbsoluteMemRefAddress(uint64_t buffer_base, const MemRefPtr& memref,
+                                         const RelativeMemRefOffsets& relative_offsets) {
+  INTERNAL_CHECK(memref != nullptr) << "Internal error: null MemRef passed to MakeAbsoluteMemRefAddress";
+  INTERNAL_CHECK_SPAN(buffer_base <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()),
+                      memref->span_)
+      << "Internal error: buffer base " << buffer_base << " of MemRef '" << memref->name_hint_
+      << "' exceeds PyPTO's signed INT64 address representation";
+  const auto entry = relative_offsets.find(memref.get());
+  INTERNAL_CHECK_SPAN(entry != relative_offsets.end() && entry->second != nullptr, memref->span_)
+      << "Internal error: MemRef '" << memref->name_hint_ << "' reached address assignment with no offset";
+  const ExprPtr& relative_offset = entry->second;
+  if (auto relative = As<ConstInt>(relative_offset)) {
+    INTERNAL_CHECK_SPAN(relative->value_ >= 0, memref->span_)
+        << "Internal error: MemRef '" << memref->name_hint_ << "' has a negative relative offset "
+        << relative->value_;
+    INTERNAL_CHECK_SPAN(static_cast<uint64_t>(relative->value_) <=
+                            static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) - buffer_base,
+                        memref->span_)
+        << "Internal error: address of MemRef '" << memref->name_hint_
+        << "' exceeds PyPTO's signed INT64 address representation";
+    return std::make_shared<ConstInt>(static_cast<int64_t>(buffer_base) + relative->value_, DataType::INT64,
+                                      Span::unknown());
+  }
+  auto base = std::make_shared<ConstInt>(static_cast<int64_t>(buffer_base), DataType::INDEX, Span::unknown());
+  return std::make_shared<Add>(base, relative_offset, DataType::INDEX, Span::unknown());
 }
 
 /// How two MemRefs' start addresses relate.
@@ -386,6 +499,17 @@ inline ExprPtr AddByteOffsets(const ExprPtr& lhs, const ExprPtr& rhs) {
   if (const_rhs && const_rhs->value_ == 0) return lhs;
   if (const_lhs && const_lhs->value_ == 0) return rhs;
   return std::make_shared<Add>(lhs, rhs, DataType::INDEX, Span::unknown());
+}
+
+/// Derive an alias window from its current source, preserving allocation-slot identity.
+/// The offset is relative to the source, never the alias's previous absolute offset.
+inline MemRefPtr MakeAliasingMemRef(const MemRefPtr& source, const ExprPtr& relative_offset, uint64_t size,
+                                    const Span& span = Span::unknown()) {
+  INTERNAL_CHECK(source) << "Internal error: alias source must carry a MemRef";
+  auto zero = As<ConstInt>(relative_offset);
+  if (zero && zero->value_ == 0 && size == source->size_) return source;
+  return std::make_shared<MemRef>(source->base_, AddByteOffsets(source->byte_offset_, relative_offset), size,
+                                  span, source->is_pinned_, source->slot_count_, source->slot_index_);
 }
 
 /// Create a multiply expression: lhs * rhs.

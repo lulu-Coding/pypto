@@ -37,19 +37,28 @@ class Ascend950Handler : public BackendHandler {
   static const Ascend950Handler& Instance();
 
   [[nodiscard]] std::string GetPtoTargetArch() const override { return "a5"; }
-  [[nodiscard]] std::string GetLaunchSpecCoreCountMethod() const override { return "set_core_num"; }
+  [[nodiscard]] std::string GetLaunchSpecCoreCountMethod() const override { return "set_block_num"; }
   [[nodiscard]] std::string GetDefaultSimPlatform() const override { return "a5sim"; }
   [[nodiscard]] std::vector<std::string> GetExtraPtoasFlags() const override { return {"--pto-arch", "a5"}; }
+  // A5 supports both legacy logical FP4 and packed FP4E2M1X2; INT4/UINT4/HF4 stay rejected.
   [[nodiscard]] bool SupportsIncoreDataType(const DataType& dtype) const override {
-    return dtype.GetBit() != 4 || dtype == DataType::FP4;
+    return dtype.GetBit() != 4 || dtype == DataType::FP4 || dtype.IsPackedFp4();
   }
+  [[nodiscard]] bool HonorsHighPrecisionAlgorithm() const override { return true; }
 
   [[nodiscard]] bool RequiresGMPipeBuffer() const override { return false; }
   [[nodiscard]] bool RequiresSplitLoadTpopWorkaround() const override { return false; }
+
+  // A5 dispatches all six compare modes generically over the element type.
+  [[nodiscard]] bool SupportsOrderingCompareDataType(const DataType& /*src_dtype*/) const override {
+    return true;
+  }
   [[nodiscard]] bool RequiresLevel3TmpScratch() const override { return false; }
+
   [[nodiscard]] bool RequiresVtoCFractalAdapt() const override { return true; }
   [[nodiscard]] bool RequiresRuntimeSubblockBridge() const override { return false; }
   [[nodiscard]] bool RequiresNoSplitDualAivDispatch() const override { return false; }
+  [[nodiscard]] bool SplitsCubeToVectorTransportInHardware() const override { return true; }
   // A5 acc->mat tinsert accepts dst=f32, so the Mat scratch may stay f32.
   [[nodiscard]] bool RequiresLowPrecisionMatScratch() const override { return false; }
 
@@ -70,6 +79,35 @@ class Ascend950Handler : public BackendHandler {
            dtype == DataType::BF16;
   }
 
+  // A5 scale-bearing fix-pipe writeback, transcribed from pto-isa
+  // `include/pto/npu/a5/common.hpp` `GetScalarPreQuantMode`:
+  //   f32 -> i8/u8 (QF322B8_PRE), hf8 (QF322HIF8_PRE), f16 (QF322F16_PRE),
+  //          bf16 (QF322BF16_PRE), fp8e4m3 (QF322FP8_PRE)
+  //   i32 -> i8/u8 (REQ8), f16 (DEQF16), bf16 (QS322BF16_PRE)
+  // The assembler is NOT the authority here: ptoas v0.61 verifies no dtype pair
+  // for an a5 quantized tinsert (a measured `f32 -> f32` assembles cleanly) and
+  // its tstore message even lists f32, yet pto-isa's table has no `f32 -> f32`
+  // entry and returns `QuantMode_t::NoQuant` for it -- silently dropping the
+  // scale on device. Keep this in step with pto-isa, not with ptoas.
+  //
+  // PTOAS 0.65 also emits the typed scaled `TINSERT` call on A5, fixing the
+  // arch-independent overload ambiguity tracked by PTOAS#1570. Enable only the
+  // INT32 -> FP16 Mat path validated for this feature; the wider A5 table below
+  // remains available to Acc->GM without claiming untested Mat combinations.
+  [[nodiscard]] bool SupportsFixpipePreQuant(const DataType& src, const DataType& dst,
+                                             FixpipeDest dest) const override {
+    if (dest == FixpipeDest::kMat) return src == DataType::INT32 && dst == DataType::FP16;
+    const bool dst_is_byte = dst == DataType::INT8 || dst == DataType::UINT8;
+    if (src == DataType::FP32) {
+      return dst_is_byte || dst == DataType::HF8 || dst == DataType::FP16 || dst == DataType::BF16 ||
+             dst == DataType::FP8E4M3FN;
+    }
+    if (src == DataType::INT32) {
+      return dst_is_byte || dst == DataType::FP16 || dst == DataType::BF16;
+    }
+    return false;
+  }
+
   [[nodiscard]] ir::TileView BuildCrossCoreTransferView(ir::MemorySpace dest_ms,
                                                         const ir::TileView& original_view) const override;
 
@@ -81,15 +119,6 @@ class Ascend950Handler : public BackendHandler {
   [[nodiscard]] uint32_t GetL2CacheLineBytes() const override { return 512; }
   [[nodiscard]] uint32_t GetRecommendedInnermostDimBytes() const override { return 128; }
 
-  // L0 capacity (matches Create950SoC AIC core memory layout; grounded in the pto-isa
-  // hardware reference include/pto/common/buffer_limits.hpp under PTO_NPU_ARCH_A5:
-  // L0A/L0B 64 KB, L0C 256 KB (2x a2a3), Mat/CB 512 KB). These are CORRECT for a5 and
-  // are what already make a5 tile differently from a2a3 (bigger accumulator -> bigger
-  // tiles / fewer M/N splits). Only the ROOFLINE CONSTANTS below are still a2a3-derived.
-  [[nodiscard]] uint32_t GetL0aCapacityBytes() const override { return 64ULL * 1024; }
-  [[nodiscard]] uint32_t GetL0bCapacityBytes() const override { return 64ULL * 1024; }
-  [[nodiscard]] uint32_t GetL0cCapacityBytes() const override { return 256ULL * 1024; }
-  [[nodiscard]] uint32_t GetBiasCapacityBytes() const override { return 4ULL * 1024; }
   [[nodiscard]] bool SupportsMatToBiasMove(const DataType& source_dtype,
                                            const DataType& bias_dtype) const override {
     return (source_dtype == DataType::INT32 && bias_dtype == DataType::INT32) ||
@@ -97,7 +126,6 @@ class Ascend950Handler : public BackendHandler {
             (source_dtype == DataType::FP32 || source_dtype == DataType::FP16 ||
              source_dtype == DataType::BF16));
   }
-  [[nodiscard]] uint64_t GetMatCapacityBytes() const override { return 512ULL * 1024; }
 
   // a5 roofline cost-model constants -- FULLY a5-sim-CALIBRATED (all 7; raw work-cycle fit;
   // no a5 device, so a5-sim is the ground truth). Recipe (a5_cost_model_device_task.md): fit
@@ -144,7 +172,7 @@ class Ascend950Handler : public BackendHandler {
   }
 
  private:
-  Ascend950Handler() = default;
+  Ascend950Handler();
 };
 
 }  // namespace backend

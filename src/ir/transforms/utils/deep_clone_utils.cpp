@@ -11,8 +11,10 @@
 
 #include "pypto/ir/transforms/utils/deep_clone_utils.h"
 
+#include <functional>
 #include <memory>
 #include <optional>
+#include <string>
 #include <tuple>
 #include <type_traits>
 #include <unordered_map>
@@ -40,8 +42,9 @@ namespace {
 /// reflection to identify which Var fields are definition sites.
 class DeepCloneMutator : public IRMutator {
  public:
-  explicit DeepCloneMutator(const std::unordered_map<const Var*, ExprPtr>& var_map, bool clone_def_vars)
-      : expr_map_(var_map), clone_def_vars_(clone_def_vars) {
+  explicit DeepCloneMutator(const std::unordered_map<const Var*, ExprPtr>& var_map, bool clone_def_vars,
+                            const std::function<std::string(const std::string&)>& fresh_name)
+      : expr_map_(var_map), clone_def_vars_(clone_def_vars), fresh_name_(fresh_name) {
     seed_keys_.reserve(var_map.size());
     for (const auto& [key, _val] : var_map) {
       seed_keys_.insert(key);
@@ -75,7 +78,7 @@ class DeepCloneMutator : public IRMutator {
   }
 
   StmtPtr VisitStmt_(const ForStmtPtr& op) override {
-    if (clone_def_vars_) PreRegisterDefFields(*op);
+    PreRegisterDefFields(*op);
     return IRMutator::VisitStmt_(op);
   }
 
@@ -85,7 +88,7 @@ class DeepCloneMutator : public IRMutator {
   }
 
   StmtPtr VisitStmt_(const WhileStmtPtr& op) override {
-    if (clone_def_vars_) PreRegisterDefFields(*op);
+    PreRegisterDefFields(*op);
     return IRMutator::VisitStmt_(op);
   }
 
@@ -99,20 +102,10 @@ class DeepCloneMutator : public IRMutator {
   }
 
   ExprPtr VisitExpr_(const IterArgPtr& op) override {
-    auto it = expr_map_.find(op.get());
-    if (it != expr_map_.end()) {
-      return it->second;
-    }
-    // Create fresh IterArg with cloned initValue_ and a remapped type — the
-    // type may embed expressions (shape dims, TileView/TensorView fields,
-    // MemRef byte_offset) that reference Vars in expr_map_.
-    INTERNAL_CHECK_SPAN(op->initValue_, op->span_) << "IterArg has null initValue";
-    auto new_init = IRMutator::VisitExpr(op->initValue_);
-    auto new_type = RemapType(op->GetType());
-    auto fresh =
-        std::make_shared<IterArg>(op->name_hint_, std::move(new_type), std::move(new_init), op->span_);
-    expr_map_[op.get()] = fresh;
-    return fresh;
+    // A use of an enclosing loop's carry is external to this subtree, just
+    // like an external Var. Cloning it here would create an unbound identity.
+    // Local carries are registered at their loop's DefField before any uses.
+    return VisitExpr_(std::static_pointer_cast<const Var>(op));
   }
 
   ExprPtr VisitExpr_(const MemRefPtr& op) override {
@@ -178,6 +171,7 @@ class DeepCloneMutator : public IRMutator {
   /// embedded MemRef's byte_offset are substituted via expr_map_ — otherwise
   /// the fresh Var's type would still reference the caller's old Var pointers.
   void CloneVar(const VarPtr& op) {
+    if (!clone_def_vars_) return;
     if (expr_map_.count(op.get())) return;  // Already mapped (e.g. pre-seeded)
     // Check if the actual runtime type is MemRef / WindowBuffer — don't create a
     // plain Var for those; their dedicated VisitExpr_ overloads handle cloning.
@@ -185,8 +179,21 @@ class DeepCloneMutator : public IRMutator {
       return;
     }
     auto new_type = RemapType(op->GetType());
-    auto fresh = std::make_shared<Var>(op->name_hint_, std::move(new_type), op->span_);
+    auto name = fresh_name_ ? fresh_name_(op->name_hint_) : op->name_hint_;
+    auto fresh = std::make_shared<Var>(std::move(name), std::move(new_type), op->span_);
     expr_map_[op.get()] = fresh;
+  }
+
+  /// Clone a carry only at its definition, remapping its seed and type in the
+  /// enclosing scope. Even pre-SSA cloning (clone_def_vars=false) must remap
+  /// local loop seeds when an enclosing unrolled index is substituted.
+  void CloneIterArg(const IterArgPtr& op) {
+    if (expr_map_.count(op.get())) return;
+    INTERNAL_CHECK_SPAN(op->initValue_, op->span_) << "IterArg has null initValue";
+    auto new_init = IRMutator::VisitExpr(op->initValue_);
+    auto new_type = RemapType(op->GetType());
+    expr_map_[op.get()] =
+        std::make_shared<IterArg>(op->name_hint_, std::move(new_type), std::move(new_init), op->span_);
   }
 
   /// Remap expressions inside a TypePtr (shape, TileView/TensorView fields, MemRef).
@@ -225,8 +232,8 @@ class DeepCloneMutator : public IRMutator {
                                             [this](const ExprPtr& e) { return IRMutator::VisitExpr(e); });
   }
 
-  /// Use GetFieldDescriptors to find DefField VarPtr/vector<VarPtr> entries
-  /// and pre-register fresh copies in expr_map_.
+  /// Use GetFieldDescriptors to find DefField VarPtr, vector<VarPtr>, and
+  /// vector<IterArgPtr> entries and pre-register their clones in expr_map_.
   template <typename StmtType>
   void PreRegisterDefFields(const StmtType& stmt) {
     constexpr auto descriptors = StmtType::GetFieldDescriptors();
@@ -247,8 +254,11 @@ class DeepCloneMutator : public IRMutator {
       for (const auto& var : desc.Get(stmt)) {
         if (var) CloneVar(var);
       }
+    } else if constexpr (std::is_same_v<FieldType, std::vector<IterArgPtr>>) {
+      for (const auto& arg : desc.Get(stmt)) {
+        if (arg) CloneIterArg(arg);
+      }
     }
-    // IterArgPtr and vector<IterArgPtr> DefFields are handled by VisitExpr_(IterArgPtr)
   }
 
   std::unordered_map<const Var*, ExprPtr> expr_map_;
@@ -256,13 +266,15 @@ class DeepCloneMutator : public IRMutator {
   /// so only entries created by the clone traversal are returned.
   std::unordered_set<const Var*> seed_keys_;
   bool clone_def_vars_;
+  std::function<std::string(const std::string&)> fresh_name_;
 };
 
 }  // namespace
 
 DeepCloneResult DeepClone(const StmtPtr& body, const std::unordered_map<const Var*, ExprPtr>& var_map,
-                          bool clone_def_vars) {
-  DeepCloneMutator mutator(var_map, clone_def_vars);
+                          bool clone_def_vars,
+                          const std::function<std::string(const std::string&)>& fresh_name) {
+  DeepCloneMutator mutator(var_map, clone_def_vars, fresh_name);
   auto cloned = mutator.VisitStmt(body);
   return {cloned, mutator.GetVarMap()};
 }

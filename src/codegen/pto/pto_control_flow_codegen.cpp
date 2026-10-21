@@ -224,16 +224,16 @@ void PTOCodegen::VisitStmt_(const IfStmtPtr& op) {
   if (op->return_vars_.empty()) {
     // Simple scf.if (no return values)
     EmitStructural("scf.if " + condition + " {");
-    indent_level_++;
+    IncreaseIndent();
     VisitStmt(op->then_body_);
-    indent_level_--;
+    DecreaseIndent();
 
     const auto& else_body = op->else_body_;
     if (else_body) {
       EmitStructural("} else {");
-      indent_level_++;
+      IncreaseIndent();
       VisitStmt(*else_body);
-      indent_level_--;
+      DecreaseIndent();
     }
     EmitStructural("}");
   } else {
@@ -246,6 +246,8 @@ void PTOCodegen::VisitStmt_(const IfStmtPtr& op) {
     std::vector<std::string> scf_return_names;
     std::vector<std::string> scf_return_types;
     std::vector<std::pair<std::string, AllocTileFields>> deferred_tile_valid_shapes;
+    const auto then_yield = FindBranchYield(op->then_body_);
+    const auto else_yield = op->else_body_ ? FindBranchYield(*op->else_body_) : nullptr;
 
     for (size_t i = 0; i < op->return_vars_.size(); ++i) {
       const auto& return_var = op->return_vars_[i];
@@ -285,7 +287,12 @@ void PTOCodegen::VisitStmt_(const IfStmtPtr& op) {
         // branch producers write the phi handle (they are re-bound to it below,
         // fix #1956) while the loop result and every post-if read still resolve
         // to the shared one, which no branch ever wrote.
-        std::string ret_name = TryGetSharedTileBufHandle(ir::GetDefinedMemRef(tile_type));
+        const auto then_value =
+            then_yield && i < then_yield->value_.size() ? ir::AsVarLike(then_yield->value_[i]) : nullptr;
+        const auto else_value =
+            else_yield && i < else_yield->value_.size() ? ir::AsVarLike(else_yield->value_[i]) : nullptr;
+        std::string ret_name =
+            TryGetSharedTileBufHandle(tile_type, alloc_fields.type_str, then_value, else_value);
         if (!ret_name.empty()) {
           // The shared handle must dominate both branches and the post-if read.
           // Hoist its declaration to the function head unless the body already
@@ -294,11 +301,16 @@ void PTOCodegen::VisitStmt_(const IfStmtPtr& op) {
         } else {
           ret_name = AllocNewTileBuf(alloc_fields.type_str, return_var->name_hint_, alloc_fields.addr_ssa,
                                      alloc_fields.valid_row_ssa, alloc_fields.valid_col_ssa);
+          RegisterTileBufType(ret_name, alloc_fields.type_str, tile_type);
           // This head-declared handle is the phi buffer. Under PTOAS the branch
           // producers are re-bound to it (see emit_branch, fix #1956); mark it
           // emitted so their EmitAllocTileForVar dedups instead of re-declaring it.
           if (!emit_tile_addr_) fs_.emitted_tile_alloc_names.insert(ret_name);
         }
+        // Prepare before entering either branch: a phi destination view must
+        // dominate branch writes as well as reads after this scf.if. Branch
+        // producers and the synthetic tmov below share this exact target.
+        ret_name = PrepareTileDestination(return_var, ret_name, "if result").name;
         BindVarToMlir(return_var, ret_name);
         if (has_dynamic_valid_shape) {
           deferred_tile_valid_shapes.emplace_back(ret_name, std::move(logical_fields));
@@ -334,7 +346,7 @@ void PTOCodegen::VisitStmt_(const IfStmtPtr& op) {
     } else {
       EmitStructural("scf.if " + condition + " {");
     }
-    indent_level_++;
+    IncreaseIndent();
 
     // For in-place return vars (ArrayType and TensorType, both kept out of
     // scf.if results), capture the backing SSA that the branches yield so it can
@@ -471,15 +483,15 @@ void PTOCodegen::VisitStmt_(const IfStmtPtr& op) {
     };
 
     emit_branch(op->then_body_, "then");
-    indent_level_--;
+    DecreaseIndent();
 
     EmitStructural("} else {");
-    indent_level_++;
+    IncreaseIndent();
     const auto& else_body = op->else_body_;
     INTERNAL_CHECK_SPAN(else_body.has_value(), op->span_)
         << "Internal error: IfStmt with return_vars has no else_body";
     emit_branch(*else_body, "else");
-    indent_level_--;
+    DecreaseIndent();
     EmitStructural("}");
 
     // Bind in-place return vars (array / tensor) to the shared backing SSA both
@@ -648,13 +660,13 @@ void PTOCodegen::VisitStmt_(const ForStmtPtr& op) {
   if (!has_scalar_iter_args) {
     // Simple scf.for (no iter_args, or all iter_args are non-scalar)
     EmitStructural("scf.for " + loop_var_name + " = " + start + " to " + stop + " step " + step + " {");
-    indent_level_++;
+    IncreaseIndent();
 
     fs_.yield_buffer.clear();
     VisitStmt(op->body_);
     fs_.yield_buffer.clear();
 
-    indent_level_--;
+    DecreaseIndent();
     EmitStructural("}");
   } else {
     // scf.for with scalar iter_args only
@@ -692,7 +704,7 @@ void PTOCodegen::VisitStmt_(const ForStmtPtr& op) {
     EmitStructural(JoinCommaSep(return_var_names) + " = scf.for " + loop_var_name + " = " + start + " to " +
                    stop + " step " + step + " iter_args(" + JoinPairs(iter_arg_names, " = ", init_values) +
                    ") -> (" + JoinCommaSep(iter_arg_types) + ") {");
-    indent_level_++;
+    IncreaseIndent();
 
     fs_.yield_buffer.clear();
     VisitStmt(op->body_);
@@ -725,7 +737,7 @@ void PTOCodegen::VisitStmt_(const ForStmtPtr& op) {
         << iter_arg_types.size() << ")";
     fs_.yield_buffer.clear();
 
-    indent_level_--;
+    DecreaseIndent();
     EmitStructural("}");
   }
 }
@@ -798,16 +810,16 @@ void PTOCodegen::VisitStmt_(const WhileStmtPtr& op) {
   if (!has_scalar_iter_args) {
     // Simple scf.while (no iter_args, or all iter_args are non-scalar)
     EmitStructural("scf.while : () -> () {");
-    indent_level_++;
+    IncreaseIndent();
 
     VisitExpr(op->condition_);
     std::string cond = fs_.current_expr_value;
     fs_.current_expr_value = "";
     Emit("scf.condition(" + cond + ")");
 
-    indent_level_--;
+    DecreaseIndent();
     EmitStructural("} do {");
-    indent_level_++;
+    IncreaseIndent();
 
     fs_.yield_buffer.clear();
     VisitStmt(op->body_);
@@ -815,7 +827,7 @@ void PTOCodegen::VisitStmt_(const WhileStmtPtr& op) {
     Emit("scf.yield");
     fs_.yield_buffer.clear();
 
-    indent_level_--;
+    DecreaseIndent();
     EmitStructural("}");
   } else {
     // scf.while with scalar iter_args only
@@ -865,7 +877,7 @@ void PTOCodegen::VisitStmt_(const WhileStmtPtr& op) {
     EmitStructural(JoinCommaSep(return_var_names) + " = scf.while (" +
                    JoinPairs(before_arg_names, " = ", init_values) + ") : " + types_str + " -> " + types_str +
                    " {");
-    indent_level_++;
+    IncreaseIndent();
 
     // Before region: register before-region args, evaluate condition
     register_scalar_iter_args(before_arg_names);
@@ -878,12 +890,12 @@ void PTOCodegen::VisitStmt_(const WhileStmtPtr& op) {
     Emit("scf.condition(" + cond + ") " + JoinCommaSep(before_arg_names) + " : " +
          JoinCommaSep(iter_arg_types));
 
-    indent_level_--;
+    DecreaseIndent();
     EmitStructural("} do {");
 
     // After region: emit ^bb0 block header with typed arguments
     EmitStructural("^bb0(" + JoinPairs(after_arg_names, " : ", iter_arg_types) + "):");
-    indent_level_++;
+    IncreaseIndent();
 
     // Re-register iter_args with after-region SSA names
     register_scalar_iter_args(after_arg_names);
@@ -909,7 +921,7 @@ void PTOCodegen::VisitStmt_(const WhileStmtPtr& op) {
         << iter_arg_types.size() << ")";
     fs_.yield_buffer.clear();
 
-    indent_level_--;
+    DecreaseIndent();
     EmitStructural("}");
   }
 }

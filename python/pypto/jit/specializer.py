@@ -42,7 +42,7 @@ import inspect
 import textwrap
 import types
 import warnings
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -135,8 +135,15 @@ class SpecializeContext:
         level: pl.Level value or None.
         param_names: Ordered parameter names (excluding 'self').
         tensor_meta: TensorMeta per tensor param name.
-        scalar_values: Concrete value per scalar param name.
-        scalar_dtypes: DataType annotation per scalar param name.
+        scalar_dtypes: DataType annotation per scalar param name. A scalar
+            parameter is a runtime value: it survives into the generated
+            program as a real ``pl.Scalar`` parameter and is never folded, so
+            only its type is carried here.
+        constexpr_values: ``pl.constexpr`` param name → the generated-source
+            text its call-site value folds to. These are the opposite of a
+            scalar: every use is replaced by that text and the parameter is
+            dropped from the generated signature, so it reaches neither the IR
+            nor the dispatch ABI.
         dep_names: Names this function's source calls its deps by. Under an
             aliased import (``from mod import kernel as kern``) that is the
             alias, not the callee's ``__name__`` — see ``dep_func_names``.
@@ -144,6 +151,9 @@ class SpecializeContext:
             call name that differs from the function it resolves to. The body
             transformer consults it when rewriting ``kern(...)`` into
             ``self.kernel(...)``; an absent entry means the two agree.
+        dep_call_variants: ``(call name, ordinal) -> generated function name``,
+            consulted before ``dep_func_names`` so two call sites of one name
+            can reach different generated functions. See the field comment.
         py_globals: A snapshot of the originating function's globals and closure
             bindings. During JIT compilation this is the same namespace used
             for cache-key construction and annotation resolution. The specializer
@@ -170,10 +180,9 @@ class SpecializeContext:
     level: Any
     param_names: list[str]
     tensor_meta: dict[str, TensorMeta]
-    scalar_values: dict[str, int | float | bool]
     scalar_dtypes: dict[str, DataType]
-    dep_names: list[str] = field(default_factory=list)
-    py_globals: Mapping[str, Any] = field(default_factory=dict)
+    dep_names: list[str] = field(default_factory=list[str])
+    py_globals: Mapping[str, Any] = field(default_factory=dict[str, Any])
     orig_file: str | None = None
     orig_start_line: int = 1
     orig_col_offset: int = 0
@@ -192,13 +201,24 @@ class SpecializeContext:
     external_include_dirs: tuple[str, ...] = ()
     # Also appended at the tail (see above): ``call name -> generated function
     # name`` for the deps this function reaches under a different name.
-    dep_func_names: dict[str, str] = field(default_factory=dict)
+    dep_func_names: dict[str, str] = field(default_factory=dict[str, str])
     # Name of the ``def`` inside ``source`` — the Python ``__name__``. It differs
     # from ``func_name`` whenever the JIT layer had to uniquify the generated
     # name (two deps sharing a ``__name__``). Anything that looks the definition
     # up in the *original* source must use ``source_def_name``; anything naming
     # the *generated* function uses ``func_name``.
     source_func_name: str | None = None
+    # Also appended at the tail (see above): ``pl.constexpr`` param name -> the
+    # generated-source text its call-site value folds to.
+    constexpr_values: dict[str, str] = field(default_factory=dict[str, str])
+    # Also appended at the tail (see above): ``(call name, ordinal) -> generated
+    # function name``, where the ordinal is the call's position among
+    # same-named calls in source order. A dep called at two different
+    # ``pl.constexpr`` values is compiled once per value, so the two call sites
+    # resolve to different generated functions and the call name alone no
+    # longer identifies the callee. Empty when every call site of a name
+    # reaches the same function, which ``dep_func_names`` already covers.
+    dep_call_variants: dict[tuple[str, int], str] = field(default_factory=dict[tuple[str, int], str])
 
     @property
     def source_def_name(self) -> str:
@@ -278,49 +298,51 @@ def func_name_lookup(func: Any) -> Mapping[str, Any]:
 
 @functools.lru_cache(maxsize=1)
 def _pl_symbol_index() -> tuple[dict[int, str], dict[Any, str]]:
-    """``pl``'s public namespace, indexed for rendering a value back to source.
+    """Index public ``pl`` and ``pld`` values by their canonical source paths.
 
-    Returns ``(enum_classes, values)``: ``id(EnumClass) -> "Mem"`` for every enum
-    type ``pl`` exports (members render as ``pl.Mem.Vec``), and ``value ->
-    "pl.INT8"`` for every exported singleton that is not an enum member -- in
-    practice the ``DataType`` constants. Names are visited in sorted order and
-    the first wins, so an alias pair resolves deterministically to the shorter
-    spelling (``pl.Mem``, not ``pl.MemorySpace``) -- the same one the IR printer
-    emits, which keeps generated and round-tripped source consistent.
+    Returns ``(enum_classes, values)``: ``id(EnumClass) -> "pl.Mem"`` for
+    exported enum types, and ``value -> "pl.INT8"`` for exported singletons
+    (in practice the ``DataType`` constants). Visit ``pl`` first to preserve
+    existing spellings for shared exports such as ``AtomicType``. Within each
+    namespace, sorted names make alias selection deterministic (``pl.Mem``
+    precedes ``pl.MemorySpace``), matching the IR printer.
 
     Callables, classes and modules are excluded: a body naming one is not naming
     a *value* the DSL can consume, and folding it would only turn a clear
     "undefined name" into a confusing type error further in.
     """
     import pypto.language as pl  # noqa: PLC0415 — avoids a circular import at module load
+    from pypto.language import distributed as pld  # noqa: PLC0415 — same circular import
 
     enum_classes: dict[int, str] = {}
     values: dict[Any, str] = {}
-    for attr in sorted(dir(pl)):
-        if attr.startswith("_"):
-            continue
-        value = getattr(pl, attr, None)
-        if isinstance(value, type):
-            if issubclass(value, enum.Enum):
-                enum_classes.setdefault(id(value), attr)
-            continue
-        # Enum members go through their class (above); literals render as
-        # literals; callables and modules are not values.
-        if isinstance(value, (enum.Enum, types.ModuleType, bool, int, float, str)) or callable(value):
-            continue
-        try:
-            values.setdefault(value, f"pl.{attr}")
-        except TypeError:
-            continue  # unhashable — not reachable by value lookup
+    for prefix, namespace in (("pl", pl), ("pld", pld)):
+        for attr in sorted(dir(namespace)):
+            if attr.startswith("_"):
+                continue
+            value = getattr(namespace, attr, None)
+            path = f"{prefix}.{attr}"
+            if isinstance(value, type):
+                if issubclass(value, enum.Enum):
+                    enum_classes.setdefault(id(value), path)
+                continue
+            # Enum members go through their class (above); literals render as
+            # literals; callables and modules are not values.
+            if isinstance(value, (enum.Enum, types.ModuleType, bool, int, float, str)) or callable(value):
+                continue
+            try:
+                values.setdefault(value, path)
+            except TypeError:
+                continue  # unhashable — not reachable by value lookup
     return enum_classes, values
 
 
 def _pl_symbol_path(value: Any) -> str | None:
-    """The ``pl.`` path that evaluates to ``value``, or None if there is none."""
+    """The ``pl.`` or ``pld.`` path that evaluates to ``value``, or None."""
     enum_classes, values = _pl_symbol_index()
     if isinstance(value, enum.Enum):
-        cls_name = enum_classes.get(id(type(value)))
-        return f"pl.{cls_name}.{value.name}" if cls_name else None
+        cls_path = enum_classes.get(id(type(value)))
+        return f"{cls_path}.{value.name}" if cls_path else None
     try:
         return values.get(value)
     except TypeError:
@@ -331,8 +353,8 @@ def _render_free_value(value: Any) -> ast.expr | None:
     """Render ``value`` as generated-source AST, or None when it cannot be written.
 
     Covers what a DSL body actually passes to an operator: literals, the ``pl``
-    enum and ``DataType`` constants, and (possibly nested) lists/tuples of those
-    -- a shape held in a module constant, for instance. A sequence renders only
+    and ``pld`` enum and ``DataType`` constants, and (possibly nested) lists/tuples
+    of those -- a shape held in a module constant, for instance. A sequence renders only
     when every element does, so a half-rendered list can never reach the parser.
     """
     if isinstance(value, type):
@@ -348,7 +370,7 @@ def _render_free_value(value: Any) -> ast.expr | None:
         # that predates this function.
         return ast.Constant(value=value)
     if isinstance(value, (list, tuple)):
-        elements = [_render_free_value(element) for element in value]
+        elements = [_render_free_value(element) for element in cast("Sequence[Any]", value)]
         if any(element is None for element in elements):
             return None
         rendered = cast("list[ast.expr]", elements)
@@ -371,6 +393,72 @@ def _bind_free_name(name: str, py_globals: Mapping[str, Any]) -> ast.expr | None
     if value is _UNBOUND:
         return None
     return _render_free_value(value)
+
+
+def _reject_constexpr_rebinding(func_def: ast.FunctionDef, ctx: SpecializeContext) -> None:
+    """Refuse a body that assigns to one of its own ``pl.constexpr`` parameters.
+
+    The name is folded to its call-site value at every load, so an assignment to
+    it cannot take effect: later reads would keep returning the original
+    constant while the assignment itself leaked into the generated body as a
+    stray runtime local. Silently compiling the wrong extent is the worst
+    outcome available here, so the rebind is rejected instead.
+
+    Only ``Store`` occurrences bind. A target can *read* names too —
+    ``out[0:BLOCK] = tile`` stores through a subscript whose slice loads
+    ``BLOCK`` — and rejecting those would refuse the most natural use of a
+    compile-time extent while the same statement written with a literal
+    compiles.
+
+    Raises:
+        ValueError: naming the parameter and the alternatives.
+    """
+    if not ctx.constexpr_values:
+        return
+    for node in ast.walk(func_def):
+        targets: list[ast.expr] = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+            targets = [node.target]
+        elif isinstance(node, ast.For):
+            targets = [node.target]
+        for target in targets:
+            for leaf in ast.walk(target):
+                if (
+                    isinstance(leaf, ast.Name)
+                    and isinstance(leaf.ctx, ast.Store)
+                    and leaf.id in ctx.constexpr_values
+                ):
+                    raise ValueError(
+                        f"@pl.jit function '{ctx.source_def_name}': '{leaf.id}' is a "
+                        f"'pl.constexpr' parameter, so it is a compile-time constant and cannot "
+                        f"be assigned to. Compute the derived value where it is used "
+                        f"(e.g. '[{leaf.id} // 2, {leaf.id}]'), bind it to a different local "
+                        f"name, or annotate '{leaf.id}' as 'pl.Scalar[dtype]' if it should be a "
+                        f"runtime value."
+                    )
+
+
+def constant_source(value: Any) -> str | None:
+    """The generated-source text ``value`` folds to, or None when it does not fold.
+
+    The value-keyed sibling of :func:`free_name_source`, for a constant the call
+    site supplies directly rather than binds to a name — a ``pl.constexpr``
+    argument. Sharing :func:`_render_free_value` is the point: a constexpr
+    parameter folds by exactly the rule a module-level constant follows, so the
+    two can never admit different value types.
+    """
+    rendered = _render_free_value(value)
+    return None if rendered is None else ast.unparse(rendered)
+
+
+def constant_expr(value: Any, node: ast.expr) -> ast.expr | None:
+    """:func:`constant_source` as AST, positioned at ``node`` so spans survive."""
+    rendered = _render_free_value(value)
+    if rendered is None:
+        return None
+    return ast.fix_missing_locations(ast.copy_location(rendered, node))
 
 
 def free_name_source(name: str, py_globals: Mapping[str, Any]) -> str | None:
@@ -400,6 +488,7 @@ def _fold_free_name(name: str, py_globals: Mapping[str, Any], node: ast.expr) ->
 
 _DTYPE_TO_PL: dict[DataType, str] = {
     DataType.FP4: "pl.FP4",
+    DataType.FP4E2M1X2: "pl.FP4E2M1X2",
     DataType.FP8E4M3FN: "pl.FP8E4M3FN",
     DataType.FP8E5M2: "pl.FP8E5M2",
     DataType.FP8E8M0: "pl.FP8E8M0",
@@ -481,7 +570,9 @@ def _array_dtype_str(dt: DataType) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _collect_dynamic_dims(
+# Cross-module private helper: production (jit/decorator.py) and the test suite
+# reach it by underscore import; pyright's unused analysis discounts those.
+def _collect_dynamic_dims(  # pyright: ignore[reportUnusedFunction]
     func_def: ast.FunctionDef,
     param_names: set[str],
 ) -> set[tuple[str, int]]:
@@ -512,7 +603,41 @@ def _collect_dynamic_dims(
     return result
 
 
-def _collect_dynvar_names(func_def: ast.FunctionDef) -> dict[str, str]:
+def _resolve_dep_call_targets(
+    func_def: ast.FunctionDef,
+    dep_names: set[str],
+    per_site: Mapping[tuple[str, int], str],
+) -> dict[int, str]:
+    """Map ``id(call node)`` → the generated function that call site reaches.
+
+    The JIT layer folds each dep call site's ``pl.constexpr`` arguments
+    separately, so two calls to one name can be compiled against different
+    constants and must be rewritten to different generated functions. It cannot
+    hand over the call nodes themselves — it parsed its own copy of the source
+    — so it keys its answer by ``(call name, ordinal)``, the call's position
+    among same-named calls in source order. Both sides enumerate ``ast.walk``
+    matches sorted by position over the same dedented source, so the Nth call
+    of a name means the same call in both. See ``_dep_call_nodes`` in
+    ``decorator.py``; this resolves that answer back onto local nodes.
+    """
+    by_name: dict[str, list[ast.Call]] = {}
+    for node in ast.walk(func_def):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in dep_names:
+            by_name.setdefault(node.func.id, []).append(node)
+    targets: dict[int, str] = {}
+    for name, calls in by_name.items():
+        for index, call in enumerate(sorted(calls, key=lambda call: (call.lineno, call.col_offset))):
+            generated = per_site.get((name, index))
+            if generated is not None:
+                targets[id(call)] = generated
+    return targets
+
+
+# Cross-module private helper: production (jit/decorator.py) and the test suite
+# reach it by underscore import; pyright's unused analysis discounts those.
+def _collect_dynvar_names(  # pyright: ignore[reportUnusedFunction]
+    func_def: ast.FunctionDef,
+) -> dict[str, str]:
     """Collect dynvar assignments from pl.dynamic(...) calls in the function body.
 
     Returns a dict mapping Python variable name → string literal passed to
@@ -546,7 +671,9 @@ def _collect_dynvar_names(func_def: ast.FunctionDef) -> dict[str, str]:
     return result
 
 
-def _collect_annotation_dynamic_dims(
+# Cross-module private helper: production (jit/decorator.py) and the test suite
+# reach it by underscore import; pyright's unused analysis discounts those.
+def _collect_annotation_dynamic_dims(  # pyright: ignore[reportUnusedFunction]
     func: Any,
     param_names: set[str],
 ) -> tuple[set[tuple[str, int]], dict[str, str], dict[str, str]]:
@@ -695,23 +822,32 @@ class _BodyTransformer(ast.NodeTransformer):
     def __init__(
         self,
         tensor_meta: dict[str, TensorMeta],
-        scalar_values: dict[str, int | float | bool],
         dep_names: set[str],
         param_names: list[str] | None = None,
         initial_used_names: set[str] | None = None,
         py_globals: Mapping[str, Any] | None = None,
         dep_param_names: dict[str, list[str]] | None = None,
         dep_func_names: dict[str, str] | None = None,
+        constexpr_values: Mapping[str, str] | None = None,
+        dep_constexpr_params: dict[str, set[str]] | None = None,
+        dep_call_targets: Mapping[int, str] | None = None,
     ) -> None:
         super().__init__()
         self._meta = tensor_meta
-        self._scalars = scalar_values
+        self._constexpr = dict(constexpr_values or {})
+        self._dep_constexpr_params = dep_constexpr_params or {}
         self._dep_names = dep_names
         # Call name → generated function name, for deps this body reaches
         # under a different name (an aliased import). ``visit_Call`` resolves
         # through it so ``kern(...)`` becomes ``self.kernel(...)``; a name
         # absent from the map is its own generated name.
         self._dep_func_names = dep_func_names or {}
+        # ``id(call node) → generated function name``. Consulted first, so two
+        # call sites of one name that were compiled against different
+        # ``pl.constexpr`` values reach their own generated function instead of
+        # both resolving to whichever one the name happens to map to. Empty
+        # unless some name really does reach more than one function.
+        self._dep_call_targets = dict(dep_call_targets or {})
         # DynVar name → (anchor_param, anchor_dim_idx). ``visit_Name`` uses
         # this to rewrite runtime references like ``pl.create_tensor([M, ...])``
         # via ``_dyn_dim_expr`` so the annotation-only DynVar doesn't leak past
@@ -1003,14 +1139,28 @@ class _BodyTransformer(ast.NodeTransformer):
     # ------------------------------------------------------------------
 
     def visit_Name(self, node: ast.Name) -> ast.expr:
-        """Replace scalar param references, inlined shape constants, renamed rebindings,
-        DynVar runtime references, and free names bound to renderable values."""
+        """Replace inlined shape constants, renamed rebindings, DynVar runtime
+        references, and free names bound to renderable values.
+
+        Scalar *parameters* are deliberately not replaced: they are runtime
+        values and must survive as real ``pl.Scalar`` parameters. A body that
+        needs a compile-time constant either declares a ``pl.constexpr``
+        parameter (folded below) or reads a module-level or closure name (folded
+        by the free-name rule further down) — the two share one renderer, so
+        they admit exactly the same values.
+        """
         if isinstance(node.ctx, ast.Load):
             # Check active renames first — a rebinding supersedes any earlier inlining.
             if node.id in self._var_renames:
                 return ast.Name(id=self._var_renames[node.id], ctx=ast.Load())
-            if node.id in self._scalars:
-                return ast.Constant(value=self._scalars[node.id])
+            # A constexpr parameter folds to its call-site value. This must
+            # precede the ``_used_names`` guard below: a parameter is always a
+            # local, so that guard would skip it and the name would survive into
+            # the generated source as an undefined free variable.
+            constexpr_text = self._constexpr.get(node.id)
+            if constexpr_text is not None:
+                folded = ast.parse(constexpr_text, mode="eval").body
+                return ast.fix_missing_locations(ast.copy_location(folded, node))
             if node.id in self._shape_inlined:
                 return ast.Constant(value=self._shape_inlined[node.id])
             # DynVar runtime references — e.g. pl.create_tensor([M, HIDDEN], ...).
@@ -1071,7 +1221,11 @@ class _BodyTransformer(ast.NodeTransformer):
 
         The attribute is the dep's *generated* function name, which differs
         from the name at the call site when the body reaches the dep through
-        an aliased import (``kern(...)`` → ``self.kernel(...)``).
+        an aliased import (``kern(...)`` → ``self.kernel(...)``) and when this
+        site's ``pl.constexpr`` values select one of several compilations of
+        the same dep (``helper(x, 16)`` → ``self.helper(...)`` while
+        ``helper(x, 32)`` → ``self.helper__2(...)``). The per-site map is
+        consulted first for exactly that reason.
 
         Keyword args are normalised to positional based on the dep's
         parameter order (so ``dep(a, out=out)`` becomes ``self.dep(a, out)``).
@@ -1079,14 +1233,17 @@ class _BodyTransformer(ast.NodeTransformer):
         args — preserving keyword form would make the parser reject the call.
         """
         if isinstance(node.func, ast.Name) and node.func.id in self._dep_names:
-            dep_name = self._dep_func_names.get(node.func.id, node.func.id)
+            dep_name = self._dep_call_targets.get(
+                id(node), self._dep_func_names.get(node.func.id, node.func.id)
+            )
             new_func = ast.Attribute(
                 value=ast.Name(id="self", ctx=ast.Load()),
                 attr=dep_name,
                 ctx=ast.Load(),
             )
             param_order = self._dep_param_names.get(dep_name)
-            if param_order is not None and node.keywords:
+            constexpr_params = self._dep_constexpr_params.get(dep_name, set())
+            if param_order is not None and (node.keywords or constexpr_params):
                 pos_args = list(node.args)
                 kw_by_name = {kw.arg: kw.value for kw in node.keywords if kw.arg is not None}
                 # Append keyword-bound args in dep's parameter order, skipping
@@ -1098,6 +1255,19 @@ class _BodyTransformer(ast.NodeTransformer):
                 # are kept as-is so we don't silently drop them; the parser
                 # will surface them as a clear error.
                 remaining_kw = [kw for kw in node.keywords if kw.arg is None or kw.arg in kw_by_name]
+                if constexpr_params:
+                    # Drop the callee's compile-time arguments. It resolved them
+                    # during specialization and its generated signature no longer
+                    # declares them, so passing one would be an arity mismatch.
+                    # Filter by position against the *declared* order, which still
+                    # includes them; anything beyond it is left alone for the
+                    # parser to report.
+                    pos_args = [
+                        arg
+                        for index, arg in enumerate(pos_args)
+                        if index >= len(param_order) or param_order[index] not in constexpr_params
+                    ]
+                    remaining_kw = [kw for kw in remaining_kw if kw.arg not in constexpr_params]
                 new_node = ast.Call(func=new_func, args=pos_args, keywords=remaining_kw)
             else:
                 new_node = ast.Call(func=new_func, args=node.args, keywords=node.keywords)
@@ -1113,7 +1283,7 @@ class _BodyTransformer(ast.NodeTransformer):
             if visited is None:
                 pass
             elif isinstance(visited, list):
-                result.extend(visited)
+                result.extend(cast("list[ast.stmt]", visited))
             else:
                 result.append(visited)
         return result or [ast.Pass()]
@@ -1366,8 +1536,8 @@ def _fold_const_names(node: ast.expr, py_globals: Mapping[str, Any]) -> ast.expr
     """
 
     class _Folder(ast.NodeTransformer):
-        def visit_Name(self, name: ast.Name) -> ast.expr:
-            return _fold_free_name(name.id, py_globals, name) or name
+        def visit_Name(self, node: ast.Name) -> ast.expr:
+            return _fold_free_name(node.id, py_globals, node) or node
 
     return _Folder().visit(copy.deepcopy(node))
 
@@ -1636,6 +1806,38 @@ def _is_tuple_annotation(node: ast.expr) -> bool:
     return False
 
 
+def _eval_annotation(source: str, ann_globals: Mapping[str, Any]) -> Any:
+    """Evaluate annotation source in its builtins-free namespace; None when it does not evaluate.
+
+    Trusted input — the kernel's own annotation, evaluated where it was written
+    with builtins stripped, so only type construction can run.
+    """
+    try:
+        return eval(source, dict(ann_globals))  # noqa: S307
+    except Exception:  # noqa: BLE001 — best effort; the caller keeps the annotation as written
+        return None
+
+
+def _scalar_dtype_source(dtype_text: str, ann_globals: Mapping[str, Any]) -> str:
+    """The ``pl.<NAME>`` a scalar annotation's dtype evaluates to, else ``dtype_text``.
+
+    A scalar's dtype may be spelled through a module or closure constant
+    (``n: pl.Scalar[IDX]``). The generated module binds only ``pl`` and ``pld``,
+    so the spelling itself would be undefined there.
+
+    Args:
+        dtype_text: The dtype as written in the annotation
+        ann_globals: The function's builtins-free annotation namespace
+
+    Returns:
+        The rendered dtype, or ``dtype_text`` unchanged when it does not
+        evaluate to a ``DataType``
+    """
+    value = _eval_annotation(dtype_text, ann_globals)
+    rendered = constant_source(value) if isinstance(value, DataType) else None
+    return dtype_text if rendered is None else rendered
+
+
 def _extract_bare_dtype(node: ast.expr) -> str | None:
     """If node is a bare dtype like pl.FP32 or INDEX, return its string."""
     if isinstance(node, ast.Name) and node.id in _DTYPE_NAMES:
@@ -1733,6 +1935,12 @@ class Specializer:
         self._dep_param_names: dict[str, list[str]] = {
             ctx.func_name: list(ctx.param_names) for ctx in contexts
         }
+        # Constexpr params per function. ``visit_Call`` drops their arguments
+        # when rewriting a call: the callee resolved them at compile time and no
+        # longer declares them, so passing one would be an arity mismatch.
+        self._dep_constexpr_params: dict[str, set[str]] = {
+            ctx.func_name: set(ctx.constexpr_values) for ctx in contexts
+        }
         # generated-program absolute line → (orig_file, orig_line, orig_col),
         # built by specialize() so diagnostics map back to the user's .py (#1612).
         self._source_map: dict[int, tuple[str, int, int]] = {}
@@ -1741,7 +1949,7 @@ class Specializer:
         # synthesized statements read as (0, 0), and zipped against the reparsed
         # generated statements in _build_source_map after assembly.
         self._fn_origin: list[tuple[SpecializeContext, list[tuple[int, int]]]] = []
-        # Set by _build_params when any param uses pld.DistributedTensor; the
+        # Set when a parameter or transformed body references pld; the
         # corresponding ``import pypto.language.distributed as pld`` is then
         # emitted in the generated module preamble so the source is
         # self-contained (mirrors the ``import pypto.language as pl`` line).
@@ -1880,27 +2088,31 @@ class Specializer:
             func_def
         )
 
-        # Inline helpers are spliced at the call site before SSA conversion,
-        # so their parameters are already in-place aliases of the caller's
-        # variables — `pl.Out[...]` / `pl.InOut[...]` is redundant ceremony
-        # there. Warn the user so they migrate to bare `pl.Tensor[...]`, and drop
-        # the wrapper from the generated source so downstream passes see the
-        # simpler form.
+        # Inline helpers share the caller's tensor storage, so writes do not
+        # need Out/InOut annotations at this eliminated call boundary. Local
+        # name rebindings remain local; InlineFunctions separates their handles.
+        # Warn on the redundant wrapper and emit bare tensor annotations.
         is_inline = ctx.func_type == "inline"
         if is_inline and (out_params or inout_params):
             warnings.warn(
                 f"@pl.jit.inline helper '{ctx.source_def_name}' uses pl.Out[...]/pl.InOut[...] on "
                 f"parameter(s) {(out_params + inout_params)!r}. Direction annotations are "
                 f"deprecated for inline helpers because the body is spliced at the call "
-                f"site before SSA conversion — the parameter is already an "
-                f"in-place alias of the caller's variable. Drop the wrapper; "
+                f"site before SSA conversion — tensor writes reach the caller's "
+                f"storage while name rebindings stay local. Drop the wrapper; "
                 f"bare pl.Tensor[...] works the same.",
                 DeprecationWarning,
                 stacklevel=2,
             )
 
-        # Collect all param names (excluding self)
-        all_param_names = [arg.arg for arg in func_def.args.args if arg.arg != "self"]
+        # Collect all param names (excluding self). A ``pl.constexpr`` parameter
+        # is dropped: its every use has been folded to a literal, so it has no
+        # IR type to declare and no slot in the dispatch ABI. Keeping it would
+        # emit an unannotated parameter the parser rejects.
+        all_param_names = [
+            arg.arg for arg in func_def.args.args if arg.arg != "self" and arg.arg not in ctx.constexpr_values
+        ]
+        _reject_constexpr_rebinding(func_def, ctx)
 
         # Build decorator
         decorator = self._build_decorator(ctx)
@@ -1914,17 +2126,17 @@ class Specializer:
         # constants that fold into ``Array`` extents), never Python builtins.
         # Type-form annotations never need builtins, so stripping them keeps the
         # best-effort eval from running anything beyond pure type construction.
-        ann_globals = {**ctx.py_globals, "__builtins__": {}}
+        ann_globals: dict[str, Any] = {**ctx.py_globals, "__builtins__": {}}
+        scalar_dtype_strs = {
+            name: _scalar_dtype_source(text, ann_globals) for name, text in scalar_dtype_strs.items()
+        }
         array_param_anns: dict[str, str] = {}
         for arg in func_def.args.args:
             if arg.arg == "self" or arg.annotation is None:
                 continue
             if arg.arg in tensor_params or arg.arg in scalar_dtype_strs:
                 continue
-            try:
-                ann_obj = eval(ast.unparse(arg.annotation), ann_globals)  # noqa: S307
-            except Exception:  # noqa: BLE001 — best effort; unrecognized stays bare
-                continue
+            ann_obj = _eval_annotation(ast.unparse(arg.annotation), ann_globals)
             if isinstance(ann_obj, _LangArray) and ann_obj.extent is not None and ann_obj.dtype is not None:
                 array_param_anns[arg.arg] = f"pl.Array[{ann_obj.extent}, {_array_dtype_str(ann_obj.dtype)}]"
 
@@ -1963,13 +2175,19 @@ class Specializer:
         }
         transformer = _BodyTransformer(
             tensor_meta=ctx.tensor_meta,
-            scalar_values=ctx.scalar_values,
+            constexpr_values=ctx.constexpr_values,
             dep_names=dep_names,
             param_names=all_param_names,
             initial_used_names=all_defined,
             py_globals=ctx.py_globals,
             dep_param_names=self._dep_param_names,
+            dep_constexpr_params=self._dep_constexpr_params,
             dep_func_names=ctx.dep_func_names,
+            dep_call_targets=(
+                _resolve_dep_call_targets(func_def, dep_names, ctx.dep_call_variants)
+                if ctx.dep_call_variants
+                else {}
+            ),
         )
         new_body = [transformer.visit(stmt) for stmt in func_def.body]
         # Accumulate alias→original renames for error message rewriting.
@@ -1985,12 +2203,19 @@ class Specializer:
             if item is None:
                 continue
             if isinstance(item, list):
-                flat_body.extend(item)
+                flat_body.extend(cast("list[ast.stmt]", item))
             else:
                 flat_body.append(item)
 
         if not flat_body:
             flat_body = [ast.Pass()]
+
+        if any(
+            isinstance(node, ast.Name) and node.id == "pld" and isinstance(node.ctx, ast.Load)
+            for stmt in flat_body
+            for node in ast.walk(stmt)
+        ):
+            self._needs_pld_import = True
 
         # Reconstruct a minimal FunctionDef to unparse
         new_func = ast.FunctionDef(
@@ -2171,8 +2396,8 @@ class Specializer:
         generated source would fail to parse.
 
         When ``is_inline`` is True, ``pl.Out[...]`` / ``pl.InOut[...]`` wrappers
-        are stripped from tensor params — inline helpers don't have a calling
-        convention boundary, so the direction tag carries no information.
+        are stripped from tensor params — inlining preserves writes to shared
+        storage and separates local name rebindings without a direction tag.
 
         Params listed in ``distributed_params`` round-trip as
         ``pld.DistributedTensor[...]`` and trigger the corresponding import in
@@ -2241,7 +2466,6 @@ def build_specialize_context(  # noqa: PLR0913 — pass-through assembler; each 
     func_type: str | None,
     level: Any,
     tensor_meta: dict[str, TensorMeta],
-    scalar_values: dict[str, int | float | bool],
     scalar_dtypes: dict[str, DataType],
     dep_names: list[str],
     auto_scope: bool = True,
@@ -2251,6 +2475,8 @@ def build_specialize_context(  # noqa: PLR0913 — pass-through assembler; each 
     external_dual_aiv_dispatch: bool = False,
     external_include_dirs: tuple[str, ...] = (),
     dep_func_names: dict[str, str] | None = None,
+    constexpr_values: dict[str, str] | None = None,
+    dep_call_variants: dict[tuple[str, int], str] | None = None,
 ) -> SpecializeContext:
     """Build a SpecializeContext from a Python function and call-site data.
 
@@ -2263,7 +2489,6 @@ def build_specialize_context(  # noqa: PLR0913 — pass-through assembler; each 
         func_type: 'orchestration', 'incore', or None.
         level: pl.Level enum or None.
         tensor_meta: TensorMeta per tensor param name.
-        scalar_values: Concrete scalar values from the call site.
         scalar_dtypes: DataType per scalar param name.
         dep_names: Names this function's source calls its @pl.jit deps by
             (the alias, under an aliased import).
@@ -2274,6 +2499,11 @@ def build_specialize_context(  # noqa: PLR0913 — pass-through assembler; each 
         dep_func_names: ``call name -> generated function name`` for the deps
             this function reaches under a different name; names that agree may
             be omitted.
+        constexpr_values: Folded source text per ``pl.constexpr`` param name.
+        dep_call_variants: ``(call name, ordinal) -> generated function name``
+            for bodies where one call name reaches more than one generated
+            function, which happens when a dep is compiled once per
+            ``pl.constexpr`` value it is called with.
 
     Dynamic dims live inside ``tensor_meta`` as :class:`DynDim` entries —
     no separate set is passed in.
@@ -2310,10 +2540,11 @@ def build_specialize_context(  # noqa: PLR0913 — pass-through assembler; each 
         level=level,
         param_names=param_names,
         tensor_meta=tensor_meta,
-        scalar_values=scalar_values,
         scalar_dtypes=scalar_dtypes,
+        constexpr_values=constexpr_values or {},
         dep_names=dep_names,
         dep_func_names=dep_func_names or {},
+        dep_call_variants=dep_call_variants or {},
         auto_scope=auto_scope,
         py_globals=func_name_lookup(func),
         orig_file=orig_file,

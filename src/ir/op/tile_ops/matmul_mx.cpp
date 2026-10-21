@@ -87,6 +87,8 @@ TypePtr DeduceTileMatMulMxType(const std::vector<ExprPtr>& args,
   CHECK(args.size() == 4) << "The operator " << op_name
                           << " requires exactly 4 arguments (lhs, lhs_scale, rhs, rhs_scale), but got "
                           << args.size();
+  CHECK(args[1].get() != args[3].get())
+      << "The operator " << op_name << " requires distinct lhs_scale and rhs_scale tiles";
 
   auto lhs_type = As<TileType>(args[0]->GetType());
   auto lhs_scale_type = As<TileType>(args[1]->GetType());
@@ -102,14 +104,16 @@ TypePtr DeduceTileMatMulMxType(const std::vector<ExprPtr>& args,
   CHECK(IsSupportedMxDataType(lhs_type->dtype_))
       << "The operator " << op_name << " requires lhs dtype FP8E4M3FN, but got "
       << lhs_type->dtype_.ToString()
-      << (lhs_type->dtype_ == DataType::FP4
-              ? "; native FP4 matmul is not supported, so cast the FP4 lhs to FP8E4M3FN with pl.cast first"
+      << (lhs_type->dtype_.IsFp4Family()
+              ? "; native FP4/FP4E2M1X2 matmul is not supported, so cast the lhs to FP8E4M3FN "
+                "with pl.cast first"
               : "");
   CHECK(IsSupportedMxDataType(rhs_type->dtype_))
       << "The operator " << op_name << " requires rhs dtype FP8E4M3FN, but got "
       << rhs_type->dtype_.ToString()
-      << (rhs_type->dtype_ == DataType::FP4
-              ? "; native FP4 matmul is not supported, so cast the FP4 rhs to FP8E4M3FN with pl.cast first"
+      << (rhs_type->dtype_.IsFp4Family()
+              ? "; native FP4/FP4E2M1X2 matmul is not supported, so cast the rhs to FP8E4M3FN "
+                "with pl.cast first"
               : "");
 
   ExprPtr m_phys = lhs_type->shape_[0];

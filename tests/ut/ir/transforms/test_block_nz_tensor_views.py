@@ -9,9 +9,9 @@
 
 """Tests for the BlockNzTensorViews pass.
 
-``pl.Tensor[[..., R, C], dtype, pl.NZ]`` asserts that the GM bytes are already
+``pl.Tensor[[R, C], dtype, pl.NZ]`` (or ``[[B, R, C], ...]``) asserts that the GM bytes are already
 in PTO-native NZ fractal order. pto-isa describes such a buffer with a blocked
-rank-(r+2) GlobalTensor (``pto/common/pto_tile.hpp``)::
+rank-5 GlobalTensor (``pto/common/pto_tile.hpp``)::
 
     TileShape2D<T, R, C, Layout::NZ> = Shape< 1, C/c0, R/16, 16, c0>
     BaseShape2D<T, R, C, Layout::NZ> = Stride<C*R, R*c0, 16*c0, c0, 1>
@@ -66,7 +66,7 @@ def _run(program: ir.Program) -> ir.Program:
     return program
 
 
-def _emit_pto(program: ir.Program, backend_type=BackendType.Ascend910B) -> str:
+def _emit_pto(program: ir.Program, backend_type=BackendType.Ascend910) -> str:
     reset_for_testing()
     set_backend_type(backend_type)
     with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO):
@@ -126,6 +126,40 @@ def _walk(stmt):
         yield from _walk(stmt.body)
         return
     yield stmt
+
+
+def _nz_slices(program: ir.Program) -> list[ir.Call]:
+    """Every tensor.slice whose source tensor carries the NZ layout, in body order."""
+    slice_name = ir.get_op("tensor.slice").name
+    found = []
+    for func in program.functions.values():
+        for stmt in _walk(func.body):
+            if not isinstance(stmt, ir.AssignStmt):
+                continue
+            call = stmt.value
+            if not isinstance(call, ir.Call) or call.op.name != slice_name:
+                continue
+            view = getattr(call.args[0].type, "tensor_view", None)
+            if view is not None and view.layout == ir.TensorLayout.NZ:
+                found.append(call)
+    return found
+
+
+def _nz_reshapes(program: ir.Program) -> list[ir.Call]:
+    """Every tensor.reshape whose source tensor carries the NZ layout, in body order."""
+    reshape_name = ir.get_op("tensor.reshape").name
+    found = []
+    for func in program.functions.values():
+        for stmt in _walk(func.body):
+            if not isinstance(stmt, ir.AssignStmt):
+                continue
+            call = stmt.value
+            if not isinstance(call, ir.Call) or call.op.name != reshape_name:
+                continue
+            view = getattr(call.args[0].type, "tensor_view", None)
+            if view is not None and view.layout == ir.TensorLayout.NZ:
+                found.append(call)
+    return found
 
 
 def _nz_loads(program: ir.Program) -> list[ir.Call]:
@@ -214,9 +248,14 @@ class NdMatmul:
 
 
 def test_nz_tensor_shape_is_blocked():
-    """[256, 512] INT8 becomes [512/32, 256/16, 16, 32] = [16, 16, 16, 32]."""
+    """[256, 512] INT8 becomes [1, 512/32, 256/16, 16, 32] = [1, 16, 16, 16, 32].
+
+    The leading 1 is pto-isa's batch slot, materialised because the logical
+    tensor has no leading axis. Blocking to rank 4 instead yields a view PTOAS
+    rejects outright ("layout=nz requires a rank-5 view").
+    """
     param_type = _nz_param(_run(NzMatmul))
-    assert _values(param_type.shape) == [16, 16, 16, 32]
+    assert _values(param_type.shape) == [1, 16, 16, 16, 32]
 
 
 def test_leading_dims_are_preserved():
@@ -227,8 +266,8 @@ def test_leading_dims_are_preserved():
     rank-3 tile, which ``tile.matmul`` rejects at parse time — before this pass
     ever runs.
     """
-    _, _, tm, sv, sd, dyn = _batched_nz_mm._bind_args_from_signature({})
-    program = _batched_nz_mm._compile_to_program(tm, sv, sd, dyn, pl)
+    _, _, tm, sd, cx, dyn = _batched_nz_mm._bind_args_from_signature({})
+    program = _batched_nz_mm._compile_to_program(tm, sd, cx, dyn, pl)
     param_type = _nz_param(_run(program))
     assert _values(param_type.shape) == [4, 16, 16, 16, 32]
 
@@ -250,10 +289,10 @@ def test_nd_tensor_is_untouched():
 
 
 def test_tile_load_coordinates_are_blocked_and_tile_stays_2d():
-    """The GM window becomes rank-4; the destination tile stays [256, 512]."""
+    """The GM window becomes rank-5; the destination tile stays [256, 512]."""
     call = _nz_load(_run(NzMatmul))
-    assert _values(_elements(call.args[1])) == [0, 0, 0, 0]  # offsets
-    assert _values(_elements(call.args[2])) == [16, 16, 16, 32]  # shapes
+    assert _values(_elements(call.args[1])) == [0, 0, 0, 0, 0]  # offsets
+    assert _values(_elements(call.args[2])) == [1, 16, 16, 16, 32]  # shapes
     # The tile the load produces is the logical 2-D operand, not the GM window.
     tile_type = call.type
     assert isinstance(tile_type, ir.TileType)
@@ -261,7 +300,7 @@ def test_tile_load_coordinates_are_blocked_and_tile_stays_2d():
 
 
 def test_slice_offsets_are_mapped_to_fractal_coordinates():
-    """A logical [n0, k0] offset becomes [k0/c0, n0/16, 0, 0]."""
+    """A logical [n0, k0] offset becomes [0, k0/c0, n0/16, 0, 0]."""
 
     @pl.program
     class Sliced:
@@ -280,8 +319,8 @@ def test_slice_offsets_are_mapped_to_fractal_coordinates():
 
     call = _nz_load(_run(Sliced))
     # n0 = 256 -> 256/16 = 16 ; k0 = 512 -> 512/32 = 16
-    assert _values(_elements(call.args[1])) == [16, 16, 0, 0]
-    assert _values(_elements(call.args[2])) == [16, 16, 16, 32]
+    assert _values(_elements(call.args[1])) == [0, 16, 16, 0, 0]
+    assert _values(_elements(call.args[2])) == [1, 16, 16, 16, 32]
 
 
 def test_maps_an_spmd_derived_slice_offset():
@@ -307,9 +346,10 @@ def test_maps_an_spmd_derived_slice_offset():
             out[0:64, n0 : n0 + 256] = pl.reshape(acc, [64, 256])
         return out
 
-    _, _, tm, sv, sd, dyn = _spmd_offset._bind_args_from_signature({})
-    call = _nz_load(_run(_spmd_offset._compile_to_program(tm, sv, sd, dyn, pl)))
-    col_off, row_off, in_fractal_row, in_c0_line = _elements(call.args[1])
+    _, _, tm, sd, cx, dyn = _spmd_offset._bind_args_from_signature({})
+    call = _nz_load(_run(_spmd_offset._compile_to_program(tm, sd, cx, dyn, pl)))
+    batch_off, col_off, row_off, in_fractal_row, in_c0_line = _elements(call.args[1])
+    assert _const(batch_off) == 0
     assert _const(col_off) == 0
     assert isinstance(row_off, ir.FloorDiv)
     assert isinstance(row_off.left, ir.Var) and row_off.left.name_hint.startswith("n0")
@@ -348,9 +388,10 @@ def test_does_not_reassociate_the_offset_arithmetic():
             out[0:64, n0 : n0 + 256] = pl.reshape(acc, [64, 256])
         return out
 
-    _, _, tm, sv, sd, dyn = _no_reassoc._bind_args_from_signature({})
-    after = _run(_no_reassoc._compile_to_program(tm, sv, sd, dyn, pl))
-    row_off = _elements(_nz_load(after).args[1])[1]
+    _, _, tm, sd, cx, dyn = _no_reassoc._bind_args_from_signature({})
+    after = _run(_no_reassoc._compile_to_program(tm, sd, cx, dyn, pl))
+    # Blocked offsets are [batch, C/c0, R/16, 0, 0] — index 2 is the row axis.
+    row_off = _elements(_nz_load(after).args[1])[2]
 
     # A division of the offset itself, not a product of the block index.
     assert isinstance(row_off, ir.FloorDiv), f"offset was re-associated into {type(row_off).__name__}"
@@ -396,20 +437,22 @@ def test_maps_a_loop_variable_slice_offset():
             out[0:64, 0:256] = pl.reshape(acc, [64, 256])
         return out
 
-    _, _, tm, sv, sd, dyn = _loop_offset._bind_args_from_signature({})
-    after = _run(_loop_offset._compile_to_program(tm, sv, sd, dyn, pl))
+    _, _, tm, sd, cx, dyn = _loop_offset._bind_args_from_signature({})
+    after = _run(_loop_offset._compile_to_program(tm, sd, cx, dyn, pl))
 
     # Two NZ loads share the weight: the k0 = 0 prologue and the loop body.
     offsets = [_elements(call.args[1]) for call in _nz_loads(after)]
     assert len(offsets) == 2, f"expected two NZ loads, got {len(offsets)}"
 
     prologue, in_loop = offsets
-    assert _values(prologue) == [0, 0, 0, 0]
-    col_off = in_loop[0]
+    assert _values(prologue) == [0, 0, 0, 0, 0]
+    # [batch, C/c0, R/16, 0, 0] — index 1 is the column-block axis k0 divides.
+    assert _const(in_loop[0]) == 0
+    col_off = in_loop[1]
     assert isinstance(col_off, ir.FloorDiv)
     assert isinstance(col_off.left, ir.Var) and col_off.left.name_hint.startswith("k0")
     assert _const(col_off.right) == 32  # c0 for INT8
-    assert _values(in_loop[1:]) == [0, 0, 0]
+    assert _values(in_loop[2:]) == [0, 0, 0]
 
 
 # ============================================================================
@@ -421,20 +464,22 @@ def test_blocked_nz_strides_match_pto_isa():
     """Row-major over the blocked shape == pto-isa's BaseShape2D<..., NZ>.
 
     For [256, 512] INT8 (c0 = 32) pto-isa gives ``Stride<C*R, R*c0, 16*c0, c0, 1>``
-    which, with the leading batch dim dropped, is
-    ``[256*32, 16*32, 32, 1] = [8192, 512, 32, 1]``.
+    = ``[512*256, 256*32, 16*32, 32, 1] = [131072, 8192, 512, 32, 1]`` — all five,
+    including the leading batch stride. The batch extent is the materialised 1,
+    so that stride is never multiplied by a non-zero coordinate; it still has to
+    be *present*, because pto-isa reads NZ strides at a fixed arity.
 
     If this ever diverges, NZ can no longer reuse the ND row-major stride rule
     and the premise of the whole design is broken — hence a dedicated test.
     """
     reset_for_testing()
-    set_backend_type(BackendType.Ascend910B)
+    set_backend_type(BackendType.Ascend910)
     with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO):
         optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(NzMatmul)
     param_type = _nz_param(optimized)
     view = param_type.tensor_view
     assert view is not None
-    assert _values(view.stride) == [8192, 512, 32, 1]
+    assert _values(view.stride) == [131072, 8192, 512, 32, 1]
 
 
 # ============================================================================
@@ -449,33 +494,36 @@ def test_codegen_emits_blocked_nz_descriptor():
     ]
     assert len(view_lines) == 1, text
     line = view_lines[0]
-    assert "%c16_index, %c16_index, %c16_index, %c32_index" in line  # shape
-    assert "%c8192_index, %c512_index, %c32_index, %c1_index" in line  # pto-isa NZ strides
+    assert "%c1_index, %c16_index, %c16_index, %c16_index, %c32_index" in line  # shape
+    # pto-isa NZ strides, batch stride included
+    assert "%c131072_index, %c8192_index, %c512_index, %c32_index, %c1_index" in line
 
 
 def test_codegen_rank_is_consistent_across_all_three_sites():
     """make_tensor_view, its !pto.tensor_view type and partition_view must agree.
 
     Each is derived independently from ``TensorType::shape_``; a disagreement is
-    what PTOAS rejects outright.
+    what PTOAS rejects outright. The rank they must agree *on* is 5 — PTOAS
+    checks the NZ arity itself, so three mutually consistent rank-4 sites would
+    still be refused.
     """
     text = _emit_pto(NzMatmul)
     nz_view_line = next(
         line for line in text.splitlines() if "make_tensor_view" in line and "layout<nz>" in line
     )
-    assert "!pto.tensor_view<?x?x?x?xi8>" in nz_view_line
+    assert "!pto.tensor_view<?x?x?x?x?xi8>" in nz_view_line
     ssa = nz_view_line.strip().split(" ")[0]
     pview_line = next(line for line in text.splitlines() if "partition_view" in line and f"{ssa}," in line)
-    assert "offsets = [%c0_index, %c0_index, %c0_index, %c0_index]" in pview_line
-    assert "sizes = [%c16_index, %c16_index, %c16_index, %c32_index]" in pview_line
-    assert "!pto.partition_tensor_view<16x16x16x32xi8>" in pview_line
+    assert "offsets = [%c0_index, %c0_index, %c0_index, %c0_index, %c0_index]" in pview_line
+    assert "sizes = [%c1_index, %c16_index, %c16_index, %c16_index, %c32_index]" in pview_line
+    assert "!pto.partition_tensor_view<1x16x16x16x32xi8>" in pview_line
 
 
 def test_codegen_emits_the_divided_offset():
     """The blocked coordinate reaches `partition_view` as the divided offset.
 
     This is the end-to-end statement of the rewrite: the descriptor is the
-    blocked rank-4 NZ one, and the row-fractal coordinate is `n0 / 16` — the
+    blocked rank-5 NZ one, and the row-fractal coordinate is `n0 / 16` — the
     offset the kernel computed, divided, rather than a re-derived index.
     """
 
@@ -493,32 +541,33 @@ def test_codegen_emits_the_divided_offset():
             out[0:64, n0 : n0 + 256] = pl.reshape(acc, [64, 256])
         return out
 
-    _, _, tm, sv, sd, dyn = _spmd_offset._bind_args_from_signature({})
-    text = _emit_pto(_spmd_offset._compile_to_program(tm, sv, sd, dyn, pl))
+    _, _, tm, sd, cx, dyn = _spmd_offset._bind_args_from_signature({})
+    text = _emit_pto(_spmd_offset._compile_to_program(tm, sd, cx, dyn, pl))
     lines = text.splitlines()
 
     nz_view_line = next(line for line in lines if "make_tensor_view" in line and "layout<nz>" in line)
-    assert "%c16_index, %c32_index, %c16_index, %c32_index" in nz_view_line  # [C/c0, R/16, 16, c0]
+    # [batch, C/c0, R/16, 16, c0]
+    assert "%c1_index, %c16_index, %c32_index, %c16_index, %c32_index" in nz_view_line
 
     ssa = nz_view_line.strip().split(" ")[0]
     pview_line = next(line for line in lines if "partition_view" in line and f"{ssa}," in line)
-    assert "sizes = [%c16_index, %c16_index, %c16_index, %c32_index]" in pview_line
-    # offsets = [c0-block, row-fractal, 0, 0] — only the row fractal is symbolic.
+    assert "sizes = [%c1_index, %c16_index, %c16_index, %c16_index, %c32_index]" in pview_line
+    # offsets = [batch, c0-block, row-fractal, 0, 0] — only the row fractal is symbolic.
     offsets = pview_line.split("offsets = [", 1)[1].split("]", 1)[0].split(", ")
-    assert [offsets[0], offsets[2], offsets[3]] == ["%c0_index"] * 3, pview_line
+    assert [offsets[0], offsets[1], offsets[3], offsets[4]] == ["%c0_index"] * 4, pview_line
 
-    # The NZ coordinate is the kernel's own offset divided: offsets[1] traces
+    # The NZ coordinate is the kernel's own offset divided: offsets[2] traces
     # back through the negative clamp to a division by 16, whose dividend is the
     # `n0 = nb * 256` the ND store on `out` also uses.
     def defining_line(operand: str) -> str:
         return next(line for line in lines if line.strip().startswith(f"{operand} = "))
 
-    clamp = defining_line(offsets[1])
+    clamp = defining_line(offsets[2])
     assert "arith.maxsi" in clamp, clamp
     divide = defining_line(clamp.split("arith.maxsi ", 1)[1].split(",", 1)[0])
-    assert "arith.divsi" in divide and "%c16_index" in divide, divide
+    assert "arith.floordivsi" in divide and "%c16_index" in divide, divide
 
-    dividend = divide.split("arith.divsi ", 1)[1].split(",", 1)[0]
+    dividend = divide.split("arith.floordivsi ", 1)[1].split(",", 1)[0]
     offset_def = defining_line(dividend)
     assert "arith.muli" in offset_def and "%c256_index" in offset_def, offset_def
 
@@ -536,6 +585,126 @@ def test_codegen_tile_keeps_logical_2d_nz_layout():
 # ============================================================================
 # Rejections — never silently mis-address
 # ============================================================================
+
+
+def test_folds_leading_axes_into_the_batch_slot():
+    """A logical ``[G, E, N, K]`` weight blocks with ``B = G*E``.
+
+    pto-isa's NZ ``GlobalTensor`` has exactly one batch slot, and dense
+    row-major leading axes collapse into it exactly — the fold removes only the
+    strides it multiplies back in.
+    """
+
+    @pl.jit
+    def _rank4_nz(
+        x: pl.Tensor[[64, 512], pl.INT8],
+        w: pl.Tensor[[2, 4, 256, 512], pl.INT8, pl.NZ],
+        out: pl.Out[pl.Tensor[[64, 256], pl.INT32]],
+    ):
+        for _ in pl.spmd(1, name_hint="rank4_nz"):
+            xt = pl.slice(x, [64, 512], [0, 0])
+            wt = w[1:2, 3:4, 0:256, 0:512]
+            acc = pl.matmul(xt, wt, b_trans=True, out_dtype=pl.INT32)
+            out[0:64, 0:256] = pl.reshape(acc, [64, 256])
+        return out
+
+    _, _, tm, sd, cx, dyn = _rank4_nz._bind_args_from_signature({})
+    after = _run(_rank4_nz._compile_to_program(tm, sd, cx, dyn, pl))
+    assert _values(_nz_param(after).shape) == [8, 16, 16, 16, 32]
+    call = _nz_load(after)
+    # [1, 3, 0, 0] into [2, 4, ...] addresses batch 1*4 + 3 = 7.
+    assert _values(_elements(call.args[1])) == [7, 0, 0, 0, 0]
+    assert _values(_elements(call.args[2])) == [1, 16, 16, 16, 32]
+
+
+def test_blocks_a_leading_axis_slice():
+    """``pl.slice`` along the batch axis keeps the NZ view addressable.
+
+    A layer-stacked weight reaches its kernel as one layer's window, so the
+    slice has to block like the load that follows it: whole trailing matrix,
+    batch offset carried through.
+    """
+
+    @pl.jit(auto_scope=False)
+    def _sliced_nz(
+        x: pl.Tensor[[64, 512], pl.INT8],
+        w: pl.Tensor[[4, 256, 512], pl.INT8, pl.NZ],
+        out: pl.Out[pl.Tensor[[64, 256], pl.INT32]],
+    ):
+        w_layer: pl.Tensor[[2, 256, 512], pl.INT8, pl.NZ] = pl.slice(w, [2, 256, 512], [2, 0, 0])
+        with pl.scope():
+            for _ in pl.spmd(1, name_hint="sliced_nz"):
+                xt = pl.slice(x, [64, 512], [0, 0])
+                acc = pl.matmul(xt, w_layer[1:2, 0:256, 0:512], b_trans=True, out_dtype=pl.INT32)
+                out[0:64, 0:256] = pl.reshape(acc, [64, 256])
+        return out
+
+    _, _, tm, sd, cx, dyn = _sliced_nz._bind_args_from_signature({})
+    after = _run(_sliced_nz._compile_to_program(tm, sd, cx, dyn, pl))
+    slices = _nz_slices(after)
+    assert len(slices) == 1
+    assert _values(_elements(slices[0].args[1])) == [2, 16, 16, 16, 32]  # shapes
+    assert _values(_elements(slices[0].args[2])) == [2, 0, 0, 0, 0]  # offsets
+    slice_type = slices[0].type
+    assert isinstance(slice_type, ir.TensorType)
+    assert _values(slice_type.shape) == [2, 16, 16, 16, 32]
+
+
+def test_rejects_a_leading_window_under_a_spanning_axis():
+    """Two narrowed leading axes do not fold into one contiguous batch run.
+
+    ``[2, 4, R, C]`` sliced to ``[2, 2, R, C]`` at ``[0, 1, 0, 0]`` names
+    batches ``{1, 2, 5, 6}``, but the fold multiplies extents and flattens
+    offsets row-major, so it would emit extent 4 at offset 1 — the run
+    ``{1, 2, 3, 4}``, a different four layers read as if they were the right
+    ones.
+    """
+
+    @pl.jit(auto_scope=False)
+    def _two_windows(
+        x: pl.Tensor[[64, 512], pl.INT8],
+        w: pl.Tensor[[2, 4, 256, 512], pl.INT8, pl.NZ],
+        out: pl.Out[pl.Tensor[[64, 256], pl.INT32]],
+    ):
+        w_win: pl.Tensor[[2, 2, 256, 512], pl.INT8, pl.NZ] = pl.slice(w, [2, 2, 256, 512], [0, 1, 0, 0])
+        with pl.scope():
+            for _ in pl.spmd(1, name_hint="two_windows"):
+                xt = pl.slice(x, [64, 512], [0, 0])
+                acc = pl.matmul(xt, w_win[0:1, 0:1, 0:256, 0:512], b_trans=True, out_dtype=pl.INT32)
+                out[0:64, 0:256] = pl.reshape(acc, [64, 256])
+        return out
+
+    _, _, tm, sd, cx, dyn = _two_windows._bind_args_from_signature({})
+    program = _two_windows._compile_to_program(tm, sd, cx, dyn, pl)
+    with pytest.raises(ValueError, match="a window on one leading axis only"):
+        _run(program)
+
+
+def test_rejects_a_slice_inside_the_fractal_plane():
+    """A row window of an NZ tensor has no contiguous stride, so it is refused.
+
+    One layer's rows sit inside every fractal column block, so ``[layer*R, 0]``
+    selects ``C/c0`` disjoint runs — exactly what the blocked view's derived
+    row-major stride cannot describe.
+    """
+
+    @pl.jit(auto_scope=False)
+    def _row_sliced_nz(
+        x: pl.Tensor[[64, 512], pl.INT8],
+        w: pl.Tensor[[512, 512], pl.INT8, pl.NZ],
+        out: pl.Out[pl.Tensor[[64, 256], pl.INT32]],
+    ):
+        w_layer: pl.Tensor[[256, 512], pl.INT8, pl.NZ] = pl.slice(w, [256, 512], [256, 0])
+        with pl.scope():
+            for _ in pl.spmd(1, name_hint="row_sliced_nz"):
+                xt = pl.slice(x, [64, 512], [0, 0])
+                acc = pl.matmul(xt, w_layer[0:256, 0:512], b_trans=True, out_dtype=pl.INT32)
+                out[0:64, 0:256] = pl.reshape(acc, [64, 256])
+        return out
+
+    _, _, tm, sd, cx, dyn = _row_sliced_nz._bind_args_from_signature({})
+    with pytest.raises(ValueError, match="slicing the leading axes only"):
+        _run(_row_sliced_nz._compile_to_program(tm, sd, cx, dyn, pl))
 
 
 def test_rejects_unaligned_rows():
@@ -628,8 +797,8 @@ def test_rejects_a_slice_offset_whose_alignment_cannot_be_proven():
             out[0:64, 0:256] = pl.reshape(acc, [64, 256])
         return out
 
-    _, _, tm, sv, sd, dyn = _unprovable._bind_args_from_signature({})
-    program = _unprovable._compile_to_program(tm, sv, sd, dyn, pl)
+    _, _, tm, sd, cx, dyn = _unprovable._bind_args_from_signature({})
+    program = _unprovable._compile_to_program(tm, sd, cx, dyn, pl)
     with pytest.raises(ValueError, match=r"offset on shape\[-2\] to be a multiple of 16"):
         _run(program)
 
@@ -659,9 +828,228 @@ def test_rejects_a_slice_offset_whose_sign_cannot_be_proven():
             out[0:64, 0:256] = pl.reshape(acc, [64, 256])
         return out
 
-    _, _, tm, sv, sd, dyn = _maybe_negative._bind_args_from_signature({})
-    program = _maybe_negative._compile_to_program(tm, sv, sd, dyn, pl)
+    _, _, tm, sd, cx, dyn = _maybe_negative._bind_args_from_signature({})
+    program = _maybe_negative._compile_to_program(tm, sd, cx, dyn, pl)
     with pytest.raises(ValueError, match=r"offset on shape\[-2\] to be non-negative"):
+        _run(program)
+
+
+def test_maps_a_split_k_offset_built_from_a_remainder():
+    """``(block % OK) * K_SLICE`` is the split-K half of a K loop.
+
+    A non-negative block index and a positive constant divisor make the
+    remainder non-negative, and the constant factor carries the alignment.
+    Without the remainder rule the split-K idiom used by attention projections
+    is refused.
+    """
+
+    @pl.jit
+    def _split_k(
+        x: pl.Tensor[[64, 1024], pl.INT8],
+        w: pl.Tensor[[256, 1024], pl.INT8, pl.NZ],
+        out: pl.Out[pl.Tensor[[64, 256], pl.INT32]],
+    ):
+        for blk in pl.spmd(4, name_hint="split_k_mm"):
+            k_base = (blk % 2) * 512
+            n0 = (blk // 2) * 128
+            acc = pl.create_tensor([64, 128], dtype=pl.INT32)
+            for kb in pl.pipeline(0, 512, 512, stage=2):
+                k0 = k_base + kb
+                acc = pl.matmul_acc(
+                    acc,
+                    x[0:64, k0 : k0 + 512],
+                    w[n0 : n0 + 128, k0 : k0 + 512],
+                    b_trans=True,
+                    init_cond=(kb == 0),
+                )
+            out[:, n0 : n0 + 128] = acc
+        return out
+
+    _, _, tm, sd, cx, dyn = _split_k._bind_args_from_signature({})
+    call = _nz_load(_run(_split_k._compile_to_program(tm, sd, cx, dyn, pl)))
+    # Both trailing offsets are divided; neither is refused for an unprovable sign.
+    assert len(_elements(call.args[1])) == 5
+
+
+def test_flattens_a_whole_nz_tensor():
+    """A rank-1 view of *every* element is layout-invariant, so it is kept as written.
+
+    The blocked form permutes the index space, not the memory: both spellings
+    walk the same contiguous GM range. An SDMA L2 warm
+    (``prefetch.async_prefetch``) wants a flat logical-1D source, so refusing
+    this would mean an NZ weight can never be prefetched — which is what the
+    DeepSeek V4 o-projection weights do while they stream.
+    """
+
+    @pl.jit
+    def _flatten(
+        x: pl.Tensor[[64, 512], pl.INT8],
+        w: pl.Tensor[[256, 512], pl.INT8, pl.NZ],
+        out: pl.Out[pl.Tensor[[64, 256], pl.INT32]],
+        head: pl.Out[pl.Tensor[[512], pl.INT8]],
+    ):
+        w_flat = pl.reshape(w, [256 * 512])
+        for nb in pl.spmd(2, name_hint="nz_flat_mm"):
+            n0 = nb * 128
+            acc = pl.matmul(x[0:64, 0:512], w[n0 : n0 + 128, 0:512], b_trans=True, out_dtype=pl.INT32)
+            out[0:64, n0 : n0 + 128] = pl.reshape(acc, [64, 128])
+        for _flat_blk in pl.spmd(1, name_hint="nz_flat_head"):
+            pl.store(pl.load(w_flat, [0], [512], target_memory=pl.Mem.Vec), [0], head)
+        return out, head
+
+    _, _, tm, sd, cx, dyn = _flatten._bind_args_from_signature({})
+    program = _run(_flatten._compile_to_program(tm, sd, cx, dyn, pl))
+    flatten = _nz_reshapes(program)
+    assert len(flatten) == 1
+    # The target shape is untouched, and the source now carries the blocked type.
+    assert _values(_elements(flatten[0].args[1])) == [256 * 512]
+    source_type = flatten[0].args[0].type
+    assert isinstance(source_type, ir.TensorType)
+    assert len(source_type.shape) == 5
+    # The matmul operand is still blocked, so the flatten did not disable the pass.
+    assert len(_elements(_nz_loads(program)[0].args[1])) == 5
+
+
+def test_rejects_a_reshape_that_is_not_a_whole_tensor_flatten():
+    """A partial reshape reinterprets coordinates, which the blocked form breaks.
+
+    ``[256, 512] -> [128, 1024]`` pairs rows in logical row-major order; in the
+    blocked form those elements are scattered across fractal blocks. There is no
+    coordinate rewrite that makes it mean the same thing, so it is refused
+    rather than silently addressed as ND.
+    """
+
+    @pl.jit
+    def _partial(
+        w: pl.Tensor[[256, 512], pl.INT8, pl.NZ],
+        head: pl.Out[pl.Tensor[[512], pl.INT8]],
+    ):
+        w_half = pl.reshape(w, [128, 1024])
+        for _half_blk in pl.spmd(1, name_hint="nz_partial_head"):
+            pl.store(pl.load(w_half, [0, 0], [1, 512], target_memory=pl.Mem.Vec), [0], head)
+        return head
+
+    _, _, tm, sd, cx, dyn = _partial._bind_args_from_signature({})
+    program = _partial._compile_to_program(tm, sd, cx, dyn, pl)
+    with pytest.raises(ValueError, match="whole-tensor 'tensor.reshape' flatten"):
+        _run(program)
+
+
+def test_rejects_a_remainder_of_an_unproven_dividend():
+    """The conservative proof still requires a non-negative dividend.
+
+    ``FloorMod`` codegen corrects negative remainders, so ``(blk - 1) % 2``
+    is 1 on the first block. This pass does not use that stronger fact: a
+    difference proves no sign, so the whole offset remains unproven.
+    """
+
+    @pl.jit
+    def _unproven_dividend(
+        x: pl.Tensor[[64, 1024], pl.INT8],
+        w: pl.Tensor[[128, 1024], pl.INT8, pl.NZ],
+        out: pl.Out[pl.Tensor[[64, 128], pl.INT32]],
+    ):
+        for blk in pl.spmd(4, name_hint="unproven_mod"):
+            k0 = ((blk - 1) % 2) * 512
+            acc = pl.matmul(x[0:64, k0 : k0 + 512], w[0:128, k0 : k0 + 512], b_trans=True, out_dtype=pl.INT32)
+            out[0:64, 0:128] = pl.reshape(acc, [64, 128])
+        return out
+
+    _, _, tm, sd, cx, dyn = _unproven_dividend._bind_args_from_signature({})
+    program = _unproven_dividend._compile_to_program(tm, sd, cx, dyn, pl)
+    with pytest.raises(ValueError, match=r"offset on shape\[-1\] to be non-negative"):
+        _run(program)
+
+
+def test_maps_an_offset_from_a_strided_loop_that_starts_at_the_block_index():
+    """A loop variable's facts come from its start and step, symbolic or not.
+
+    ``for ob in pl.range(core, TILES, CORES)`` hands each core every CORES-th
+    tile starting at its own block index -- the vocab split an LM head uses. The
+    start is a block index, so it is non-negative, and the step is a positive
+    constant, so ``ob * 256`` is a non-negative multiple of 16. Before the start
+    could be symbolic this offset was refused for its sign.
+    """
+
+    @pl.jit
+    def _strided(
+        x: pl.Tensor[[64, 512], pl.INT8],
+        w: pl.Tensor[[1024, 512], pl.INT8, pl.NZ],
+        out: pl.Out[pl.Tensor[[64, 1024], pl.INT32]],
+    ):
+        with pl.spmd(2, name_hint="nz_strided"):
+            core = pl.tile.get_block_idx()
+            for ob in pl.range(core, 4, 2):
+                o0 = ob * 256
+                acc = pl.matmul(x[0:64, 0:512], w[o0 : o0 + 256, 0:512], b_trans=True, out_dtype=pl.INT32)
+                out[0:64, o0 : o0 + 256] = pl.reshape(acc, [64, 256])
+        return out
+
+    _, _, tm, sd, cx, dyn = _strided._bind_args_from_signature({})
+    program = _run(_strided._compile_to_program(tm, sd, cx, dyn, pl))
+    assert len(_elements(_nz_loads(program)[0].args[1])) == 5
+
+
+def test_blocks_a_ragged_tail_whose_valid_rows_are_a_min():
+    """A valid region that covers whole fractals blocks to fewer row fractals.
+
+    The last of four 256-row tiles over an 800-row weight holds 32 rows, named at
+    run time as ``min(800 - o0, 256)``. Both operands are multiples of 16, so the
+    region ends on a fractal boundary and blocks to ``valid // 16`` row
+    fractals -- the one axis left dynamic in the blocked valid shape.
+    """
+
+    @pl.jit
+    def _ragged(
+        x: pl.Tensor[[64, 512], pl.INT8],
+        w: pl.Tensor[[800, 512], pl.INT8, pl.NZ],
+        out: pl.Out[pl.Tensor[[64, 1024], pl.INT32]],
+    ):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="nz_ragged"):
+            for ob in pl.range(0, 4):
+                o0 = ob * 256
+                valid = pl.min(800 - o0, 256)
+                wt = pl.slice(w, [256, 512], [o0, 0], valid_shape=[valid, 512])
+                acc = pl.matmul(x[0:64, 0:512], wt, b_trans=True, out_dtype=pl.INT32)
+                out[0:64, o0 : o0 + 256] = pl.reshape(acc, [64, 256])
+        return out
+
+    _, _, tm, sd, cx, dyn = _ragged._bind_args_from_signature({})
+    program = _run(_ragged._compile_to_program(tm, sd, cx, dyn, pl))
+    load = _nz_loads(program)[0]
+    valid = _elements(load.args[3])
+    assert len(valid) == 5
+    # Column blocks, fractal rows and the C0 line stay static; the row-fractal
+    # count is the run-time quotient.
+    assert _values([valid[1], valid[3], valid[4]]) == [16, 16, 32]
+    assert not isinstance(valid[2], ir.ConstInt)
+
+
+def test_rejects_a_ragged_tail_that_ends_inside_a_fractal():
+    """A dynamic valid row count must be a provable multiple of 16.
+
+    ``min(800 - o0, 250)`` can end mid-fractal, and a partial fractal has no
+    blocked form, so the load is refused rather than rounded.
+    """
+
+    @pl.jit
+    def _mid_fractal(
+        x: pl.Tensor[[64, 512], pl.INT8],
+        w: pl.Tensor[[800, 512], pl.INT8, pl.NZ],
+        out: pl.Out[pl.Tensor[[64, 1024], pl.INT32]],
+    ):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="nz_mid_fractal"):
+            for ob in pl.range(0, 4):
+                o0 = ob * 256
+                valid = pl.min(800 - o0, 250)
+                wt = pl.slice(w, [256, 512], [o0, 0], valid_shape=[valid, 512])
+                acc = pl.matmul(x[0:64, 0:512], wt, b_trans=True, out_dtype=pl.INT32)
+                out[0:64, o0 : o0 + 256] = pl.reshape(acc, [64, 256])
+        return out
+
+    _, _, tm, sd, cx, dyn = _mid_fractal._bind_args_from_signature({})
+    program = _mid_fractal._compile_to_program(tm, sd, cx, dyn, pl)
+    with pytest.raises(ValueError, match=r"dynamic valid_shape\[-2\] to be a provable multiple of 16"):
         _run(program)
 
 
@@ -687,8 +1075,8 @@ def test_rejects_a_loop_variable_whose_step_breaks_alignment():
                 out[0:64, 0:256] = pl.reshape(acc, [64, 256])
         return out
 
-    _, _, tm, sv, sd, dyn = _bad_step._bind_args_from_signature({})
-    program = _bad_step._compile_to_program(tm, sv, sd, dyn, pl)
+    _, _, tm, sd, cx, dyn = _bad_step._bind_args_from_signature({})
+    program = _bad_step._compile_to_program(tm, sd, cx, dyn, pl)
     with pytest.raises(ValueError, match=r"offset on shape\[-1\] to be a multiple of c0 = 32"):
         _run(program)
 
@@ -766,9 +1154,9 @@ def test_c0_is_derived_from_bit_width():
             pl.store(acc, [0, 0], out)
             return out
 
-    # FP16: c0 = 256/16 = 16, so [256, 512] -> [512/16, 256/16, 16, 16].
+    # FP16: c0 = 256/16 = 16, so [256, 512] -> [1, 512/16, 256/16, 16, 16].
     param_type = _nz_param(_run(Fp16Nz))
-    assert _values(param_type.shape) == [32, 16, 16, 16]
+    assert _values(param_type.shape) == [1, 32, 16, 16, 16]
 
 
 def test_rejects_nz_store_destination():
@@ -818,6 +1206,228 @@ def test_rejects_tensor_view_of_nz():
                 wt = pl.load(v, [0, 0], [512, 256], target_memory=pl.Mem.Mat)
                 pl.store(wt, [0, 0], out)
                 return out
+
+
+# -- A sliced shard handed to a separate kernel -------------------------------
+#
+# `BlockNzTensorViews` blocks a leading-axis slice, but the driver shape that
+# needs it passes the slice as an argument to an outlined kernel. That route
+# goes through `OptimizeOrchTensors`, which used to stamp the parent's logical
+# row-major strides onto the kernel's NZ param -- strides that describe nothing
+# for fractal-blocked bytes -- and blocking then refused the explicit stride.
+# The in-function slice of `test_blocks_a_leading_axis_slice` never reaches
+# that optimizer, so only a call boundary exercises this.
+
+
+@pl.program
+class SlicedNzShardToKernel:
+    """An orchestration body handing one plane of a stacked NZ weight to a kernel."""
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def shard_mm(
+        self,
+        x: pl.Tensor[[64, 512], pl.INT8],
+        w: pl.Tensor[[256, 512], pl.INT8, pl.NZ],
+        out: pl.Out[pl.Tensor[[64, 256], pl.INT32]],
+    ) -> pl.Tensor[[64, 256], pl.INT32]:
+        xt = pl.load(x, [0, 0], [64, 512], target_memory=pl.Mem.Mat)
+        wt = pl.load(w, [0, 0], [256, 512], target_memory=pl.Mem.Mat)
+        acc = pl.matmul(xt, pl.tile.transpose_view(wt), out_dtype=pl.INT32)
+        return pl.store(acc, [0, 0], out)
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+        x: pl.Tensor[[64, 512], pl.INT8],
+        w: pl.Tensor[[2, 256, 512], pl.INT8, pl.NZ],
+        out: pl.Out[pl.Tensor[[64, 256], pl.INT32]],
+    ) -> pl.Tensor[[64, 256], pl.INT32]:
+        shard = w[1]
+        return self.shard_mm(x, shard, out)
+
+
+def test_a_sliced_shard_reaches_its_kernel_unstrided():
+    """`w[b]` passed to an outlined kernel blocks on both sides of the call."""
+    after = _run(SlicedNzShardToKernel)
+
+    # The kernel's own param, not the driver's: `_nz_param` would return
+    # whichever NZ param sorts first, which here is the stacked `[2, ...]` one.
+    kernel = after.get_function("shard_mm")
+    assert kernel is not None
+    param_type = kernel.params[1].type
+    assert isinstance(param_type, ir.TensorType)
+    assert _values(param_type.shape) == [1, 16, 16, 16, 32]
+    # An explicit stride here is what blocking refuses: the NZ stride is derived
+    # from the blocked shape, never carried from the logical parent.
+    assert param_type.tensor_view is not None
+    assert list(param_type.tensor_view.stride) == []
+
+    slices = _nz_slices(after)
+    assert len(slices) == 1
+    assert _values(_elements(slices[0].args[1])) == [1, 16, 16, 16, 32]  # shapes
+    assert _values(_elements(slices[0].args[2])) == [1, 0, 0, 0, 0]  # offsets
+
+
+# -- Temporary guard for hw-native-sys/pto-isa#317 ----------------------------
+# Delete this block together with ``CheckNzGmGapFitsBurstStride`` once the
+# upstream truncation is fixed.
+
+
+def _gap_program(rows: int, tile_rows: int):
+    """A 16-column-block NZ load of *tile_rows* out of a *rows*-row weight.
+
+    The GM gap ``TLoadGm2L1Nz2nz`` computes for it is exactly ``rows -
+    tile_rows`` 32-byte blocks, for every dtype.
+    """
+
+    @pl.program
+    class GmGap:
+        @pl.function(type=pl.FunctionType.InCore)
+        def main(
+            self,
+            x: pl.Tensor[[64, 512], pl.INT8],
+            w: pl.Tensor[[rows, 512], pl.INT8, pl.NZ],
+            out: pl.Tensor[[64, tile_rows], pl.INT32],
+        ):
+            xt = pl.load(x, [0, 0], [64, 512], target_memory=pl.Mem.Mat)
+            wt = pl.load(w, [0, 0], [tile_rows, 512], target_memory=pl.Mem.Mat)
+            acc = pl.matmul(xt, pl.tile.transpose_view(wt), out_dtype=pl.INT32)
+            pl.store(acc, [0, 0], out)
+            return out
+
+    return GmGap
+
+
+def _single_column_block_program(rows: int, tile_rows: int):
+    """The same load narrowed to one C0 column block (32 INT8 columns).
+
+    ``TLoadGm2L1Nz2nz`` passes the column-block extent as ``nBurst``, so this
+    load issues a single burst and never consumes ``gmGap``.
+    """
+
+    @pl.program
+    class OneBlock:
+        @pl.function(type=pl.FunctionType.InCore)
+        def main(
+            self,
+            x: pl.Tensor[[64, 32], pl.INT8],
+            w: pl.Tensor[[rows, 32], pl.INT8, pl.NZ],
+            out: pl.Tensor[[64, tile_rows], pl.INT32],
+        ):
+            xt = pl.load(x, [0, 0], [64, 32], target_memory=pl.Mem.Mat)
+            wt = pl.load(w, [0, 0], [tile_rows, 32], target_memory=pl.Mem.Mat)
+            acc = pl.matmul(xt, pl.tile.transpose_view(wt), out_dtype=pl.INT32)
+            pl.store(acc, [0, 0], out)
+            return out
+
+    return OneBlock
+
+
+def test_accepts_the_largest_encodable_gm_gap():
+    """65520 blocks is the largest gap a fractal-aligned load can produce."""
+    assert 65536 - 16 == 65520
+    _run(_gap_program(rows=65536, tile_rows=16))
+
+
+def test_rejects_a_gm_gap_above_the_burst_stride_field():
+    """Above 65535 blocks pto-isa truncates the gap and reads wrong fractals.
+
+    The message must say this is a temporary guard, not an NZ limitation — a
+    user who reads it as "NZ tops out here" would design around a cap that is
+    about to disappear.
+    """
+    assert 65552 - 16 == 65536
+    with pytest.raises(ValueError) as excinfo:
+        _run(_gap_program(rows=65552, tile_rows=16))
+    message = str(excinfo.value)
+    assert "65536 32-byte blocks" in message
+    assert "NOT an expected pl.NZ limitation" in message
+    assert "pto-isa#317" in message
+
+
+def test_a_taller_row_tile_rescues_the_same_tensor():
+    """The gap, not the row extent, is the limit.
+
+    Same 65552-row weight the test above refuses, read in a 32-row tile instead
+    of a 16-row one: the gap drops to 65520 and it compiles. This is why the
+    diagnostic offers a *wider* tile as the workaround.
+    """
+    assert 65552 - 32 == 65520
+    _run(_gap_program(rows=65552, tile_rows=32))
+
+
+def test_a_single_column_block_load_is_exempt_from_the_gap_limit():
+    """``gmGap`` is the stride *between* bursts, so one burst never reads it.
+
+    Verified on device in pto-isa's own tload_gm2mat ST suite: an NZ int16 load
+    with ``gShape1 = 1`` and a 65536-block gap returns bit-exact data, while the
+    identical load at ``gShape1 = 2`` corrupts 1837/4096 elements. Rejecting the
+    single-block case would refuse a load that is actually correct.
+    """
+    assert 65552 - 16 == 65536
+    _run(_single_column_block_program(rows=65552, tile_rows=16))
+
+
+def _valid_shape_program(rows: int, tile_rows: int, valid_rows: int):
+    """An NZ load whose ``valid_shape`` narrows the row window below ``shapes``.
+
+    Codegen builds the ``pto.partition_view`` from ``valid_shape`` when the load
+    carries one, so this window — not ``shapes`` — is pto-isa's ``gShape``.
+    """
+
+    @pl.program
+    class NarrowedValidShape:
+        @pl.function(type=pl.FunctionType.InCore)
+        def main(
+            self,
+            x: pl.Tensor[[64, 64], pl.INT8],
+            w: pl.Tensor[[rows, 64], pl.INT8, pl.NZ],
+            out: pl.Tensor[[64, tile_rows], pl.INT32],
+        ):
+            xt = pl.load(x, [0, 0], [64, 64], target_memory=pl.Mem.Mat)
+            wt = pl.load(w, [0, 0], [tile_rows, 64], valid_shape=[valid_rows, 64], target_memory=pl.Mem.Mat)
+            acc = pl.matmul(xt, pl.tile.transpose_view(wt), out_dtype=pl.INT32)
+            pl.store(acc, [0, 0], out)
+            return out
+
+    return NarrowedValidShape
+
+
+def test_a_narrowed_valid_shape_drives_the_gap_check():
+    """The gap follows ``valid_shape``, not ``shapes``.
+
+    ``shapes`` alone puts this load at 65520 blocks — under the bound — while
+    the partition codegen actually emits (``1x2x1x16x32``, from ``valid_shape``)
+    puts it at 65536. Measuring ``shapes`` would wave through a load that
+    truncates on device, which is the whole failure this guard exists to stop.
+    """
+    assert 65552 - 32 == 65520  # what `shapes` alone would report
+    assert 65552 - 16 == 65536  # what pto-isa actually computes
+    with pytest.raises(ValueError) as excinfo:
+        _run(_valid_shape_program(rows=65552, tile_rows=32, valid_rows=16))
+    assert "65536 32-byte blocks" in str(excinfo.value)
+
+
+def test_a_valid_shape_load_within_the_bound_is_accepted():
+    """A narrowed valid_shape is not rejected per se — only an oversized gap."""
+    assert 65536 - 16 == 65520
+    _run(_valid_shape_program(rows=65536, tile_rows=32, valid_rows=16))
+
+
+@pytest.mark.parametrize("dynamic_axis", [0, 1])
+def test_rejects_a_dynamic_leading_extent_when_folding(dynamic_axis):
+    """A rank-4 fold must reject either dynamic leading axis before codegen."""
+    batch = pl.dynamic("NZ_BATCH")
+    shape = [batch, 4, 256, 512] if dynamic_axis == 0 else [2, batch, 256, 512]
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(self, w: pl.Tensor[shape, pl.INT8, pl.NZ]):
+            return
+
+    with pytest.raises(ValueError, match=f"axis {dynamic_axis} is dynamic"):
+        passes.block_nz_tensor_views()(Before)
 
 
 if __name__ == "__main__":

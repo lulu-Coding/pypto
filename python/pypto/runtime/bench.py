@@ -30,14 +30,15 @@ module therefore:
    ``ChipWorker.init``), then restores the prior level afterward;
 2. redirects ``stderr`` at the file-descriptor level (``os.dup2`` — Python's
    ``contextlib.redirect_stderr`` cannot capture the C++ writes) into a temp
-   file around the measured region (for L3, also around ``prepare()`` so the
+   file around the worker lifetime, including teardown so the asynchronous
+   logger drains before fd restoration (for L3, also around ``prepare()`` so
    forked chip-worker processes inherit the redirected fd);
 3. parses the captured markers, reading each launch's on-NPU ``device_wall``
    and host ``chip.run`` span.
 
-Because the capture is fd-level, **all** stderr produced during the measured
-loop is diverted into the temp file (not shown live). Warmup/teardown logging
-outside the loop is unaffected.
+Because the capture is fd-level, **all** stderr produced during the
+worker lifetime is diverted into the temp file (not shown live). On failure,
+the captured setup and execution diagnostics are echoed to stderr.
 """
 
 import functools
@@ -51,6 +52,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from pypto._target import _parse_platform
 
 from .log_config import configure_log, current_level
 from .runner import RunConfig
@@ -126,7 +129,7 @@ class TraceInvocation:
     pid: int
     inv: int
     hid: str
-    spans: list[TraceSpan] = field(default_factory=list)
+    spans: list[TraceSpan] = field(default_factory=list[TraceSpan])
 
     def root(self) -> "TraceSpan | None":
         """The depth-0 span (``chip.run``), or ``None`` if absent."""
@@ -338,7 +341,7 @@ def _span_names() -> dict[str, str]:
     than spreading it across metrics.
     """
     try:
-        from simpler_setup.tools.strace_timing import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+        from simpler_setup.tools.strace_timing import (  # noqa: PLC0415
             _ROUNDS_TABLE_NAMES,
         )
     except (ImportError, AttributeError):
@@ -540,12 +543,14 @@ class BenchmarkStats:
             :meth:`per_rank` and :meth:`per_round` stay valid and populated.
     """
 
-    device_wall_us: list[float] = field(default_factory=list)
-    host_wall_us: list[float] = field(default_factory=list)
+    device_wall_us: list[float] = field(default_factory=list[float])
+    host_wall_us: list[float] = field(default_factory=list[float])
     rounds: int = 0
     warmup: int = 0
-    invocations: list[TraceInvocation] = field(default_factory=list)
-    rounds_dispatches: list[dict[int, list[TraceInvocation]]] = field(default_factory=list)
+    invocations: list[TraceInvocation] = field(default_factory=list[TraceInvocation])
+    rounds_dispatches: list[dict[int, list[TraceInvocation]]] = field(
+        default_factory=list[dict[int, list[TraceInvocation]]]
+    )
     fallback_flattened: bool = False
     unstable_dispatch_slots: bool = False
 
@@ -985,6 +990,14 @@ def _capture_fd_stderr(path: Path) -> Iterator[None]:
         os.close(saved_fd)
 
 
+def _replay_captured_stderr(path: Path) -> None:
+    """Preserve setup and execution diagnostics after fd restoration on failure."""
+    if path.exists():
+        captured = path.read_text(encoding="utf-8", errors="replace")
+        if captured:
+            print(captured, file=sys.stderr, end="")
+
+
 def _mirror_invocation(inv: Any) -> TraceInvocation:
     """Mirror a simpler ``strace_timing.Invocation`` into a pypto TraceInvocation.
 
@@ -1196,7 +1209,7 @@ def _parse_stats_from_strace(
     # where the runtime is installed, absent on the lint / unit-test host. The
     # import is resolved lazily at call time; pyright cannot see it in the lint
     # env, and unit tests skip the parse path when it is not installed.
-    from simpler_setup.tools import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+    from simpler_setup.tools import (  # noqa: PLC0415
         strace_timing as _strace_timing,
     )
 
@@ -1255,8 +1268,8 @@ def _dispatch_loop(
 
     Shared by the L2 (``ChipWorker``) and L3 (``DistributedWorker``) paths: both
     expose the same register-once :class:`RegistrationHandle`. The ``[STRACE]``
-    stderr capture is set up by the caller — its scope differs per path (L2 wraps
-    only this loop; L3 must wrap ``prepare()`` too, see :func:`benchmark`).
+    stderr capture is set up by the caller around the worker lifetime, including
+    teardown (and L3 ``prepare()``), see :func:`benchmark`.
     """
     for _ in range(warmup):  # warm caches / page-in; markers discarded
         handle(*args, config=dispatch_config)
@@ -1297,10 +1310,10 @@ def benchmark(
     #1177): this sets the runtime log level to ``timing`` for the worker's
     lifetime (restored afterward) and captures ``stderr`` at the file-descriptor
     level, so the emitted stderr is diverted into a temp file rather than shown
-    live. For L2 the capture wraps only the measured loop; for L3 it must wrap
-    ``compiled.prepare()`` as well, because the chip workers are forked there and
+    live. For L2 the capture includes worker teardown to drain queued markers;
+    for L3 it also wraps ``compiled.prepare()``, because chip workers fork there and
     inherit fd 2 at fork time — a redirect set up after the fork would miss the
-    children's markers entirely. (On L3 failure the diverted setup stderr is
+    children's markers entirely. (On failure the diverted setup stderr is
     echoed back so diagnostics are not lost.)
 
     Args:
@@ -1421,13 +1434,13 @@ def benchmark(
     try:
         with tempfile.TemporaryDirectory(prefix="pypto-bench-") as tmp:
             log_path = Path(tmp) / "strace.log"
-            if distributed:
-                # The L3 chip workers are forked inside ``prepare()`` and inherit
-                # fd 2 at fork time, so the stderr redirect MUST wrap ``prepare()``
-                # — a redirect established after the fork would not capture the
-                # children's markers. This diverts ``prepare()``'s own setup
-                # stderr too; on failure it is echoed back so diagnostics survive.
-                try:
+            try:
+                if distributed:
+                    # The L3 chip workers are forked inside ``prepare()`` and inherit
+                    # fd 2 at fork time, so the stderr redirect MUST wrap ``prepare()``
+                    # — a redirect established after the fork would not capture the
+                    # children's markers. This diverts ``prepare()``'s own setup
+                    # stderr too; on failure it is echoed back so diagnostics survive.
                     with _capture_fd_stderr(log_path):
                         # Pass the dispatch config so prepare() prewarms the ring
                         # sizing the loop below actually dispatches with.
@@ -1438,30 +1451,31 @@ def benchmark(
                         ) as rt:
                             handle = rt.register(compiled)  # register once (cid=0)
                             _dispatch_loop(handle, args, rounds=rounds, warmup=warmup, dispatch_config=config)
-                except Exception:
-                    captured = log_path.read_text(encoding="utf-8", errors="replace")
-                    if captured:
-                        print(captured, file=sys.stderr, end="")
-                    raise
-            else:
-                if config is not None:
-                    rc = config
                 else:
-                    rc_kwargs: dict[str, Any] = {"platform": platform or compiled.platform}
-                    if device_id is not None:
-                        rc_kwargs["device_id"] = device_id
-                    rc = RunConfig(**rc_kwargs)
-                enable_sdma = bool(compiled.runtime_config.get("enable_sdma", False))
-                # L2 runs the chip in-process (no fork), so the parent's fd 2
-                # redirect during the loop captures its markers.
-                with ChipWorker(
-                    rc,
-                    runtime=compiled.runtime_name,
-                    enable_sdma=enable_sdma,
-                ) as worker:
-                    handle = worker.register(compiled)  # register once; cid cached
-                    with _capture_fd_stderr(log_path):
+                    if config is not None:
+                        rc = config
+                    else:
+                        backend_type, execution_mode = _parse_platform(platform or compiled.platform)
+                        rc_kwargs: dict[str, Any] = {
+                            "backend_type": backend_type,
+                            "execution_mode": execution_mode,
+                        }
+                        if device_id is not None:
+                            rc_kwargs["device_id"] = device_id
+                        rc = RunConfig(**rc_kwargs)
+                    enable_sdma = bool(compiled.runtime_config.get("enable_sdma", False))
+                    # Worker teardown drains the asynchronous host logger. Keep fd 2
+                    # redirected until that drain finishes, or trailing launches lose
+                    # timing markers when the writer catches up after restoration.
+                    with (
+                        _capture_fd_stderr(log_path),
+                        ChipWorker(rc, runtime=compiled.runtime_name, enable_sdma=enable_sdma) as worker,
+                    ):
+                        handle = worker.register(compiled)  # register once; cid cached
                         _dispatch_loop(handle, args, rounds=rounds, warmup=warmup, dispatch_config=rc)
+            except Exception:
+                _replay_captured_stderr(log_path)
+                raise
             log_text = log_path.read_text(encoding="utf-8", errors="replace")
     finally:
         configure_log(prior_level)

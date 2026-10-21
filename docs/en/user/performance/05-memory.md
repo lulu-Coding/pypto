@@ -1,5 +1,9 @@
 # Memory
 
+> **Legacy Python API examples:** `platform=` calls on this page are retained for
+> compatibility. They emit `DeprecationWarning`; new code should use
+> `backend_type` and `execution_mode`. See the [target mapping](../../dev/08-entry-points.md#legacy-platform-examples).
+
 The runtime's four rings, why scope placement decides which one your tasks land in, and how
 to size them.
 
@@ -265,11 +269,12 @@ coherency bug, which is why this is never a default and never inferred. The
 compiler rejects the case it can see — declaring `BYPASS` on a tensor the scope
 writes is an error — but it cannot prove the general case.
 
-**Current status:** the toolchain has no bypass path yet
-([PTOAS#1356](https://github.com/hw-native-sys/PTOAS/issues/1356)). A `BYPASS`
-declaration is accepted and carried, warns at compile time, and generates exactly
-the same code as an ordinary cached read. Declaring it now costs nothing and
-starts working when that lands.
+**Requires PTOAS >= v0.64, and pays off on a2a3 only.** There, a `BYPASS` read
+compiles to a load issued against the page's uncached alias, using the offset
+the device's driver reports for it; a device that exposes no such alias reports
+zero, which leaves the read ordinary and correct. A5 does not map GM twice, so a
+declaration is accepted there and currently changes nothing. A read that declares
+nothing is unaffected on every target, byte for byte.
 
 ## See also
 

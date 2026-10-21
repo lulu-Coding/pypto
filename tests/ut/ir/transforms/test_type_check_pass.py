@@ -9,6 +9,8 @@
 
 """Unit tests for type checking via run_verifier()."""
 
+from typing import Any
+
 import pypto
 import pytest
 from pypto import DataType, ir, passes
@@ -436,6 +438,183 @@ def test_type_check_rejects_loop_carrier_metadata_disagreement(
     assert len(diagnostics) == 1
     assert expected_carriers[0] in diagnostics[0].message
     assert expected_carriers[1] in diagnostics[0].message
+
+
+def _buffer_boundary_type(container: str, **changes: Any) -> ir.Type:
+    fields: dict[str, Any] = {"shape": [8, 16], "dtype": DataType.FP32, "memory_space": ir.Mem.Vec}
+    slot_count = changes.pop("slot_count", 2)
+    fields.update(changes)
+    buffer = ir.BufferType(**fields)
+    descriptor: ir.Type = buffer
+    if container != "buffer":
+        descriptor = ir.MultiBufferType(buffer, slot_count)
+    if container == "tuple":
+        descriptor = ir.TupleType([ir.ScalarType(DataType.INT32), ir.TupleType([descriptor])])
+    return descriptor
+
+
+def _buffer_boundary(kind: str, types: list[ir.Type]) -> ir.Stmt:
+    if kind == "if":
+        return _if_with_types(*types)
+    initial = ir.Var("initial", types[0], _SPAN)
+    carry = ir.IterArg("carry", types[1], initial, _SPAN)
+    body = ir.YieldStmt([ir.Var("yielded", types[2], _SPAN)], _SPAN)
+    result = ir.Var("result", types[3], _SPAN)
+    if kind == "while":
+        return ir.WhileStmt(ir.ConstBool(True, _SPAN), [carry], body, [result], _SPAN)
+    return ir.ForStmt(_sym("i"), _idx(0), _idx(2), _idx(1), [carry], body, [result], _SPAN)
+
+
+@pytest.mark.parametrize("kind", ["if", "for", "while"])
+@pytest.mark.parametrize("container", ["buffer", "multi", "tuple"])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("shape", [8, 32]),
+        ("dtype", DataType.FP16),
+        ("memory_space", ir.Mem.Mat),
+        ("valid_shape", [-1, 16]),
+        ("blayout", ir.TileLayout.col_major),
+        ("slayout", ir.TileLayout.row_major),
+        ("fractal", 1024),
+        ("pad", ir.PadValue.zero),
+        ("compact", ir.CompactMode.normal),
+    ],
+)
+def test_buffer_descriptor_fields_must_match_at_control_flow(kind, container, field, value):
+    """Each physical field remains part of the contract, including through nested tuples."""
+    types = [_buffer_boundary_type(container) for _ in range(3 if kind == "if" else 4)]
+    types[1 if kind == "if" else 2] = _buffer_boundary_type(container, **{field: value})
+    diagnostics = _typecheck_diagnostics(_buffer_boundary(kind, types))
+    assert diagnostics
+    assert all(
+        d.error_code == passes.TypeCheckErrorType.BUFFER_DESCRIPTOR_MISMATCH.value for d in diagnostics
+    )
+    assert all(f"Buffer descriptor mismatch in {kind.title()}Stmt" in d.message for d in diagnostics)
+    assert all("BufferType" in d.message for d in diagnostics)
+
+
+@pytest.mark.parametrize("kind", ["if", "for", "while"])
+@pytest.mark.parametrize("container", ["multi", "tuple"])
+def test_multi_buffer_slot_counts_must_match_at_control_flow(kind, container):
+    """Equal element descriptors do not make different slot counts compatible."""
+    types = [_buffer_boundary_type(container) for _ in range(3 if kind == "if" else 4)]
+    types[1 if kind == "if" else 2] = _buffer_boundary_type(container, slot_count=3)
+    diagnostics = _typecheck_diagnostics(_buffer_boundary(kind, types))
+    assert diagnostics
+    assert all(
+        d.error_code == passes.TypeCheckErrorType.BUFFER_DESCRIPTOR_MISMATCH.value for d in diagnostics
+    )
+    assert all("MultiBufferType" in d.message for d in diagnostics)
+
+
+@pytest.mark.parametrize(
+    "kind,position",
+    [(kind, i) for kind, count in (("if", 3), ("for", 4), ("while", 4)) for i in range(count)],
+)
+@pytest.mark.parametrize("container", ["buffer", "multi"])
+def test_buffer_contract_checks_every_control_flow_binding(kind, position, container):
+    """Check initial values, declared carries, yields and result declarations individually."""
+    types = [_buffer_boundary_type(container) for _ in range(3 if kind == "if" else 4)]
+    types[position] = _buffer_boundary_type(container, dtype=DataType.FP16)
+    diagnostics = _typecheck_diagnostics(_buffer_boundary(kind, types))
+    assert diagnostics
+    assert all(
+        d.error_code == passes.TypeCheckErrorType.BUFFER_DESCRIPTOR_MISMATCH.value for d in diagnostics
+    )
+
+
+@pytest.mark.parametrize("kind", ["if", "for", "while"])
+@pytest.mark.parametrize("container", ["buffer", "multi", "tuple"])
+@pytest.mark.parametrize("valid_shape", [[8, 16], [-1, 16]])
+def test_equal_buffer_descriptors_from_distinct_objects_are_compatible(kind, container, valid_shape):
+    """Compare descriptor values rather than requiring the same type object."""
+    types = [
+        _buffer_boundary_type(container, valid_shape=valid_shape) for _ in range(3 if kind == "if" else 4)
+    ]
+    assert _typecheck_diagnostics(_buffer_boundary(kind, types)) == []
+
+
+def _layout_call_program(
+    *,
+    device_dispatch: bool,
+    callee_layout: ir.TensorLayout = ir.TensorLayout.NZ,
+    caller_layout: ir.TensorLayout = ir.TensorLayout.ND,
+    submit: bool = False,
+) -> ir.Program:
+    """A caller passing an ND weight to a callee that declares it ``pl.NZ``.
+
+    ``device=`` marks a dispatch into a device program: the caller only says
+    which card the bytes are on, so the callee's parameter is the only claim
+    about their order.
+    """
+    shape = [_idx(256), _idx(512)]
+    nd_type = ir.TensorType(shape, DataType.INT8, None, ir.TensorView(layout=caller_layout))
+    callee_type = ir.TensorType(shape, DataType.INT8, None, ir.TensorView(layout=callee_layout))
+
+    callee_param = ir.Var("w", callee_type, _SPAN)
+    callee = ir.Function("device_program", [callee_param], [], ir.ReturnStmt([], _SPAN), _SPAN)
+
+    caller_param = ir.Var("w_host", nd_type, _SPAN)
+    callee_gvar = ir.GlobalVar("device_program")
+    attrs = [("device", 0)] if device_dispatch else []
+    if submit:
+        call = ir.Submit(callee_gvar, [caller_param], [], {}, attrs, ir.ScalarType(DataType.TASK_ID), _SPAN)
+    else:
+        call = ir.Call(callee_gvar, [caller_param], {}, attrs, ir.TupleType([]), _SPAN)
+    caller_body = ir.SeqStmts([ir.EvalStmt(call, _SPAN), ir.ReturnStmt([], _SPAN)], _SPAN)
+    caller = ir.Function("host_driver", [caller_param], [], caller_body, _SPAN)
+    return ir.Program([caller, callee], "test", _SPAN)
+
+
+def _layout_diagnostics(program: ir.Program) -> list[passes.Diagnostic]:
+    properties = passes.IRPropertySet()
+    properties.insert(passes.IRProperty.TypeChecked)
+    return passes.PropertyVerifierRegistry.verify(properties, program)
+
+
+def test_type_check_rejects_a_plain_call_that_changes_layout():
+    """Inside one program both ends read the bytes, so both must agree."""
+    diagnostics = _layout_diagnostics(_layout_call_program(device_dispatch=False))
+    assert any("Layout mismatch" in d.message for d in diagnostics)
+
+
+def test_type_check_accepts_an_nd_buffer_dispatched_to_an_nz_parameter():
+    """A ``device=`` dispatch hands over a buffer, not a layout claim."""
+    diagnostics = _layout_diagnostics(_layout_call_program(device_dispatch=True))
+    assert not any("Layout mismatch" in d.message for d in diagnostics)
+
+
+def test_type_check_rejects_an_nd_buffer_dispatched_to_an_mx_parameter():
+    """Only NZ has a logical-to-blocked restatement at the orchestration entry.
+
+    An MX parameter is blocked the same way, but nothing restates the incoming
+    ND tensor into that form, so the exemption would hand a kernel ordinary
+    bytes to read as packed MX data.
+    """
+    diagnostics = _layout_diagnostics(
+        _layout_call_program(device_dispatch=True, callee_layout=ir.TensorLayout.MX_A_ZZ)
+    )
+    assert any("Layout mismatch" in d.message for d in diagnostics)
+
+
+@pytest.mark.parametrize("submit", [False, True])
+@pytest.mark.parametrize(
+    "caller_layout,callee_layout,accepted",
+    [
+        (ir.TensorLayout.ND, ir.TensorLayout.NZ, True),
+        (ir.TensorLayout.NZ, ir.TensorLayout.ND, False),
+        (ir.TensorLayout.ND, ir.TensorLayout.MX_A_ZZ, False),
+    ],
+)
+def test_device_dispatch_layout_direction_for_call_and_submit(submit, caller_layout, callee_layout, accepted):
+    diagnostics = _layout_diagnostics(
+        _layout_call_program(
+            device_dispatch=True, caller_layout=caller_layout, callee_layout=callee_layout, submit=submit
+        )
+    )
+    mismatched = any("Layout mismatch" in d.message for d in diagnostics)
+    assert mismatched is not accepted
 
 
 if __name__ == "__main__":

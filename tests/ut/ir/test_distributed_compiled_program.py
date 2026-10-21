@@ -16,12 +16,14 @@ owner Buffer/provenance cannot belong to a temporary one-shot Worker.
 """
 
 import json
+import warnings
 from unittest.mock import patch
 
 import pypto.language as pl
 import pytest
 import torch
 from pypto import DataType, ir
+from pypto._artifact_contract import ArtifactExecutionMode, ExecutionCapabilities
 from pypto.backend import BackendType
 from pypto.ir.distributed_compiled_program import (
     _DISTRIBUTED_META_FILENAME,
@@ -29,7 +31,7 @@ from pypto.ir.distributed_compiled_program import (
     DistributedConfig,
 )
 from pypto.pypto_core.ir import ParamDirection
-from pypto.runtime import DeviceTensor, StackedDeviceTensor
+from pypto.runtime import DeviceTensor, ExecutionMode, StackedDeviceTensor
 
 
 @pl.program
@@ -163,9 +165,26 @@ def test_compile_persists_distributed_meta(compiled, tmp_path):
     assert shapes == [[128, 128], [128, 128], [128, 128]]
     assert meta["num_return_types"] == 1
     assert meta["platform"] == "a2a3sim"
-    assert meta["backend_type"] == "Ascend910B"
+    assert meta["backend_type"] == "Ascend910"
     assert meta["distributed_config"]["runtime"] == "tensormap_and_ringbuffer"
     assert meta["distributed_config"]["aicpu_thread_num"] == 0
+
+
+@pytest.mark.parametrize("backend_name", ["Ascend910", "Ascend910B"])
+def test_from_dir_accepts_ascend910_backend_names(compiled, tmp_path, backend_name):
+    """The shared metadata reader must also retain compatibility for L3 artifacts."""
+    meta_path = tmp_path / _DISTRIBUTED_META_FILENAME
+    meta = json.loads(meta_path.read_text())
+    meta["backend_type"] = backend_name
+    meta_path.write_text(json.dumps(meta))
+    persisted = meta_path.read_bytes()
+
+    reloaded = DistributedCompiledProgram.from_dir(tmp_path)
+
+    assert reloaded.backend_type is BackendType.Ascend910
+    assert reloaded.backend_type.name == "Ascend910"
+    assert reloaded.platform == "a2a3sim"
+    assert meta_path.read_bytes() == persisted
 
 
 def test_from_dir_round_trips_param_metadata(compiled, tmp_path):
@@ -399,6 +418,87 @@ def test_distributed_types_are_reexported_from_pypto_ir():
     assert ir.DistributedConfig is DistributedConfig
     assert "DistributedCompiledProgram" in ir.__all__
     assert "DistributedConfig" in ir.__all__
+
+
+def test_distributed_capabilities_round_trip_without_workers(compiled, tmp_path):
+    with patch("pypto.runtime.distributed_runner._execute_distributed") as execute:
+        restored = DistributedCompiledProgram.from_dir(tmp_path)
+        assert restored.execution_capabilities == compiled.execution_capabilities == ExecutionCapabilities()
+        with pytest.raises(ValueError, match="requires 'kernel'"):
+            restored.execution_capabilities.require(ArtifactExecutionMode.KERNEL)
+    execute.assert_not_called()
+
+
+@pytest.mark.parametrize("legacy", [True, False])
+def test_distributed_reload_rejects_legacy_or_kernel_metadata(compiled, tmp_path, legacy):
+    path = tmp_path / _DISTRIBUTED_META_FILENAME
+    meta = json.loads(path.read_text())
+    if legacy:
+        meta["schema"] = 2
+        del meta["supported_execution_modes"]
+    else:
+        meta["supported_execution_modes"] = ["kernel"]
+    path.write_text(json.dumps(meta))
+    with pytest.raises(ValueError, match="recompile"):
+        DistributedCompiledProgram.from_dir(tmp_path)
+
+
+@pytest.mark.filterwarnings("error::DeprecationWarning")
+@pytest.mark.parametrize(
+    ("persisted_backend", "target_backend", "target_name"),
+    [
+        (BackendType.Ascend910, BackendType.Ascend950, "a5"),
+        (BackendType.Ascend950, BackendType.Ascend910, "a2a3"),
+    ],
+)
+@pytest.mark.parametrize("persisted_mode", [None, ExecutionMode.SIM, ExecutionMode.ONBOARD])
+@pytest.mark.parametrize("override_mode", [None, ExecutionMode.SIM, ExecutionMode.ONBOARD])
+def test_reload_backend_override_keeps_target_consistent(
+    tmp_path, persisted_backend, target_backend, target_name, persisted_mode, override_mode
+):
+    DistributedCompiledProgram(
+        _L3AddProgram,
+        str(tmp_path),
+        backend_type=persisted_backend,
+        execution_mode=persisted_mode or ExecutionMode.SIM,
+    )
+    meta_path = tmp_path / _DISTRIBUTED_META_FILENAME
+    if persisted_mode is None:
+        payload = json.loads(meta_path.read_text())
+        del payload["platform"]
+        meta_path.write_text(json.dumps(payload))
+    metadata = meta_path.read_bytes()
+
+    restored = DistributedCompiledProgram.from_dir(
+        tmp_path, backend_type=target_backend, execution_mode=override_mode
+    )
+    expected_mode = override_mode or persisted_mode or ExecutionMode.SIM
+    assert restored.backend_type == target_backend
+    assert restored.execution_mode is expected_mode
+    assert restored.platform == target_name + ("sim" if expected_mode is ExecutionMode.SIM else "")
+    assert meta_path.read_bytes() == metadata
+
+
+def test_from_dir_overrides_execution_mode(compiled, tmp_path):
+    restored = DistributedCompiledProgram.from_dir(tmp_path, execution_mode=ExecutionMode.ONBOARD)
+    assert restored.backend_type == compiled.backend_type
+    assert restored.execution_mode is ExecutionMode.ONBOARD
+    assert restored.platform == "a2a3"
+
+
+def test_reload_platform_warns_but_explicit_mode_and_metadata_are_silent(compiled, tmp_path):
+    metadata = (tmp_path / _DISTRIBUTED_META_FILENAME).read_bytes()
+    with pytest.warns(DeprecationWarning, match=r"DistributedCompiledProgram.from_dir\(platform=") as caught:
+        legacy = DistributedCompiledProgram.from_dir(tmp_path, platform="a2a3")
+    assert len(caught) == 1
+    assert caught[0].filename == __file__
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        explicit = DistributedCompiledProgram.from_dir(tmp_path, execution_mode=ExecutionMode.ONBOARD)
+        persisted = DistributedCompiledProgram.from_dir(tmp_path)
+        assert explicit.platform == legacy.platform == "a2a3"
+        assert persisted.execution_mode is ExecutionMode.SIM
+    assert (tmp_path / _DISTRIBUTED_META_FILENAME).read_bytes() == metadata
 
 
 if __name__ == "__main__":

@@ -26,7 +26,7 @@ namespace pypto {
 namespace codegen {
 
 /**
- * @brief Base class for platform code generators (Ascend910B, Ascend950, etc.)
+ * @brief Base class for platform code generators (Ascend910, Ascend950, etc.)
  *
  * Provides a common API used by operator codegen callbacks (f_codegen_ascend910b, f_codegen_ascend950).
  * Subclasses implement platform-specific code generation while sharing this contract.
@@ -199,7 +199,7 @@ class CodegenBase : public ir::IRVisitor {
    * @param expr Expression to convert
    * @return C++ code string
    */
-  [[nodiscard]] std::string GenerateExprString(const ir::ExprPtr& expr) const;
+  [[nodiscard]] virtual std::string GenerateExprString(const ir::ExprPtr& expr) const;
 
  protected:
   /**

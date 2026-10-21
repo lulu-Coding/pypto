@@ -9,11 +9,10 @@
 
 """Tests for MemoryReusePass.
 
-Most tests use the Before/Expected pattern with
-``ir.assert_structural_equal(After, Expected)``.
-DefFields always auto-map, so ``enable_auto_mapping=True`` is unnecessary.
-This aligns MemRef objects consistently: if two tiles share a MemRef in
-``After``, the corresponding tiles in ``Expected`` must also share.
+Hand-written expectations normalize inferred Call result MemRefs explicitly.
+Exact comparison still checks all variable storage fields and allocation alias
+patterns. Roundtrip instruments compare the original IR without normalization.
+DefFields always alpha-map; open references retain their identity by default.
 """
 
 import re
@@ -26,9 +25,18 @@ from pypto.backend import BackendType
 from pypto.ir.op import tile
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 
+from .storage_test_utils import without_call_memrefs
+
 # Tile-producing reads from GM. Built through the getter so a renamed operator fails at import
 # rather than silently dropping out of the membership test below.
 _LOAD_LIKE_OPS = frozenset({ir.get_op("tile.load").name, ir.get_op("tile.read").name})
+
+
+@pytest.fixture(autouse=True)
+def legacy_storage_context(pass_verification_instruments):
+    """These tests exercise the legacy Tile storage algorithm directly."""
+    with passes.PassContext(pass_verification_instruments, enable_buffer_ir=False):
+        yield
 
 
 def _run_pipeline(program: ir.Program) -> ir.Program:
@@ -324,7 +332,7 @@ class TestBasic:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_sequential(self):
         """Sequential chain: tile_a/c/e share one buffer, tile_b/d share another."""
@@ -377,10 +385,10 @@ class TestBasic:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_different_sizes(self):
-        """Different-shaped tiles cannot reuse each other's buffer."""
+        """Smaller tiles can reuse a dead larger allocation when lifetimes permit."""
 
         @pl.program
         class Before:
@@ -402,8 +410,8 @@ class TestBasic:
                 result_f: pl.Tensor[[32, 32], pl.FP32] = pl.store(tile_f, [0, 0], output_b)
                 return result_f
 
-        # tile_a/tile_e share mem_vec_4 (16384 bytes). tile_b/tile_f share mem_vec_5
-        # (4096 bytes). Different sizes never alias.
+        # tile_b fits in the dead tile_a allocation; tile_f overlaps tile_e
+        # and needs its own smaller allocation.
         @pl.program
         class Expected:
             @pl.function
@@ -422,9 +430,9 @@ class TestBasic:
                 _result_a: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_2", 0, 16384)] = pl.tile.store(
                     tile_a, [0, 0], output_a
                 )
-                tile_b: pl.Tile[[32, 32], pl.FP32, pl.MemRef(mem_vec_5, 0, 4096), pl.Mem.Vec] = pl.tile.load(
-                    input_b, [0, 0], [32, 32], [32, 32]
-                )
+                tile_b: pl.Tile[
+                    [32, 32], pl.FP32, pl.MemRef(mem_vec_4, pl.const(0, pl.INDEX), 4096), pl.Mem.Vec
+                ] = pl.tile.load(input_b, [0, 0], [32, 32], [32, 32])
                 _result_b: pl.Tensor[[32, 32], pl.FP32, pl.MemRef("mem_ddr_3", 0, 4096)] = pl.tile.store(
                     tile_b, [0, 0], output_b
                 )
@@ -443,7 +451,7 @@ class TestBasic:
                 return result_f
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_empty_function(self):
         """Empty function (no TileType) should pass through unchanged."""
@@ -467,7 +475,7 @@ class TestBasic:
                 return output
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_transitive_conflict(self):
         """Transitive conflict: tile_c and tile_d cannot share."""
@@ -521,7 +529,7 @@ class TestBasic:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
 
 class TestAllocCleanup:
@@ -572,7 +580,7 @@ class TestAllocCleanup:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_partial_reuse_with_overlapping_lifetimes(self):
         """When some lifetimes truly overlap, only partial reuse happens.
@@ -620,7 +628,7 @@ class TestAllocCleanup:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
 
 class TestDtype:
@@ -634,7 +642,8 @@ class TestDtype:
     """
 
     def test_cross_dtype_can_reuse(self):
-        """All tiles collapse onto one buffer regardless of FP32/BF16 dtype."""
+        """A5 retains safe cross-dtype cast reuse; A2/A3 requires separation."""
+        backend.set_backend_type(BackendType.Ascend950)
 
         @pl.program
         class Before:
@@ -672,22 +681,23 @@ class TestDtype:
                 tile_b: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.add(
                     tile_a, tile_a
                 )
-                tile_cast: pl.Tile[[64, 64], pl.BF16, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = (
-                    pl.tile.cast(tile_b, target_type=pl.BF16, mode="round")
-                )
-                tile_d: pl.Tile[[64, 64], pl.BF16, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.add(
-                    tile_cast, tile_cast
-                )
-                tile_e: pl.Tile[[64, 64], pl.BF16, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.add(
-                    tile_d, tile_d
-                )
+                tile_cast: pl.Tile[
+                    [64, 64], pl.BF16, pl.MemRef(mem_vec_2, pl.const(0, pl.INDEX), 8192), pl.Mem.Vec
+                ] = pl.tile.cast(tile_b, target_type=pl.BF16, mode="round")
+                tile_d: pl.Tile[
+                    [64, 64], pl.BF16, pl.MemRef(mem_vec_2, pl.const(0, pl.INDEX), 8192), pl.Mem.Vec
+                ] = pl.tile.add(tile_cast, tile_cast)
+                tile_e: pl.Tile[
+                    [64, 64], pl.BF16, pl.MemRef(mem_vec_2, pl.const(0, pl.INDEX), 8192), pl.Mem.Vec
+                ] = pl.tile.add(tile_d, tile_d)
                 result: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)] = pl.tile.store(
                     tile_e, [0, 0], output
                 )
                 return result
 
-        After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        with passes.PassContext([], enable_buffer_ir=False):
+            After = _run_pipeline(Before)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
 
 class TestFillpad:
@@ -753,7 +763,7 @@ class TestFillpad:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_fillpad_different_pad_can_reuse(self):
         """Two fillpad outputs with different pad values share one buffer."""
@@ -833,7 +843,7 @@ class TestFillpad:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_fillpad_same_pad_can_reuse(self):
         """Two fillpad outputs with identical TileView attributes CAN reuse."""
@@ -912,7 +922,7 @@ class TestFillpad:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
 
 class TestValidShapeDivergence:
@@ -979,7 +989,9 @@ class TestValidShapeDivergence:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(
+            without_call_memrefs(After), without_call_memrefs(Expected), enable_auto_mapping=True
+        )
 
     def test_non_2d_divergent_valid_shape_can_reuse(self):
         """3D tiles with divergent ``valid_shape`` share a MemRef (gate removed)."""
@@ -1079,7 +1091,9 @@ class TestValidShapeDivergence:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        ir.assert_structural_equal(
+            without_call_memrefs(After), without_call_memrefs(Expected), enable_auto_mapping=True
+        )
 
 
 def _collect_tile_memref_bases(program: ir.Program) -> dict[str, str]:
@@ -1451,7 +1465,7 @@ class TestViewOps:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_reshape_not_broken_by_memory_reuse(self):
         """MemoryReuse should propagate reuse to ALL variables sharing MemRef.
@@ -1507,7 +1521,7 @@ class TestViewOps:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_reshape_shared_buffer_can_be_reused_after_all_dead(self):
         """After all aliases are dead, shared buffer can be reused."""
@@ -1558,7 +1572,7 @@ class TestViewOps:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
 
 class TestInplaceOps:
@@ -1673,7 +1687,7 @@ class TestInplaceOps:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_move_output_must_not_alias_input(self):
         """tile.move's output must get a buffer distinct from its input.
@@ -1769,7 +1783,7 @@ class TestInplaceOps:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_inplace_safe_op_allows_producer_consumer_reuse(self):
         """tile.add (inplace-safe) CAN reuse its input's buffer."""
@@ -1808,7 +1822,7 @@ class TestInplaceOps:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_ands_no_producer_consumer_reuse(self):
         """tile.ands must NOT reuse its input's buffer."""
@@ -1848,7 +1862,7 @@ class TestInplaceOps:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_xors_no_producer_consumer_reuse(self):
         """tile.xors must NOT reuse its input's buffer."""
@@ -1896,7 +1910,7 @@ class TestInplaceOps:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_xor_output_does_not_alias_sources_or_tmp(self):
         """TXOR decomposition requires four distinct live buffers."""
@@ -1987,7 +2001,7 @@ class TestInplaceOps:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
 
 class TestYieldFixup:
@@ -2048,7 +2062,7 @@ class TestYieldFixup:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_simple_loop_memrefs_unified(self):
         """Simple loop: iter_arg/initValue/return_var/next_0 all land in a
@@ -2098,7 +2112,7 @@ class TestYieldFixup:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_multiple_iter_args_producers_retyped_independently(self):
         """With 2 iter_args, the retargeter retypes each yield producer
@@ -2169,7 +2183,7 @@ class TestYieldFixup:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_if_stmt_return_var_memref_patched(self):
         """tile_b/tile_c reuse tile_a's MemRef; if_result picks up the patched MemRef."""
@@ -2247,7 +2261,7 @@ class TestYieldFixup:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_if_stmt_tile_move_when_branch_memrefs_differ(self):
         """When IfStmt branches yield tiles with different MemRefs, the pass
@@ -2322,7 +2336,7 @@ class TestYieldFixup:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_if_phi_arm_yielding_iter_arg_still_copies_into_the_phi_buffer(self):
         """Every arm of an if-phi must write the phi's buffer, IterArg arms included.
@@ -2387,9 +2401,9 @@ class TestYieldFixup:
                 mem_vec_4: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 8192)
                 mem_vec_5: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 mem_vec_6: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
-                src_tile: pl.Tile[[1, 2048], pl.FP32, pl.MemRef(mem_vec_6, 0, 16384), pl.Mem.Vec] = (
-                    pl.tile.load(src_tensor, [0, 0], [1, 2048], [1, 2048], target_memory=pl.Mem.Vec)
-                )
+                src_tile: pl.Tile[
+                    [1, 2048], pl.FP32, pl.MemRef(mem_vec_6, pl.const(0, pl.INDEX), 8192), pl.Mem.Vec
+                ] = pl.tile.load(src_tensor, [0, 0], [1, 2048], [1, 2048], target_memory=pl.Mem.Vec)
                 idx_tile: pl.Tile[[1, 2048], pl.UINT32, pl.MemRef(mem_vec_4, 0, 8192), pl.Mem.Vec] = (
                     pl.tile.load(idx_tensor, [0, 0], [1, 2048], [1, 2048], target_memory=pl.Mem.Vec)
                 )
@@ -2417,16 +2431,16 @@ class TestYieldFixup:
                     result: pl.Tile[[1, 4096], pl.FP32, pl.MemRef(mem_vec_5, 0, 16384), pl.Mem.Vec] = (
                         pl.yield_(phi_mv)
                     )
-                vals: pl.Tile[[1, 2048], pl.FP32, pl.MemRef(mem_vec_6, 0, 16384), pl.Mem.Vec] = (
-                    pl.tile.gather_mask(result, mask_pattern=pl.tile.MaskPattern.P0101)
-                )
+                vals: pl.Tile[
+                    [1, 2048], pl.FP32, pl.MemRef(mem_vec_6, pl.const(0, pl.INDEX), 8192), pl.Mem.Vec
+                ] = pl.tile.gather_mask(result, mask_pattern=pl.tile.MaskPattern.P0101)
                 out_val: pl.Tensor[[1, 2048], pl.FP32, pl.MemRef("mem_ddr_2", 0, 8192)] = pl.tile.store(
                     vals, [0, 0], val_output
                 )
                 return out_val
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
         _assert_if_phi_arms_write_the_phi_buffer(After)
 
     def test_if_phi_arm_yielding_iter_arg_makes_the_carry_buffer_canonical(self):
@@ -2488,9 +2502,9 @@ class TestYieldFixup:
                 mem_vec_4: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 8192)
                 mem_vec_5: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 mem_vec_6: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
-                src_tile: pl.Tile[[1, 2048], pl.FP32, pl.MemRef(mem_vec_6, 0, 16384), pl.Mem.Vec] = (
-                    pl.tile.load(src_tensor, [0, 0], [1, 2048], [1, 2048], target_memory=pl.Mem.Vec)
-                )
+                src_tile: pl.Tile[
+                    [1, 2048], pl.FP32, pl.MemRef(mem_vec_6, pl.const(0, pl.INDEX), 8192), pl.Mem.Vec
+                ] = pl.tile.load(src_tensor, [0, 0], [1, 2048], [1, 2048], target_memory=pl.Mem.Vec)
                 idx_tile: pl.Tile[[1, 2048], pl.UINT32, pl.MemRef(mem_vec_4, 0, 8192), pl.Mem.Vec] = (
                     pl.tile.load(idx_tensor, [0, 0], [1, 2048], [1, 2048], target_memory=pl.Mem.Vec)
                 )
@@ -2515,16 +2529,16 @@ class TestYieldFixup:
                     result: pl.Tile[[1, 4096], pl.FP32, pl.MemRef(mem_vec_5, 0, 16384), pl.Mem.Vec] = (
                         pl.yield_(phi)
                     )
-                vals: pl.Tile[[1, 2048], pl.FP32, pl.MemRef(mem_vec_6, 0, 16384), pl.Mem.Vec] = (
-                    pl.tile.gather_mask(result, mask_pattern=pl.tile.MaskPattern.P0101)
-                )
+                vals: pl.Tile[
+                    [1, 2048], pl.FP32, pl.MemRef(mem_vec_6, pl.const(0, pl.INDEX), 8192), pl.Mem.Vec
+                ] = pl.tile.gather_mask(result, mask_pattern=pl.tile.MaskPattern.P0101)
                 out_val: pl.Tensor[[1, 2048], pl.FP32, pl.MemRef("mem_ddr_2", 0, 8192)] = pl.tile.store(
                     vals, [0, 0], val_output
                 )
                 return out_val
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
         _assert_if_phi_arms_write_the_phi_buffer(After)
 
     def test_carry_writebacks_run_before_they_are_overwritten(self):
@@ -2601,7 +2615,7 @@ class TestYieldFixup:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
         _assert_carry_writebacks_do_not_clobber(After)
 
     def test_carry_writeback_cycle_is_broken_with_a_spill_buffer(self):
@@ -2677,7 +2691,7 @@ class TestYieldFixup:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
         _assert_carry_writebacks_do_not_clobber(After)
 
     def test_carry_writeback_distinguishes_slots_of_one_allocation(self):
@@ -2771,9 +2785,9 @@ class TestYieldFixup:
                 mem_vec_4: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 8192)
                 mem_vec_5: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 mem_vec_6: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
-                src_tile: pl.Tile[[1, 2048], pl.FP32, pl.MemRef(mem_vec_6, 0, 16384), pl.Mem.Vec] = (
-                    pl.tile.load(src_tensor, [0, 0], [1, 2048], [1, 2048], target_memory=pl.Mem.Vec)
-                )
+                src_tile: pl.Tile[
+                    [1, 2048], pl.FP32, pl.MemRef(mem_vec_6, pl.const(0, pl.INDEX), 8192), pl.Mem.Vec
+                ] = pl.tile.load(src_tensor, [0, 0], [1, 2048], [1, 2048], target_memory=pl.Mem.Vec)
                 idx_tile: pl.Tile[[1, 2048], pl.UINT32, pl.MemRef(mem_vec_4, 0, 8192), pl.Mem.Vec] = (
                     pl.tile.load(idx_tensor, [0, 0], [1, 2048], [1, 2048], target_memory=pl.Mem.Vec)
                 )
@@ -2794,16 +2808,16 @@ class TestYieldFixup:
                     r_outer: pl.Tile[[1, 4096], pl.FP32, pl.MemRef(mem_vec_5, 0, 16384), pl.Mem.Vec] = (
                         pl.yield_(r_inner)
                     )
-                vals: pl.Tile[[1, 2048], pl.FP32, pl.MemRef(mem_vec_6, 0, 16384), pl.Mem.Vec] = (
-                    pl.tile.gather_mask(r_outer, mask_pattern=pl.tile.MaskPattern.P0101)
-                )
+                vals: pl.Tile[
+                    [1, 2048], pl.FP32, pl.MemRef(mem_vec_6, pl.const(0, pl.INDEX), 8192), pl.Mem.Vec
+                ] = pl.tile.gather_mask(r_outer, mask_pattern=pl.tile.MaskPattern.P0101)
                 out_val: pl.Tensor[[1, 2048], pl.FP32, pl.MemRef("mem_ddr_2", 0, 8192)] = pl.tile.store(
                     vals, [0, 0], val_output
                 )
                 return out_val
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
         _assert_carry_yield_lands_in_its_buffer(After)
 
     def test_carry_held_in_one_dynamic_slot_needs_no_copy(self):
@@ -3057,7 +3071,7 @@ class TestControlFlow:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_different_if_branches_can_share(self):
         """Variables in different IfStmt branches CAN share MemRef (non-overlapping lifetimes)."""
@@ -3125,7 +3139,7 @@ class TestControlFlow:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_loop_local_var_can_be_reused(self):
         """Loop-local vars share a scratch buffer; the yield producer is
@@ -3194,7 +3208,7 @@ class TestControlFlow:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_nested_for_loops_outer_var_extends_to_outer_end(self):
         """Variable defined before nested loops, used in inner loop body --
@@ -3273,7 +3287,7 @@ class TestControlFlow:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_if_without_else_branch(self):
         """IfStmt with only then branch (no else): tile_a is alive through the
@@ -3332,7 +3346,7 @@ class TestControlFlow:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_for_with_if_multiple_vars_competing(self):
         """ForStmt with IfStmt inside: `tile_a` and `tile_b` are live across
@@ -3416,7 +3430,7 @@ class TestControlFlow:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_branch_local_var_does_not_leak(self):
         """A variable defined and consumed entirely inside one IfStmt branch
@@ -3482,7 +3496,7 @@ class TestControlFlow:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_if_phi_read_after_branch_blocks_reuse(self):
         """An scf.if return_var (phi) read *after* the branch keeps its buffer
@@ -3561,7 +3575,7 @@ class TestControlFlow:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_loop_return_var_blocks_init_memref_reuse(self):
         """Return_var used after loop must block reuse of initValue's MemRef.
@@ -3642,7 +3656,7 @@ class TestControlFlow:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
 
 def _assert_single_acc_buffer_no_move(after: ir.Program, label: str) -> None:
@@ -3757,7 +3771,7 @@ class TestTopDownRetargeter:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_padded_acc_initializer_preserves_valid_shape_and_coalesces(self):
         """A ``set_validshape`` Acc initializer stays on the loop accumulator allocation.
@@ -3873,17 +3887,26 @@ class TestTopDownRetargeter:
                     output = pl.tensor.assemble(output, tile, [region_index * 16, 0])
                 return output
 
-        with passes.PassContext([], memory_planner=planner):
+        with passes.PassContext([], memory_planner=planner, enable_buffer_ir=False):
             lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(NestedAccumulator)
         aic_functions = [
             function for function in lowered.functions.values() if function.func_type == ir.FunctionType.AIC
         ]
         assert len(aic_functions) == 1
 
-        body = aic_functions[0].as_python()
-        assert "pl.tile.matmul_acc(" in body
+        calls = []
+
+        class CollectCalls(ir.IRVisitor):
+            def visit_call(self, op):
+                calls.append(op)
+                super().visit_call(op)
+
+        CollectCalls().visit_function(aic_functions[0])
+        assert any(call.op.name == ir.get_op("tile.matmul_acc").name for call in calls)
         assert not any(
-            "pl.tile.move(" in line and "target_memory=pl.Mem.Acc" in line for line in body.splitlines()
+            call.op.name == ir.get_op("tile.move").name
+            and call.kwargs.get("target_memory") == ir.MemorySpace.Acc
+            for call in calls
         )
 
         aic = aic_functions[0]
@@ -3983,7 +4006,7 @@ class TestTopDownRetargeter:
 
         # BASIC verification: the coalescing fix makes the peeled IR round-trip
         # clean, so this exercises the legality check, not just the buffer count.
-        with passes.PassContext([], passes.VerificationLevel.BASIC):
+        with passes.PassContext([], passes.VerificationLevel.BASIC, enable_buffer_ir=False):
             legacy_after = passes.memory_reuse()(
                 passes.materialize_semantic_aliases()(
                     passes.init_mem_ref()(passes.lower_pipeline_loops()(Before))
@@ -3998,6 +4021,7 @@ class TestTopDownRetargeter:
             [],
             passes.VerificationLevel.BASIC,
             memory_planner=passes.MemoryPlanner.DSA_RP,
+            enable_buffer_ir=False,
         ):
             dsa_after = passes.materialize_semantic_aliases()(
                 passes.init_mem_ref()(passes.lower_pipeline_loops()(Before))
@@ -4086,7 +4110,7 @@ class TestTopDownRetargeter:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_failed_if_retarget_rolls_back_successful_sibling_arm(self):
         """A declined branch must not leak rewrites planned for its sibling.
@@ -4769,7 +4793,7 @@ class SharedSuffix:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_retargeter_declines_when_read_after_nested_if(self):
         """Regression test for the ancestor-walking liveness check.
@@ -4863,7 +4887,7 @@ class SharedSuffix:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_retargeter_declines_for_not_inplace_safe_op(self):
         """Regression test for the not_inplace_safe check.
@@ -4928,9 +4952,9 @@ class SharedSuffix:
                 mem_vec_4: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 8192)
                 mem_vec_5: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 mem_vec_6: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
-                src_tile: pl.Tile[[1, 2048], pl.FP32, pl.MemRef(mem_vec_6, 0, 16384), pl.Mem.Vec] = (
-                    pl.tile.load(src_tensor, [0, 0], [1, 2048], [1, 2048])
-                )
+                src_tile: pl.Tile[
+                    [1, 2048], pl.FP32, pl.MemRef(mem_vec_6, pl.const(0, pl.INDEX), 8192), pl.Mem.Vec
+                ] = pl.tile.load(src_tensor, [0, 0], [1, 2048], [1, 2048])
                 idx_tile: pl.Tile[[1, 2048], pl.UINT32, pl.MemRef(mem_vec_4, 0, 8192), pl.Mem.Vec] = (
                     pl.tile.load(idx_tensor, [0, 0], [1, 2048], [1, 2048])
                 )
@@ -4948,16 +4972,16 @@ class SharedSuffix:
                     result: pl.Tile[[1, 4096], pl.FP32, pl.MemRef(mem_vec_5, 0, 16384), pl.Mem.Vec] = (
                         pl.yield_(merged_mv)
                     )
-                vals: pl.Tile[[1, 2048], pl.FP32, pl.MemRef(mem_vec_6, 0, 16384), pl.Mem.Vec] = (
-                    pl.tile.gather_mask(result, mask_pattern=pl.tile.MaskPattern.P0101)
-                )
+                vals: pl.Tile[
+                    [1, 2048], pl.FP32, pl.MemRef(mem_vec_6, pl.const(0, pl.INDEX), 8192), pl.Mem.Vec
+                ] = pl.tile.gather_mask(result, mask_pattern=pl.tile.MaskPattern.P0101)
                 out_val: pl.Tensor[[1, 2048], pl.FP32, pl.MemRef("mem_ddr_2", 0, 8192)] = pl.tile.store(
                     vals, [0, 0], val_output
                 )
                 return out_val
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
     def test_predicated_pipelined_kloop_uses_one_acc_buffer(self):
         """The migration target for the peel the sibling test rejects.
@@ -5005,7 +5029,7 @@ class SharedSuffix:
 
         peeled = passes.init_mem_ref()(passes.lower_pipeline_loops()(Before))
 
-        with passes.PassContext([], passes.VerificationLevel.BASIC):
+        with passes.PassContext([], passes.VerificationLevel.BASIC, enable_buffer_ir=False):
             legacy_after = passes.memory_reuse()(passes.materialize_semantic_aliases()(peeled))
         _assert_single_acc_buffer_no_move(legacy_after, "PYPTO")
 
@@ -5013,6 +5037,7 @@ class SharedSuffix:
             [],
             passes.VerificationLevel.BASIC,
             memory_planner=passes.MemoryPlanner.DSA_RP,
+            enable_buffer_ir=False,
         ):
             dsa_after = passes.materialize_semantic_aliases()(peeled)
         _assert_single_acc_buffer_no_move(dsa_after, "DSA_RP")
@@ -5143,7 +5168,7 @@ class SharedSuffix:
                 return result
 
         After = _run_pipeline(Before)
-        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
 
         # Sanity: split metadata round-trips through the pass.
         after_vp = After.get_function("vector_producer")
@@ -5212,7 +5237,7 @@ class TestStructuralShapeEquality:
             [
                 ir.AssignStmt(
                     tile_a,
-                    tile.load(input_x, offsets=[0, 0], shapes=[64, 64], target_memory=ir.MemorySpace.Vec),
+                    tile.load(input_x, offsets=[0, 0], shapes=[add_1, c64], target_memory=ir.MemorySpace.Vec),
                     span,
                 ),
                 ir.AssignStmt(
@@ -5222,7 +5247,7 @@ class TestStructuralShapeEquality:
                 ),
                 ir.AssignStmt(
                     tile_b,
-                    tile.load(input_x, offsets=[0, 0], shapes=[64, 64], target_memory=ir.MemorySpace.Vec),
+                    tile.load(input_x, offsets=[0, 0], shapes=[add_2, c64], target_memory=ir.MemorySpace.Vec),
                     span,
                 ),
                 ir.AssignStmt(
@@ -5489,10 +5514,18 @@ class TestL0CrossShapeReuse:
         assert physical["small_r0"].byte_offset_.value == 0
         assert isinstance(physical["small_r1"].byte_offset_, ir.ConstInt)
         assert physical["small_r1"].byte_offset_.value == 32768
-        # Pure tile.slice addresses deliberately collapse to the bare base here;
-        # PTO derives the runtime window from the placed source tile below.
-        assert isinstance(physical["small_r1_view"].byte_offset_, ir.ConstInt)
-        assert physical["small_r1_view"].byte_offset_.value == 0
+        # The view keeps its symbolic row offset: the placed address is its original
+        # relative offset displaced by the root's 32 KiB rebase (buffer base 0).
+        placed_displacement = Analyzer().simplify(
+            ir.Sub(
+                physical["small_r1_view"].byte_offset_,
+                before_view.byte_offset_,
+                DataType.INDEX,
+                ir.Span.unknown(),
+            )
+        )
+        assert isinstance(placed_displacement, ir.ConstInt)
+        assert placed_displacement.value == 32768
 
         mlir = codegen.PTOCodegen().generate(allocated)
         small_r1_alloc = next(
@@ -5846,7 +5879,7 @@ class TestStorageLayoutReuse:
 
 class TestAscend910BLoadTpopHazard:
     """MemoryReuse must not coalesce a writer that consumes a tile.load result
-    and a tile.tpop_from_aic value into the load's buffer on Ascend910B split-AIV
+    and a tile.tpop_from_aic value into the load's buffer on Ascend910 split-AIV
     functions — that in-place sharing is a silent hardware hazard.  This guard
     folds in the responsibility formerly owned by LegalizePTOBufferReuse.
     """
@@ -5884,7 +5917,7 @@ class TestAscend910BLoadTpopHazard:
 
     def test_ascend910b_split_aiv_does_not_reuse_load_buffer(self):
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         try:
             After = passes.memory_reuse()(self._build_program())
         finally:
@@ -5893,7 +5926,7 @@ class TestAscend910BLoadTpopHazard:
         bases = _collect_tile_memref_bases(After)
         assert "down_prev" in bases and "down_next" in bases, f"missing tile vars; got {bases}"
         assert bases["down_next"] != bases["down_prev"], (
-            "Ascend910B split-AIV: tile.add output must NOT reuse the tile.load buffer "
+            "Ascend910 split-AIV: tile.add output must NOT reuse the tile.load buffer "
             f"(load+tpop_from_aic hazard), but both bind to {bases['down_prev']}"
         )
 
@@ -5901,9 +5934,9 @@ class TestAscend910BLoadTpopHazard:
         """DSA-RP exports the load+tpop target hazard as an unrelaxable edge."""
 
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         try:
-            with passes.PassContext([], memory_planner=passes.MemoryPlanner.DSA_RP):
+            with passes.PassContext([], memory_planner=passes.MemoryPlanner.DSA_RP, enable_buffer_ir=False):
                 after = passes.allocate_memory_addr()(
                     passes.materialize_semantic_aliases()(passes.init_mem_ref()(self._build_program()))
                 )
@@ -5914,7 +5947,7 @@ class TestAscend910BLoadTpopHazard:
         previous_offset, previous_size = ranges["down_prev"]
         next_offset, next_size = ranges["down_next"]
         assert previous_offset + previous_size <= next_offset or next_offset + next_size <= previous_offset, (
-            "Ascend910B split-AIV: DSA-RP must physically separate tile.add output "
+            "Ascend910 split-AIV: DSA-RP must physically separate tile.add output "
             f"{ranges['down_next']} from load buffer {ranges['down_prev']}"
         )
 
@@ -5964,7 +5997,7 @@ class TestAscend910BLoadTpopHazard:
         tpop value and MemoryReuse forms the in-place load touch.
         """
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         try:
             After = passes.memory_reuse()(self._build_loop_carried_program())
         finally:
@@ -5973,7 +6006,7 @@ class TestAscend910BLoadTpopHazard:
         bases = _collect_tile_memref_bases(After)
         assert "down_prev" in bases and "down_next" in bases, f"missing tile vars; got {bases}"
         assert bases["down_next"] != bases["down_prev"], (
-            "Ascend910B split-AIV: tile.add output must NOT reuse the tile.load buffer when the "
+            "Ascend910 split-AIV: tile.add output must NOT reuse the tile.load buffer when the "
             "tpop_from_aic operand arrives as a loop-carried IterArg, but both bind to "
             f"{bases['down_prev']}"
         )
@@ -6029,7 +6062,7 @@ class TestAscend910BLoadTpopHazard:
         completed buffer taint is in hand before the writer is classified.
         """
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         try:
             After = passes.memory_reuse()(self._build_back_edge_program())
         finally:
@@ -6038,7 +6071,7 @@ class TestAscend910BLoadTpopHazard:
         bases = _collect_tile_memref_bases(After)
         assert "down_prev" in bases and "down_next" in bases, f"missing tile vars; got {bases}"
         assert bases["down_next"] != bases["down_prev"], (
-            "Ascend910B split-AIV: tile.add output must NOT reuse the tile.load buffer when the "
+            "Ascend910 split-AIV: tile.add output must NOT reuse the tile.load buffer when the "
             "tpop_from_aic value reaches it across the loop back edge, but both bind to "
             f"{bases['down_prev']}"
         )
@@ -6220,7 +6253,7 @@ class TestForbidOutputAlias:
                 return seq
 
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         try:
             After = _run_pipeline(Before)
         finally:
@@ -6229,10 +6262,10 @@ class TestForbidOutputAlias:
         ci_calls: list[ir.Call] = []
 
         class _CiCollector(ir.IRVisitor):
-            def visit_call(self, call: ir.Call) -> None:
-                if call.op.name == ir.get_op("tile.ci").name:
-                    ci_calls.append(call)
-                super().visit_call(call)
+            def visit_call(self, op: ir.Call) -> None:
+                if op.op.name == ir.get_op("tile.ci").name:
+                    ci_calls.append(op)
+                super().visit_call(op)
 
         _CiCollector().visit_program(After)
         assert len(ci_calls) == 1 and len(ci_calls[0].args) == 3
@@ -6272,7 +6305,7 @@ class TestForbidOutputAlias:
                 return res
 
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         try:
             After = _run_pipeline(Before)
         finally:
@@ -6290,7 +6323,7 @@ class TestForbidOutputAlias:
             f"tile.sel output must not alias its tmp buffer, but both bind to {bases['dst']}"
         )
 
-    @pytest.mark.parametrize("backend_type", [BackendType.Ascend910B, BackendType.Ascend950])
+    @pytest.mark.parametrize("backend_type", [BackendType.Ascend910, BackendType.Ascend950])
     def test_sel_output_may_reuse_dead_lhs(self, backend_type):
         """TSEL may reuse a dying lhs/rhs buffer; mask and tmp stay forbidden."""
 
@@ -6328,7 +6361,7 @@ class TestForbidOutputAlias:
         assert bases["dst"] != bases["mask"]
         assert bases["dst"] != bases["tmp"]
 
-    @pytest.mark.parametrize("backend_type", [BackendType.Ascend910B, BackendType.Ascend950])
+    @pytest.mark.parametrize("backend_type", [BackendType.Ascend910, BackendType.Ascend950])
     def test_sels_output_may_reuse_dead_tmp(self, backend_type):
         """TSELS consumes tmp before dst writes on A2/A3; A5 leaves tmp unread."""
 
@@ -6343,13 +6376,18 @@ class TestForbidOutputAlias:
                 out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
             ) -> pl.Tensor[[16, 16], pl.FP32]:
                 t0: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(a, [0, 0], [16, 16])
-                dead: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.add(t0, t0)
                 src: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(b, [0, 0], [16, 16])
-                mask: pl.Tile[[16, 32], pl.UINT8, pl.MemorySpace.Vec] = pl.cmps(dead, 0.0, cmp_type=4)
+                mask: pl.Tile[[16, 32], pl.UINT8, pl.MemorySpace.Vec] = pl.cmps(t0, 0.0, cmp_type=4)
                 tmp: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(tmp_in, [0, 0], [16, 16])
                 dst: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.sels(mask, src, tmp, -1.0)
+                # Keep t0 and src live past the sels: this test is about which
+                # buffer `dst` may JOIN, so no earlier buffer may fall dead and
+                # offer itself first. A dead one here would also hand `tmp` a
+                # buffer a preceding op still reads, which the A2/A3 TSELS
+                # scratch guard forbids (see test_sels_scratch_* below).
                 keep_src_live: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.add(src, dst)
-                res: pl.Tensor[[16, 16], pl.FP32] = pl.store(keep_src_live, [0, 0], out)
+                keep_t0_live: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.add(t0, keep_src_live)
+                res: pl.Tensor[[16, 16], pl.FP32] = pl.store(keep_t0_live, [0, 0], out)
                 return res
 
         backend.reset_for_testing()
@@ -6365,6 +6403,163 @@ class TestForbidOutputAlias:
         assert bases["dst"] == bases["tmp"]
         assert bases["dst"] != bases["src"]
         assert bases["dst"] != bases["mask"]
+
+    @pytest.mark.parametrize("backend_type", [BackendType.Ascend910, BackendType.Ascend950])
+    def test_written_workspace_does_not_inherit_a_buffer_a_preceding_op_reads(self, backend_type):
+        """A workspace the intrinsic writes itself may not recycle a buffer.
+
+        `tile.sels` declares its `tmp` a written workspace: A2/A3's TSELS opens
+        with ``*scalarPtr = scalar`` into it -- a one-element store issued on
+        the SCALAR pipe and ordered forward only by
+        ``PtoSetWaitFlag<PIPE_S, PIPE_V>``. Nothing retires an earlier VECTOR
+        reader of that buffer first, so letting the workspace inherit `dead`'s
+        storage lets the store land before ``pl.cmps`` has read element 0,
+        silently corrupting it.
+
+        The guard is registry-driven, not backend-gated: PyPTO cannot know
+        which pipe a given intrinsic writes a workspace from, so every declared
+        one is isolated. A5's TSELS happens to leave `tmp` untouched (it dups
+        the scalar into a vector register), and paying a 512-byte buffer there
+        is the price of not encoding per-intrinsic pipe knowledge in the pass.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                b: pl.Tensor[[16, 16], pl.FP32],
+                tmp_in: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                dead: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(a, [0, 0], [16, 16])
+                src: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(b, [0, 0], [16, 16])
+                # `dead` dies here, one statement before the scratch is created.
+                mask: pl.Tile[[16, 32], pl.UINT8, pl.MemorySpace.Vec] = pl.cmps(dead, 0.0, cmp_type=4)
+                tmp: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(tmp_in, [0, 0], [16, 16])
+                dst: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.sels(mask, src, tmp, -1.0)
+                res: pl.Tensor[[16, 16], pl.FP32] = pl.store(dst, [0, 0], out)
+                return res
+
+        backend.reset_for_testing()
+        backend.set_backend_type(backend_type)
+        try:
+            After = _run_pipeline(Before)
+        finally:
+            backend.reset_for_testing()
+
+        bases = _collect_tile_memref_bases(After)
+        for name in ("dead", "tmp"):
+            assert name in bases, f"Expected {name} in After IR; got bases: {bases}"
+        assert bases["tmp"] != bases["dead"], (
+            "a written workspace must not inherit the buffer of a value the preceding cmps "
+            f"still reads, but both landed on {bases['tmp']} (backend {backend_type})"
+        )
+
+    def test_loop_carried_written_workspace_is_still_isolated(self):
+        """Var identity alone misses this; the guard keys on the MemRef base.
+
+        A lifetime interval is keyed on ONE representative of its sharing group,
+        and an `IterArg` never gets an interval of its own -- its carry chain
+        (init value, IterArg, yield value) is fused onto a single MemRef base by
+        MaterializeSemanticAliases. The `tile.sels` here sees the carry's
+        `IterArg`, so a Var-pointer lookup matches no interval and the guard
+        would silently not fire, letting the carry's storage stay on `dead`'s
+        buffer -- which the `cmps` right before it still reads.
+
+        The dead value and the carry's init must both sit BEFORE the loop: the
+        carry's storage is established at its init value, so a value dying
+        inside the body can never be inherited by it.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                b: pl.Tensor[[16, 16], pl.FP32],
+                tmp_in: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                dead: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(a, [0, 0], [16, 16])
+                src: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(b, [0, 0], [16, 16])
+                # `dead` dies here, one statement before the carry's init value.
+                mask: pl.Tile[[16, 32], pl.UINT8, pl.MemorySpace.Vec] = pl.cmps(dead, 0.0, cmp_type=4)
+                tmp0: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(tmp_in, [0, 0], [16, 16])
+                for _, (carry_tmp,) in pl.range(2, init_values=(tmp0,)):
+                    got: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.sels(mask, src, carry_tmp, -1.0)
+                    next_tmp = pl.yield_(got)
+                res: pl.Tensor[[16, 16], pl.FP32] = pl.store(next_tmp, [0, 0], out)
+                return res
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910)
+        try:
+            After = _run_pipeline(Before)
+        finally:
+            backend.reset_for_testing()
+
+        bases = _collect_tile_memref_bases(After)
+        for name in ("dead", "tmp0"):
+            assert name in bases, f"Expected {name} in After IR; got bases: {bases}"
+        assert bases["tmp0"] != bases["dead"], (
+            "a loop-carried written workspace must not inherit the buffer of a value the "
+            f"preceding cmps still reads, but both landed on {bases['tmp0']}"
+        )
+
+    def test_written_workspace_in_a_loop_takes_an_exclusive_buffer(self):
+        """Across a back edge the directional argument collapses.
+
+        The straight-line rule lets a LATER value join a workspace's buffer,
+        because by then the workspace has retired. Inside a loop that stops
+        holding: iteration i+1 re-writes the workspace from the SCALAR pipe
+        while iteration i's vector reads of a co-resident value -- here the
+        TSELS `dst` and the `add` that consumes it -- can still be in flight.
+        Lifetime order within one iteration proves nothing about the next, so a
+        looping workspace takes an exclusive buffer in both directions.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                b: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                src: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(b, [0, 0], [16, 16])
+                acc0: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(a, [0, 0], [16, 16])
+                for _i, (acc,) in pl.range(4, init_values=(acc0,)):
+                    tmp: pl.Tile[[1, 16], pl.FP32, pl.MemorySpace.Vec] = pl.tile.create(
+                        [1, 16], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                    )
+                    mask: pl.Tile[[16, 32], pl.UINT8, pl.MemorySpace.Vec] = pl.cmps(acc, 0.0, cmp_type=4)
+                    dst: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.sels(mask, src, tmp, -1.0)
+                    # Reads dst on the vector pipe, so it can still be in flight
+                    # when the next iteration's TSELS stages its scalar.
+                    used: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.add(dst, dst)
+                    nxt = pl.yield_(used)
+                res: pl.Tensor[[16, 16], pl.FP32] = pl.store(nxt, [0, 0], out)
+                return res
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910)
+        try:
+            After = _run_pipeline(Before)
+        finally:
+            backend.reset_for_testing()
+
+        bases = _collect_tile_memref_bases(After)
+        for name in ("tmp", "dst", "used", "src", "mask"):
+            assert name in bases, f"Expected {name} in After IR; got bases: {bases}"
+        for other in ("dst", "used", "src", "mask"):
+            assert bases["tmp"] != bases[other], (
+                "a workspace written inside a loop must not share its buffer with anything, but "
+                f"tmp and {other} both landed on {bases['tmp']}"
+            )
 
     def test_prelu_output_does_not_alias_any_input(self):
         """A2/A3 TPRELU reads src, slope, and tmp while writing dst."""
@@ -6387,7 +6582,7 @@ class TestForbidOutputAlias:
                 return res
 
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         try:
             After = _run_pipeline(Before)
         finally:
@@ -6517,7 +6712,7 @@ class TestForbidOutputAlias:
         input elements not yet converted. The bf16 input here reuses a dead FP32
         buffer (cross-dtype reuse) so it is large enough to hold the FP32 output,
         making the in-place upcast reachable — the guard must forbid it.
-        Narrowing / same-width casts stay in-place-safe.
+        A2/A3 narrowing casts also require disjoint storage (#2973).
         """
 
         @pl.program
@@ -6543,6 +6738,72 @@ class TestForbidOutputAlias:
         assert bases["r"] != bases["bf"], (
             f"widening cast output must not alias its input buffer, but both bind to {bases['r']}"
         )
+
+    @pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.DSA_RP])
+    @pytest.mark.parametrize("width", [128, 528])
+    def test_narrowing_cast_source_is_disjoint(self, planner, width):
+        """A2/A3 TCVT must not overwrite an unread source tail, including views."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                x: pl.Tensor[[16, width], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, width], pl.BF16]],
+                valid_rows: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[16, width], pl.BF16]:
+                source = pl.load(x, [0, 0], [16, width], valid_shape=[valid_rows, width])
+                viewed = pl.reshape(source, [16, width])
+                result = pl.cast(viewed, pl.BF16)
+                return pl.store(result, [0, 0], out)
+
+        with passes.PassContext([], memory_planner=planner, enable_buffer_ir=False):
+            after = passes.infer_tile_memory_space()(Before)
+            after = passes.init_mem_ref()(after)
+            after = passes.materialize_semantic_aliases()(after)
+            if planner == passes.MemoryPlanner.PYPTO:
+                after = passes.memory_reuse()(after)
+            after = passes.allocate_memory_addr()(after)
+        ranges = _collect_allocated_tile_ranges(after)
+        source_offset, source_size = ranges["source"]
+        result_offset, result_size = ranges["result"]
+        assert source_offset + source_size <= result_offset or result_offset + result_size <= source_offset
+
+    @pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.DSA_RP])
+    def test_narrowing_cast_loop_carry_is_disjoint(self, planner):
+        """Retargeting a cast onto a loop carry must preserve source separation."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                x: pl.Tensor[[16, 528], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 528], pl.BF16]],
+            ) -> pl.Tensor[[16, 528], pl.BF16]:
+                initial = pl.tile.create([16, 528], dtype=pl.BF16, target_memory=pl.Mem.Vec)
+                for _, (carry,) in pl.range(2, init_values=(initial,)):
+                    source = pl.load(x, [0, 0], [16, 528])
+                    result = pl.cast(source, pl.BF16)
+                    final = pl.yield_(result)
+                return pl.store(final, [0, 0], out)
+
+        with passes.PassContext([], memory_planner=planner, enable_buffer_ir=False):
+            after = passes.infer_tile_memory_space()(Before)
+            after = passes.init_mem_ref()(after)
+            after = passes.materialize_semantic_aliases()(after)
+            if planner == passes.MemoryPlanner.PYPTO:
+                after = passes.memory_reuse()(after)
+            after = passes.allocate_memory_addr()(after)
+        ranges = _collect_allocated_tile_ranges(after)
+        source_offset, source_size = ranges["source"]
+        result_offset, result_size = ranges["result"]
+        assert source_offset + source_size <= result_offset or result_offset + result_size <= source_offset
 
     def test_col_expand_mul_output_does_not_alias_col_vector(self):
         """col_expand_mul output must not alias its broadcast column vector.
@@ -6913,7 +7174,7 @@ class TestCapacityGatedReuse:
         in distinct buffers — the depth-2 ping-pong. This is the ->2 address
         signature (the ``0 A 0 A`` stream) capacity-gated reuse produces."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         Before = self._two_stage_matmuls()
         After = passes.memory_reuse()(passes.init_mem_ref()(Before))
         bases = self._collect_bases(After, ("r0", "r1"))
@@ -6928,7 +7189,7 @@ class TestCapacityGatedReuse:
         capacity-pinned projection behaviour, preventing the overflow that blind
         separation would cause."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         # [128, 192] BF16 Right operand => 48 KB, so depth-2 (96 KB) overflows the 64 KB L0b.
         Before = self._two_stage_matmuls(a_shape=(16, 128), b_shape=(128, 192))
         After = passes.memory_reuse()(passes.init_mem_ref()(Before))
@@ -6944,9 +7205,9 @@ class TestCapacityGatedReuse:
         depth and the fix. Routed through the diagnostic channel and captured via a
         ``ReportInstrument``'s ``perf_hints.log`` — the serialization is no longer silent."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         Before = self._two_stage_matmuls(a_shape=(16, 128), b_shape=(128, 192))
-        with passes.PassContext([passes.ReportInstrument(str(tmp_path))]):
+        with passes.PassContext([passes.ReportInstrument(str(tmp_path))], enable_buffer_ir=False):
             passes.memory_reuse()(passes.init_mem_ref()(Before))
         log = tmp_path / "perf_hints.log"
         assert log.exists(), "a capacity-reduced pipeline depth must emit a perf hint, not serialize silently"
@@ -6964,12 +7225,13 @@ class TestCapacityGatedReuse:
     def test_dsa_rp_keeps_affordable_pipeline_stages_separate(self, tmp_path):
         """The strict DSA-RP solve preserves pipeline intent when it fits."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         Before = self._two_stage_matmuls()
 
         with passes.PassContext(
             [passes.ReportInstrument(str(tmp_path))],
             memory_planner=passes.MemoryPlanner.DSA_RP,
+            enable_buffer_ir=False,
         ):
             After = passes.allocate_memory_addr()(passes.init_mem_ref()(Before))
 
@@ -6981,12 +7243,13 @@ class TestCapacityGatedReuse:
     def test_dsa_rp_relaxes_pipeline_only_after_strict_no_fit(self, tmp_path):
         """A capacity-forced pipeline reuse emits PH-DSA-001 after actual overlap."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         Before = self._two_stage_matmuls(a_shape=(16, 128), b_shape=(128, 192))
 
         with passes.PassContext(
             [passes.ReportInstrument(str(tmp_path))],
             memory_planner=passes.MemoryPlanner.DSA_RP,
+            enable_buffer_ir=False,
         ):
             After = passes.allocate_memory_addr()(passes.init_mem_ref()(Before))
 
@@ -7004,7 +7267,7 @@ class TestCapacityGatedReuse:
         through 2 buffers (stage mod 2): r0 and r2 share, r1 is separate. This is the
         proper modulo-variable-expansion an all-or-nothing gate would miss."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -7073,7 +7336,7 @@ class TestCapacityGatedReuse:
         tagged the SAME (group, stage) map to the same ping-pong residue, so they merge
         — only *cross-stage* operands are kept apart."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -7122,7 +7385,7 @@ class TestCapacityGatedReuse:
         must stay separate. The fix compares the dense stage *ordinal* (0, 1) mod k,
         not the raw stage value — raw `2 mod 2 == 0 mod 2` would wrongly merge them."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -7181,7 +7444,7 @@ class TestCapacityGatedReuse:
         operands would correctly stay separated — the old conservative Sum(size)
         estimate over-counted a disjoint tile as its own buffer."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -7238,7 +7501,7 @@ class TestCapacityGatedReuse:
                 out2 = pl.store(m2, [0, 0], out2)
                 return out2
 
-        with passes.PassContext([passes.ReportInstrument(str(tmp_path))]):
+        with passes.PassContext([passes.ReportInstrument(str(tmp_path))], enable_buffer_ir=False):
             after_reuse = passes.memory_reuse()(passes.init_mem_ref()(Before))
         bases = self._collect_bases(after_reuse, ("r0", "r1"))
         assert bases["r0"] is bases["r1"], "co-resident non-pipeline tile must force fallback to merge"
@@ -7261,7 +7524,7 @@ class TestCapacityGatedReuse:
         """Same IR in => identical buffer assignment out (the direct depth-cap is
         order-free — no ratio-greedy merge ordering to diverge)."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         Before = self._two_stage_matmuls()
         first = self._collect_bases(passes.memory_reuse()(passes.init_mem_ref()(Before)), ("r0", "r1"))
         second = self._collect_bases(passes.memory_reuse()(passes.init_mem_ref()(Before)), ("r0", "r1"))
@@ -7278,7 +7541,7 @@ class TestCapacityGatedReuse:
         NOT the shed-loop `force_legacy` fallback branch, which needs a tagged,
         capacity-overflowing space to fire.)"""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -7330,7 +7593,7 @@ class TestCapacityGatedReuse:
         tests above. This guards the real tag production/consumption flow and that the
         gate yields a valid <=L0b allocation on a real pipeline."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Prog:
@@ -7378,7 +7641,7 @@ class TestCapacityGatedReuse:
         adjacency guarantee at depth > 2 that a distance-blind shed would break; it is
         why mod F is kept rather than recovered from a scalar ShedScore."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -7422,7 +7685,7 @@ class TestCapacityGatedReuse:
 
         # Empty-instruments context suppresses the autouse SSA verification: this kernel
         # intentionally reassigns `out` per stage (non-SSA input) to model the stage clones.
-        with passes.PassContext([]):
+        with passes.PassContext([], enable_buffer_ir=False):
             after = passes.memory_reuse()(passes.init_mem_ref()(Before))
         bases = self._collect_bases(after, ("r0", "r1", "r2", "r3"))
         assert len({b.name_hint for b in bases.values()}) == 2, "exactly 2 ping-pong buffers at F=2"
@@ -7441,7 +7704,7 @@ class TestCapacityGatedReuse:
         co-resident/whole-space accuracy that the old Sum(size) estimate lacked. (The shed
         loop itself is exercised by the co-resident test, where a co-live tile forces it.)"""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -7515,7 +7778,7 @@ class TestCapacityGatedReuse:
         reserved_start accounting. (reserve_buffer lives in Vec for InCore functions;
         L0 — the #1475 L0b target — has no reserve region, so it is unaffected.)"""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class WithReserve:
@@ -7590,7 +7853,7 @@ class TestCapacityGatedReuse:
         B's depth as well. So the assertion below discriminates ``max_relief`` from the
         alternatives, not merely "some group shed"."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -7656,7 +7919,7 @@ class TestCapacityGatedReuse:
 
         # Empty-instruments context suppresses the autouse SSA verification: this kernel
         # intentionally reassigns `oa`/`ob` per stage (non-SSA input) to model the stage clones.
-        with passes.PassContext([]):
+        with passes.PassContext([], enable_buffer_ir=False):
             after = passes.memory_reuse()(passes.init_mem_ref()(Before))
         bases = self._collect_bases(after, ("ra0", "ra1", "rb0", "rb1"))
         assert bases["ra0"] is bases["ra1"], "max_relief sheds the larger-slot group A to depth 1"
@@ -7711,7 +7974,7 @@ class TestCapacityGatedReuse:
         assert allocation succeeds — we assert the branch's contract: the fallback re-runs exactly
         the legacy packing, which keeps the 4 co-live operands in distinct buffers."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -7785,7 +8048,7 @@ class TestCapacityGatedReuse:
         operation-specific passes may diagnose it earlier with more context.
         """
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -7810,6 +8073,492 @@ class TestCapacityGatedReuse:
 
         with pytest.raises(ValueError, match=r"Right buffer usage \(131072 bytes\).*\(65536 bytes\)"):
             passes.allocate_memory_addr()(after)
+
+
+class TestAliasingOutputPropagation:
+    """Every semantic alias follows the current input window after storage rewrites."""
+
+    @pytest.mark.parametrize("buffer_ir", [False, True], ids=["legacy_storage", "buffer_ir"])
+    def test_gather_view_chain_follows_reanchored_result(self, buffer_ir, pass_verification_instruments):
+        """Repairing a DPS result must repair all following metadata views (#3027)."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                pool: pl.Tensor[[16, 32], pl.FP16, pl.MemRef("mem_pool", 0, 1024)],
+                out: pl.Out[pl.Tensor[[8, 64], pl.FP16, pl.MemRef("mem_out", 0, 1024)]],
+            ) -> pl.Tensor[[8, 64], pl.FP16]:
+                current: pl.Ptr = pl.tile.alloc(pl.Mem.Mat, 1024)
+                _stale: pl.Ptr = pl.tile.alloc(pl.Mem.Mat, 1024)
+                seed: pl.Tile[[16, 32], pl.FP16, pl.MemRef(current, 0, 1024), pl.Mem.Mat] = pl.tile.load(
+                    pool, [0, 0], [16, 32], target_memory=pl.Mem.Mat
+                )
+                gathered: pl.Tile[[16, 32], pl.FP16, pl.MemRef(_stale, 0, 1024), pl.Mem.Mat] = (
+                    pl.tile.gather_row(seed, pool, [0, 0], [0, 0], [16, 32])
+                )
+                transposed: pl.Tile[[32, 16], pl.FP16, pl.MemRef(_stale, 0, 1024), pl.Mem.Mat] = (
+                    pl.tile.transpose_view(gathered)
+                )
+                reshaped: pl.Tile[[8, 64], pl.FP16, pl.MemRef(_stale, 0, 1024), pl.Mem.Mat] = pl.tile.reshape(
+                    transposed, [8, 64]
+                )
+                return pl.tile.store(reshaped, [0, 0], out)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                pool: pl.Tensor[[16, 32], pl.FP16, pl.MemRef("mem_pool", 0, 1024)],
+                out: pl.Out[pl.Tensor[[8, 64], pl.FP16, pl.MemRef("mem_out", 0, 1024)]],
+            ) -> pl.Tensor[[8, 64], pl.FP16]:
+                current: pl.Ptr = pl.tile.alloc(pl.Mem.Mat, 1024)
+                _stale: pl.Ptr = pl.tile.alloc(pl.Mem.Mat, 1024)
+                seed: pl.Tile[[16, 32], pl.FP16, pl.MemRef(current, 0, 1024), pl.Mem.Mat] = pl.tile.load(
+                    pool, [0, 0], [16, 32], target_memory=pl.Mem.Mat
+                )
+                gathered: pl.Tile[[16, 32], pl.FP16, pl.MemRef(current, 0, 1024), pl.Mem.Mat] = (
+                    pl.tile.gather_row(seed, pool, [0, 0], [0, 0], [16, 32])
+                )
+                transposed: pl.Tile[[32, 16], pl.FP16, pl.MemRef(current, 0, 1024), pl.Mem.Mat] = (
+                    pl.tile.transpose_view(gathered)
+                )
+                reshaped: pl.Tile[[8, 64], pl.FP16, pl.MemRef(current, 0, 1024), pl.Mem.Mat] = (
+                    pl.tile.reshape(transposed, [8, 64])
+                )
+                return pl.tile.store(reshaped, [0, 0], out)
+
+        with passes.PassContext(pass_verification_instruments, enable_buffer_ir=buffer_ir):
+            after = passes.materialize_semantic_aliases()(Before)
+            # BufferIR also removes the now-unused stale allocation.
+            expected = passes.materialize_semantic_aliases()(Expected) if buffer_ir else Expected
+            ir.assert_structural_equal(without_call_memrefs(after), without_call_memrefs(expected))
+            memrefs = _collect_named_tile_memrefs(after, {"seed", "gathered", "transposed", "reshaped"})
+            for name, memref in memrefs.items():
+                assert _same_base_address(memref, memrefs["seed"]), name
+            # Re-derivation must be stable instead of accumulating old absolute offsets.
+            ir.assert_structural_equal(passes.materialize_semantic_aliases()(after), after)
+
+    def test_same_allocation_slice_uses_current_parent_offset_once(self):
+        """A same-base DPS repair propagates its new offset through mixed alias kinds."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                inp: pl.Tensor[[8, 16], pl.FP32, pl.MemRef("mem_inp", 0, 512)],
+                out: pl.Out[pl.Tensor[[32, 1], pl.INT16, pl.MemRef("mem_out", 0, 64)]],
+            ) -> pl.Tensor[[32, 1], pl.INT16]:
+                storage: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 1024)
+                seed: pl.Tile[[8, 16], pl.FP32, pl.MemRef(storage, 512, 512), pl.Mem.Vec] = pl.tile.load(
+                    inp, [0, 0], [8, 16], target_memory=pl.Mem.Vec
+                )
+                updated: pl.Tile[[8, 16], pl.FP32, pl.MemRef(storage, 0, 512), pl.Mem.Vec] = (
+                    pl.tile.fillpad_inplace(seed)
+                )
+                row: pl.Tile[[1, 16], pl.FP32, pl.MemRef(storage, 192, 64), pl.Mem.Vec] = pl.tile.slice(
+                    updated, [1, 16], [3, 0]
+                )
+                reshaped: pl.Tile[[16, 1], pl.FP32, pl.MemRef(storage, 192, 64), pl.Mem.Vec] = (
+                    pl.tile.reshape(row, [16, 1])
+                )
+                reinterpreted: pl.Tile[[32, 1], pl.INT16, pl.MemRef(storage, 192, 64), pl.Mem.Vec] = (
+                    pl.tile.reinterpret_view(reshaped, pl.INT16)
+                )
+                valid: pl.Tile[[32, 1], pl.INT16, pl.MemRef(storage, 192, 64), pl.Mem.Vec] = (
+                    pl.tile.set_validshape(reinterpreted, 8, 1)
+                )
+                renamed: pl.Tile[[32, 1], pl.INT16, pl.MemRef(storage, 192, 64), pl.Mem.Vec] = valid
+                return pl.tile.store(renamed, [0, 0], out)
+
+        after = passes.materialize_semantic_aliases()(Before)
+        memrefs = _collect_named_tile_memrefs(
+            after, {"seed", "updated", "row", "reshaped", "reinterpreted", "valid", "renamed"}
+        )
+        for name, memref in memrefs.items():
+            assert memref.base_ is memrefs["seed"].base_, f"{name} changed allocation"
+            assert isinstance(memref.byte_offset_, ir.ConstInt)
+            expected_offset, expected_size = (512, 512) if name in {"seed", "updated"} else (704, 64)
+            assert (memref.byte_offset_.value, memref.size_) == (expected_offset, expected_size), name
+        # Preserve the dtype and valid-shape metadata of each individual view.
+        function = after.get_function("kernel")
+        assert function is not None and isinstance(function.body, ir.SeqStmts)
+        valid = next(
+            stmt.var
+            for stmt in function.body.stmts
+            if isinstance(stmt, ir.AssignStmt) and stmt.var.name_hint == "valid"
+        )
+        assert isinstance(valid.type, ir.TileType) and valid.type.dtype == DataType.INT16
+        assert valid.type.tile_view is not None
+        valid_shape = valid.type.tile_view.valid_shape
+        assert len(valid_shape) == 2
+        for dim, expected in zip(valid_shape, (8, 1)):
+            assert isinstance(dim, ir.ConstInt) and dim.value == expected
+        ir.assert_structural_equal(passes.materialize_semantic_aliases()(after), after)
+
+    def test_loop_retarget_updates_view_when_only_parent_window_changes(self):
+        """A reload retarget within one allocation still moves its off-chain slice."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                inp: pl.Tensor[[8, 16], pl.FP32, pl.MemRef("mem_inp", 0, 512)],
+                row_out: pl.Out[pl.Tensor[[1, 16], pl.FP32, pl.MemRef("mem_row_out", 0, 64)]],
+                out: pl.Out[pl.Tensor[[8, 16], pl.FP32, pl.MemRef("mem_out", 0, 512)]],
+            ) -> pl.Tensor[[8, 16], pl.FP32]:
+                storage: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 1024)
+                seed: pl.Tile[[8, 16], pl.FP32, pl.MemRef(storage, 512, 512), pl.Mem.Vec] = pl.tile.load(
+                    inp, [0, 0], [8, 16], target_memory=pl.Mem.Vec
+                )
+                for _i, (_carry,) in pl.range(2, init_values=(seed,)):
+                    reloaded: pl.Tile[[8, 16], pl.FP32, pl.MemRef(storage, 0, 512), pl.Mem.Vec] = (
+                        pl.tile.load(inp, [0, 0], [8, 16], target_memory=pl.Mem.Vec)
+                    )
+                    row: pl.Tile[[1, 16], pl.FP32, pl.MemRef(storage, 192, 64), pl.Mem.Vec] = pl.tile.slice(
+                        reloaded, [1, 16], [3, 0]
+                    )
+                    _observed_row = pl.tile.store(row, [0, 0], row_out)
+                    final: pl.Tile[[8, 16], pl.FP32, pl.MemRef(storage, 512, 512), pl.Mem.Vec] = pl.yield_(
+                        reloaded
+                    )
+                return pl.tile.store(final, [0, 0], out)
+
+        after = passes.materialize_semantic_aliases()(Before)
+        memrefs = _collect_named_tile_memrefs(after, {"seed", "reloaded", "row"})
+        # Prove the retarget happened without an allocation-identity change.
+        assert _same_base_address(memrefs["seed"], memrefs["reloaded"])
+        row = memrefs["row"]
+        assert row.base_ is memrefs["seed"].base_
+        assert isinstance(row.byte_offset_, ir.ConstInt) and row.byte_offset_.value == 704
+        assert row.size_ == 64
+        ir.assert_structural_equal(passes.materialize_semantic_aliases()(after), after)
+
+    @pytest.mark.parametrize("runtime_slot", [False, True], ids=["constant_slot", "runtime_slot"])
+    def test_slice_and_reshape_preserve_source_slot_identity(self, runtime_slot):
+        """Both initialization and late repair retain slot identity on correct windows."""
+        slots = pl.MemRef(slots=2)
+
+        @pl.program
+        class ConstantSlot:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                inp: pl.Tensor[[8, 16], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+            ) -> pl.Tensor[[16, 1], pl.FP32]:
+                seed: pl.Tile[[8, 16], pl.FP32, slots[1], pl.Mem.Vec] = pl.tile.load(
+                    inp, [0, 0], [8, 16], target_memory=pl.Mem.Vec
+                )
+                row = pl.tile.slice(seed, [1, 16], [3, 0])
+                reshaped = pl.tile.reshape(row, [16, 1])
+                return pl.tile.store(reshaped, [0, 0], out)
+
+        @pl.program
+        class RuntimeSlot:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                inp: pl.Tensor[[8, 16], pl.FP32],
+                slot_index: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+            ) -> pl.Tensor[[16, 1], pl.FP32]:
+                seed: pl.Tile[[8, 16], pl.FP32, slots[slot_index], pl.Mem.Vec] = pl.tile.load(
+                    inp, [0, 0], [8, 16], target_memory=pl.Mem.Vec
+                )
+                row = pl.tile.slice(seed, [1, 16], [3, 0])
+                reshaped = pl.tile.reshape(row, [16, 1])
+                return pl.tile.store(reshaped, [0, 0], out)
+
+        initialized = passes.init_mem_ref()(RuntimeSlot if runtime_slot else ConstantSlot)
+        function = initialized.get_function("kernel")
+        assert function is not None and isinstance(function.body, ir.SeqStmts)
+        index = function.params[1] if runtime_slot else ir.ConstInt(1, DataType.INDEX, function.span)
+        initial_memrefs = _collect_named_tile_memrefs(initialized, {"seed", "row", "reshaped"})
+        for name, memref in initial_memrefs.items():
+            assert memref.slot_count_ == 2, f"InitMemRef lost the slot count on {name}"
+            assert memref.slot_index_ is not None
+            if runtime_slot:
+                assert memref.slot_index_ is index
+            else:
+                assert isinstance(memref.slot_index_, ir.ConstInt) and memref.slot_index_.value == 1
+
+        # Simulate a later type rebuild dropping only slots, without moving bytes.
+        replacements: dict[int, ir.Var] = {}
+        for stmt in function.body.stmts:
+            if not isinstance(stmt, ir.AssignStmt) or stmt.var.name_hint not in {"row", "reshaped"}:
+                continue
+            old_type = stmt.var.type
+            assert isinstance(old_type, ir.TileType) and old_type.memref is not None
+            old_memref = old_type.memref
+            incomplete = ir.MemRef(old_memref.base_, old_memref.byte_offset_, old_memref.size_, stmt.span)
+            new_type = ir.TileType(
+                old_type.shape, old_type.dtype, incomplete, old_type.tile_view, old_type.memory_space
+            )
+            replacements[stmt.var.unique_id] = ir.Var(stmt.var.name_hint, new_type, stmt.var.span)
+
+        class _ForgetViewSlots(ir.IRMutator):
+            def visit_var(self, op):
+                return replacements.get(op.unique_id, op)
+
+        drifted = _ForgetViewSlots().visit_program(initialized)
+        drifted_memrefs = _collect_named_tile_memrefs(drifted, {"row", "reshaped"})
+        for name, memref in drifted_memrefs.items():
+            assert memref.slot_count_ == 1 and memref.slot_index_ is None
+            assert _same_base_address(memref, initial_memrefs[name])
+            assert memref.size_ == initial_memrefs[name].size_
+
+        after = passes.materialize_semantic_aliases()(drifted)
+        memrefs = _collect_named_tile_memrefs(after, {"seed", "row", "reshaped"})
+        for name, memref in memrefs.items():
+            assert memref.base_ is memrefs["seed"].base_
+            assert memref.slot_count_ == 2, f"{name} lost the allocation's slot count"
+            assert memref.slot_index_ is not None
+            if runtime_slot:
+                assert memref.slot_index_ is index
+            else:
+                assert isinstance(memref.slot_index_, ir.ConstInt) and memref.slot_index_.value == 1
+            expected_offset: ir.Expr = ir.Mul(
+                index, ir.ConstInt(512, DataType.INDEX, function.span), DataType.INDEX, function.span
+            )
+            if name != "seed":
+                expected_offset = ir.Add(
+                    expected_offset,
+                    ir.ConstInt(192, DataType.INDEX, function.span),
+                    DataType.INDEX,
+                    function.span,
+                )
+            difference = Analyzer().simplify(
+                ir.Sub(memref.byte_offset_, expected_offset, DataType.INDEX, function.span)
+            )
+            assert isinstance(difference, ir.ConstInt) and difference.value == 0, name
+            assert memref.size_ == (512 if name == "seed" else 64)
+        ir.assert_structural_equal(passes.materialize_semantic_aliases()(after), after)
+
+    def test_data_moving_transpose_and_extract_keep_independent_buffers(self):
+        """Repaired DPS inputs must not turn allocating consumers into aliases."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                inp: pl.Tensor[[8, 16], pl.FP32, pl.MemRef("mem_inp", 0, 512)],
+                out: pl.Out[pl.Tensor[[16, 8], pl.FP32, pl.MemRef("mem_out", 0, 512)]],
+                out_extract: pl.Out[pl.Tensor[[4, 16], pl.FP32, pl.MemRef("mem_out_extract", 0, 256)]],
+            ) -> pl.Tensor[[16, 8], pl.FP32]:
+                current: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 512)
+                stale: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 512)
+                transpose_storage: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 512)
+                extract_storage: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 256)
+                scratch_storage: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 512)
+                seed: pl.Tile[[8, 16], pl.FP32, pl.MemRef(current, 0, 512), pl.Mem.Vec] = pl.tile.load(
+                    inp, [0, 0], [8, 16], target_memory=pl.Mem.Vec
+                )
+                updated: pl.Tile[[8, 16], pl.FP32, pl.MemRef(stale, 0, 512), pl.Mem.Vec] = (
+                    pl.tile.fillpad_inplace(seed)
+                )
+                scratch: pl.Tile[[8, 16], pl.FP32, pl.MemRef(scratch_storage, 0, 512), pl.Mem.Vec] = (
+                    pl.tile.create([8, 16], pl.FP32, target_memory=pl.Mem.Vec)
+                )
+                transposed: pl.Tile[[16, 8], pl.FP32, pl.MemRef(transpose_storage, 0, 512), pl.Mem.Vec] = (
+                    pl.tile.transpose(updated, 0, 1, scratch)
+                )
+                extracted: pl.Tile[[4, 16], pl.FP32, pl.MemRef(extract_storage, 0, 256), pl.Mem.Vec] = (
+                    pl.tile.extract(updated, 0, 0, [4, 16], target_memory=pl.Mem.Vec)
+                )
+                _extract_result = pl.tile.store(extracted, [0, 0], out_extract)
+                return pl.tile.store(transposed, [0, 0], out)
+
+        original = _collect_named_tile_memrefs(Before, {"transposed", "extracted", "scratch"})
+        after = passes.materialize_semantic_aliases()(Before)
+        memrefs = _collect_named_tile_memrefs(
+            after, {"seed", "updated", "transposed", "extracted", "scratch"}
+        )
+        assert memrefs["updated"].base_ is memrefs["seed"].base_
+        for name, old_memref in original.items():
+            assert memrefs[name].base_ is old_memref.base_, f"{name} unexpectedly became an alias"
+            assert memrefs[name].base_ is not memrefs["updated"].base_
+
+    @pytest.mark.parametrize("views_on_canonical", [False, True], ids=["pending_views", "canonical_views"])
+    @pytest.mark.parametrize("buffer_ir", [False, True], ids=["legacy_storage", "buffer_ir"])
+    def test_unsettled_phi_propagates_through_view_and_rename(
+        self, views_on_canonical, buffer_ir, pass_verification_instruments
+    ):
+        """A view of a pending phi must not choose storage for the next DPS producer."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                pool: pl.Tensor[[16, 32], pl.FP16, pl.MemRef("mem_pool", 0, 1024)],
+                cond: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[16, 32], pl.FP16, pl.MemRef("mem_out", 0, 1024)]],
+            ) -> pl.Tensor[[16, 32], pl.FP16]:
+                current: pl.Ptr = pl.tile.alloc(pl.Mem.Mat, 1024)
+                pending: pl.Ptr = pl.tile.alloc(pl.Mem.Mat, 1024)
+                pending_next: pl.Ptr = pl.tile.alloc(pl.Mem.Mat, 1024)
+                seed: pl.Tile[[16, 32], pl.FP16, pl.MemRef(current, 0, 1024), pl.Mem.Mat] = pl.tile.load(
+                    pool, [0, 0], [16, 32], target_memory=pl.Mem.Mat
+                )
+                if cond < 1:
+                    first: pl.Tile[[16, 32], pl.FP16, pl.MemRef(current, 0, 1024), pl.Mem.Mat] = (
+                        pl.tile.gather_row(seed, pool, [0, 0], [0, 0], [16, 32])
+                    )
+                    phi: pl.Tile[[16, 32], pl.FP16, pl.MemRef(pending, 0, 1024), pl.Mem.Mat] = pl.yield_(
+                        first
+                    )
+                else:
+                    phi: pl.Tile[[16, 32], pl.FP16, pl.MemRef(pending, 0, 1024), pl.Mem.Mat] = pl.yield_(seed)
+                viewed: pl.Tile[[16, 32], pl.FP16, pl.MemRef(pending, 0, 1024), pl.Mem.Mat] = pl.tile.reshape(
+                    phi, [16, 32]
+                )
+                renamed: pl.Tile[[16, 32], pl.FP16, pl.MemRef(pending, 0, 1024), pl.Mem.Mat] = viewed
+                if cond < 2:
+                    second: pl.Tile[[16, 32], pl.FP16, pl.MemRef(current, 0, 1024), pl.Mem.Mat] = (
+                        pl.tile.gather_row(renamed, pool, [0, 0], [0, 0], [16, 32])
+                    )
+                    result: pl.Tile[[16, 32], pl.FP16, pl.MemRef(pending_next, 0, 1024), pl.Mem.Mat] = (
+                        pl.yield_(second)
+                    )
+                else:
+                    result: pl.Tile[[16, 32], pl.FP16, pl.MemRef(pending_next, 0, 1024), pl.Mem.Mat] = (
+                        pl.yield_(renamed)
+                    )
+                final_view: pl.Tile[[16, 32], pl.FP16, pl.MemRef(pending_next, 0, 1024), pl.Mem.Mat] = (
+                    pl.tile.reshape(result, [16, 32])
+                )
+                return pl.tile.store(final_view, [0, 0], out)
+
+        input_program = Before
+        if views_on_canonical:
+            canonical = _collect_named_tile_memrefs(Before, {"seed"})["seed"]
+            replacements: dict[int, ir.Var] = {}
+
+            class _SeedViewTypes(ir.IRMutator):
+                def visit_var(self, op):
+                    if op.name_hint not in {"viewed", "renamed"}:
+                        return op
+                    if op.unique_id not in replacements:
+                        old_type = op.type
+                        assert isinstance(old_type, ir.TileType)
+                        new_type = ir.TileType(
+                            old_type.shape,
+                            old_type.dtype,
+                            canonical,
+                            old_type.tile_view,
+                            old_type.memory_space,
+                        )
+                        replacements[op.unique_id] = ir.Var(op.name_hint, new_type, op.span)
+                    return replacements[op.unique_id]
+
+            input_program = _SeedViewTypes().visit_program(Before)
+
+        with passes.PassContext(pass_verification_instruments, enable_buffer_ir=buffer_ir):
+            after = passes.memory_reuse()(passes.materialize_semantic_aliases()(input_program))
+        _assert_if_phi_arms_write_the_phi_buffer(after)
+        memrefs = _collect_named_tile_memrefs(
+            after, {"seed", "first", "viewed", "renamed", "second", "final_view"}
+        )
+
+        class _AliasWindowChecker(ir.IRVisitor):
+            def visit_assign_stmt(self, stmt):  # type: ignore[override]
+                value = stmt.value
+                if isinstance(value, ir.Var):
+                    source = value
+                elif isinstance(value, ir.Call) and value.op.name in {
+                    ir.get_op("tile.gather_row").name,
+                    ir.get_op("tile.reshape").name,
+                }:
+                    source = value.args[0]
+                else:
+                    return super().visit_assign_stmt(stmt)
+                output_memref, source_memref = _carry_memref(stmt.var), _carry_memref(source)
+                assert output_memref is not None and source_memref is not None
+                assert _same_base_address(output_memref, source_memref), stmt.var.name_hint
+                super().visit_assign_stmt(stmt)
+
+        function = after.get_function("kernel")
+        assert function is not None
+        _AliasWindowChecker().visit_stmt(function.body)
+        if not buffer_ir:
+            for name, memref in memrefs.items():
+                assert _same_base_address(memref, memrefs["seed"]), f"{name} left the written L1 buffer"
+        assert "pl.tile.move(" not in after.as_python(), "phi repair emitted an unlowerable Mat->Mat move"
+
+
+class TestChainedInPlaceIfPhis:
+    """An in-place producer must never be anchored onto an unsettled `if` phi.
+
+    An `scf.if` return_var is not a tracked def in the reuse analysis, so it still
+    carries its pre-reuse buffer when the pre-YieldFixup identity-copy
+    normalization runs. Re-anchoring an in-place producer onto that stale buffer
+    pins it to storage YieldFixup is about to abandon, which then reconciles the
+    sibling arm with a same-space `tile.move` no target can lower, and leaves the
+    phi buffer unwritten on the taken arm.
+    """
+
+    def test_chained_conditional_gather_row_shares_one_l1_buffer(self, ascend_backend):
+        """Two chained `if`s over one in-place `gather_row` keep a single L1 buffer.
+
+        A dynamic `pl.pipeline` trip count makes LowerPipelineLoops peel a remainder
+        epilogue onto its own buffer, which is what gives MemoryReuse a retarget to
+        make; `pl.unroll(2)` around the `if` is what chains two phis over the same
+        tile. Both are required to reach the bug.
+        """
+
+        @pl.program
+        class ChainedGather:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                pool: pl.Tensor[[4096, 128], pl.INT8],
+                q: pl.Tensor[[32, 128], pl.INT8],
+                limits: pl.Tensor[[2], pl.INT32],
+                out: pl.Out[pl.Tensor[[4, 64, 32], pl.INT32]],
+            ) -> pl.Tensor[[4, 64, 32], pl.INT32]:
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    pages = pl.cast(pl.read(limits, [0]), pl.INDEX)
+                    groups = pl.cast(pl.read(limits, [1]), pl.INDEX)
+                    for group in pl.pipeline(0, groups, stage=2):
+                        kv = pl.create_l1([64, 128], pl.INT8)
+                        for slot in pl.unroll(2):
+                            page = group * 2 + slot
+                            if page < pages:
+                                row = pl.cast(page * 32, pl.INDEX)
+                                kv = pl.gather_row(kv, pool, [slot * 32, 0], [row, 0], [32, 128])
+                        score = pl.matmul(kv, q, out_dtype=pl.INT32, b_trans=True)
+                        out = pl.assemble(out, score, [group, 0, 0])
+                return out
+
+        lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(ChainedGather)
+        aic_functions = [
+            function for function in lowered.functions.values() if function.func_type == ir.FunctionType.AIC
+        ]
+        assert len(aic_functions) == 1
+
+        body = aic_functions[0].as_python()
+        # A Mat -> Mat tile.move has no legal `pto.tmov` address-space pair; the phi
+        # must resolve in place instead.
+        assert not any(
+            "pl.tile.move(" in line and "target_memory=pl.Mem.Mat" in line for line in body.splitlines()
+        ), f"MemoryReuse emitted an unlowerable Mat->Mat tile.move:\n{body}"
+
+        # Every gather in one epilogue/steady-state copy, and the phi feeding the
+        # matmul, must name one L1 allocation — otherwise the taken arm writes a
+        # buffer the matmul never reads.
+        pto = codegen.PTOCodegen().generate(
+            ir.Program([aic_functions[0]], aic_functions[0].name, lowered.span),
+            emit_tile_addr=True,
+        )
+        assert not re.search(r"pto\.tmov ins\([^)]*loc=mat[^)]*\) outs\([^)]*loc=mat[^)]*\)", pto), (
+            f"codegen emitted a same-space Mat->Mat pto.tmov:\n{pto}"
+        )
 
 
 if __name__ == "__main__":

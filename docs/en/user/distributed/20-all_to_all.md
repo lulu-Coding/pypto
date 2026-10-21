@@ -56,9 +56,11 @@ a wrong value, not a subtle shape issue.
 
 ## Walkthrough
 
-Both modes share one `[nr, SIZE]` window. Rank `r` writes its chunk-for-`d`
-at row `r` of destination `d`'s window, then reads row `src` of its own
-window. The hand-rolled kernel uses step 06's `put`:
+Both modes share one `[nr, SIZE]` window. Rank `r`'s chunk-for-`d` ends up at
+row `r` of destination `d`'s window, then rank `d` reads row `src` of its
+own window — in the hand-rolled kernel the caller does the write explicitly;
+in the reveal below, the push happens inside the call instead. The
+hand-rolled kernel uses step 06's `put`:
 
 ```python
 @pl.function(type=pl.FunctionType.InCore)
@@ -98,7 +100,8 @@ def hand_step(self, x, y, data, signal):
 - **Read-back completes the exchange.** After the barrier, row `src` of our
   own window holds the chunk rank `src` intended for us.
 
-The reveal replaces phases 1–3 with one call:
+The reveal replaces phases 1–2 with one call; phase 3's read-back loop
+remains in the caller:
 
 ```python
     result = pld.tensor.all_to_all(x, data, signal)
@@ -115,15 +118,26 @@ The reveal replaces phases 1–3 with one call:
 
 ### The IR diff (the teaching artifact)
 
+The interesting part isn't which bytes move — both modes move the same chunks
+to the same destinations — it's how much of the sequence the builtin writes
+for you, and where it stops.
+
 - `--mode hand` lowers to the three phases above: `P` puts (one per
-  destination), the `Set`/`Ge(1)` barrier, and the read-back loop.
-- `--mode builtin` expands into the same shape: your per-destination chunks
-  pushed via `pld.tile.put`, then the barrier, then the row read-back. Note
-  the barrier's role here — because the transfers come *first*, it is a
-  completion barrier telling you every peer's push has landed, not a
-  readiness barrier gating a read. The composite also appends a self-clearing
-  epilogue, so the signal is reusable on the next call. (The HOST builtin adds
-  orchestration-level chunking for large transfers.)
+  destination), then the `Set`/`Ge(1)` barrier, then the read-back loop — the
+  barrier comes *after* your own pushes but *before* you trust any peer's,
+  because your reads would otherwise race their pushes.
+- `--mode builtin` expands into the same shape — your per-destination chunks
+  pushed via `pld.tile.put`, then the barrier — but it stops there. The
+  barrier sits on the same side of the transfer as in the hand-rolled version,
+  so it means the same thing: a **completion** barrier confirming that every
+  peer's push has landed. What the builtin does *not* do is read the rows back
+  for you — the window **is** the result, so the read-back loop stays in your
+  code.
+- The composite appends a **self-clearing epilogue** after the barrier that
+  subtracts this call's credits back out, so the same signal is reusable by a
+  later collective ([21-putting_it_together](21-putting_it_together.md)). The
+  HOST builtin also chunks large transfers, but inside the generated AIV
+  kernel, in fixed-size tiles — not at the orchestration level.
 
 **Cost card (per rank):** every rank sends a *different* `N/P` slice to each
 peer — `(P-1)/P · N` bytes received, and no two ranks receive the same bytes.

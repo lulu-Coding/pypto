@@ -40,8 +40,8 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
 import torch
-from pypto import ir
 from pypto.ir import DistributedConfig
+from pypto.runtime import RunConfig
 
 SIZE = 64
 NR = pl.dynamic("world_size")
@@ -63,34 +63,31 @@ def _make_rank_inputs(n_ranks: int, round_offset: float = 0.0) -> torch.Tensor:
     return torch.stack(rows)
 
 
-@pl.program
-class HostTensorAllGather:
-    @pl.function(type=pl.FunctionType.InCore)
+def _build_host_allgather_program():
+    @pl.jit.incore
     def publish_step(
-        self,
         inp: pl.Tensor[[1, SIZE], pl.FP32],
         stage: pl.Out[pld.DistributedTensor[[1, SIZE], pl.FP32]],
         my_rank: pl.Scalar[pl.INT32],
         nranks: pl.Scalar[pl.INT32],
-    ):
+    ) -> pld.DistributedTensor[[1, SIZE], pl.FP32]:
         # Stage local chunk at row 0 of this rank's [1, SIZE] window; kernel
         # pushes stage[0,:] to every peer's target[my_rank,:].
         chunk = pl.load(inp, [0, 0], [1, SIZE])
         stage = pl.store(chunk, [0, 0], stage)
+        return stage
 
-    @pl.function(type=pl.FunctionType.Orchestration)
+    @pl.jit
     def publish_orch(
-        self,
         inp: pl.Tensor[[1, SIZE], pl.FP32],
         stage: pl.Out[pld.DistributedTensor[[1, SIZE], pl.FP32]],
         my_rank: pl.Scalar[pl.INT32],
         nranks: pl.Scalar[pl.INT32],
-    ):
-        self.publish_step(inp, stage, my_rank, nranks)
+    ) -> pld.DistributedTensor[[1, SIZE], pl.FP32]:
+        return publish_step(inp, stage, my_rank, nranks)
 
-    @pl.function(type=pl.FunctionType.InCore)
+    @pl.jit.incore
     def consume_step(
-        self,
         data: pld.DistributedTensor[[NR, SIZE], pl.FP32],
         out: pl.Out[pl.Tensor[[1, NR, SIZE], pl.FP32]],
         nranks: pl.Scalar[pl.INT32],
@@ -102,18 +99,16 @@ class HostTensorAllGather:
             out = pl.store(row, [0, j, 0], out)
         return out
 
-    @pl.function(type=pl.FunctionType.Orchestration)
+    @pl.jit
     def consume_orch(
-        self,
         data: pld.DistributedTensor[[NR, SIZE], pl.FP32],
         out: pl.Out[pl.Tensor[[1, NR, SIZE], pl.FP32]],
         nranks: pl.Scalar[pl.INT32],
     ) -> pl.Tensor[[1, NR, SIZE], pl.FP32]:
-        return self.consume_step(data, out, nranks)
+        return consume_step(data, out, nranks)
 
-    @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+    @pl.jit.host
     def host_orch(
-        self,
         inputs: pl.Tensor[[NR, 1, SIZE], pl.FP32],
         outputs: pl.Out[pl.Tensor[[NR, 1, NR, SIZE], pl.FP32]],
     ) -> pl.Tensor[[NR, 1, NR, SIZE], pl.FP32]:
@@ -125,7 +120,7 @@ class HostTensorAllGather:
 
         for r in pl.range(pld.world_size()):
             stage = pld.window(stage_buf, [1, SIZE], dtype=pl.FP32)
-            self.publish_orch(inputs[r], stage, r, pld.world_size(), device=r)
+            publish_orch(inputs[r], stage, r, pld.world_size(), device=r)
 
         stage = pld.window(stage_buf, [1, SIZE], dtype=pl.FP32)
         data = pld.window(data_buf, [pld.world_size(), SIZE], dtype=pl.FP32)
@@ -134,9 +129,11 @@ class HostTensorAllGather:
         data = pld.tensor.allgather(stage, data, signal)
 
         for r in pl.range(pld.world_size()):
-            self.consume_orch(data, outputs[r], pld.world_size(), device=r)
+            consume_orch(data, outputs[r], pld.world_size(), device=r)
 
         return outputs
+
+    return host_orch
 
 
 def _build_host_allgather_signal_reuse_program():
@@ -148,85 +145,79 @@ def _build_host_allgather_signal_reuse_program():
     """
     ROUNDS = 2
 
-    @pl.program
-    class HostTensorAllGatherSignalReuse:
-        @pl.function(type=pl.FunctionType.InCore)
-        def publish_step(
-            self,
-            inp: pl.Tensor[[1, SIZE], pl.FP32],
-            stage: pl.Out[pld.DistributedTensor[[1, SIZE], pl.FP32]],
-            my_rank: pl.Scalar[pl.INT32],
-            nranks: pl.Scalar[pl.INT32],
-        ):
-            chunk = pl.load(inp, [0, 0], [1, SIZE])
-            stage = pl.store(chunk, [0, 0], stage)
+    @pl.jit.incore
+    def publish_step(
+        inp: pl.Tensor[[1, SIZE], pl.FP32],
+        stage: pl.Out[pld.DistributedTensor[[1, SIZE], pl.FP32]],
+        my_rank: pl.Scalar[pl.INT32],
+        nranks: pl.Scalar[pl.INT32],
+    ) -> pld.DistributedTensor[[1, SIZE], pl.FP32]:
+        chunk = pl.load(inp, [0, 0], [1, SIZE])
+        stage = pl.store(chunk, [0, 0], stage)
+        return stage
 
-        @pl.function(type=pl.FunctionType.Orchestration)
-        def publish_orch(
-            self,
-            inp: pl.Tensor[[1, SIZE], pl.FP32],
-            stage: pl.Out[pld.DistributedTensor[[1, SIZE], pl.FP32]],
-            my_rank: pl.Scalar[pl.INT32],
-            nranks: pl.Scalar[pl.INT32],
-        ):
-            self.publish_step(inp, stage, my_rank, nranks)
+    @pl.jit
+    def publish_orch(
+        inp: pl.Tensor[[1, SIZE], pl.FP32],
+        stage: pl.Out[pld.DistributedTensor[[1, SIZE], pl.FP32]],
+        my_rank: pl.Scalar[pl.INT32],
+        nranks: pl.Scalar[pl.INT32],
+    ) -> pld.DistributedTensor[[1, SIZE], pl.FP32]:
+        return publish_step(inp, stage, my_rank, nranks)
 
-        @pl.function(type=pl.FunctionType.InCore)
-        def consume_step(
-            self,
-            data: pld.DistributedTensor[[NR, SIZE], pl.FP32],
-            out: pl.Out[pl.Tensor[[1, NR, SIZE], pl.FP32]],
-            nranks: pl.Scalar[pl.INT32],
-        ) -> pl.Tensor[[1, NR, SIZE], pl.FP32]:
-            for j in pl.range(nranks):
-                row = pl.load(data, [j, 0], [1, SIZE])
-                out = pl.store(row, [0, j, 0], out)
-            return out
+    @pl.jit.incore
+    def consume_step(
+        data: pld.DistributedTensor[[NR, SIZE], pl.FP32],
+        out: pl.Out[pl.Tensor[[1, NR, SIZE], pl.FP32]],
+        nranks: pl.Scalar[pl.INT32],
+    ) -> pl.Tensor[[1, NR, SIZE], pl.FP32]:
+        for j in pl.range(nranks):
+            row = pl.load(data, [j, 0], [1, SIZE])
+            out = pl.store(row, [0, j, 0], out)
+        return out
 
-        @pl.function(type=pl.FunctionType.Orchestration)
-        def consume_orch(
-            self,
-            data: pld.DistributedTensor[[NR, SIZE], pl.FP32],
-            out: pl.Out[pl.Tensor[[1, NR, SIZE], pl.FP32]],
-            nranks: pl.Scalar[pl.INT32],
-        ) -> pl.Tensor[[1, NR, SIZE], pl.FP32]:
-            return self.consume_step(data, out, nranks)
+    @pl.jit
+    def consume_orch(
+        data: pld.DistributedTensor[[NR, SIZE], pl.FP32],
+        out: pl.Out[pl.Tensor[[1, NR, SIZE], pl.FP32]],
+        nranks: pl.Scalar[pl.INT32],
+    ) -> pl.Tensor[[1, NR, SIZE], pl.FP32]:
+        return consume_step(data, out, nranks)
 
-        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
-        def host_orch(
-            self,
-            inputs: pl.Tensor[[ROUNDS, NR, 1, SIZE], pl.FP32],
-            outputs: pl.Out[pl.Tensor[[ROUNDS, NR, 1, NR, SIZE], pl.FP32]],
-        ) -> pl.Tensor[[ROUNDS, NR, 1, NR, SIZE], pl.FP32]:
-            stage_buf_1 = pld.alloc_window_buffer(SIZE * pl.FP32.get_byte())
-            stage_buf_2 = pld.alloc_window_buffer(SIZE * pl.FP32.get_byte())
-            data_buf_1 = pld.alloc_window_buffer(pld.world_size() * SIZE * pl.FP32.get_byte())
-            data_buf_2 = pld.alloc_window_buffer(pld.world_size() * SIZE * pl.FP32.get_byte())
-            signal_buf = pld.alloc_window_buffer(pld.world_size() * pl.INT32.get_byte())
-            signal = pld.window(signal_buf, [pld.world_size()], dtype=pl.INT32)
+    @pl.jit.host
+    def host_orch(
+        inputs: pl.Tensor[[ROUNDS, NR, 1, SIZE], pl.FP32],
+        outputs: pl.Out[pl.Tensor[[ROUNDS, NR, 1, NR, SIZE], pl.FP32]],
+    ) -> pl.Tensor[[ROUNDS, NR, 1, NR, SIZE], pl.FP32]:
+        stage_buf_1 = pld.alloc_window_buffer(SIZE * pl.FP32.get_byte())
+        stage_buf_2 = pld.alloc_window_buffer(SIZE * pl.FP32.get_byte())
+        data_buf_1 = pld.alloc_window_buffer(pld.world_size() * SIZE * pl.FP32.get_byte())
+        data_buf_2 = pld.alloc_window_buffer(pld.world_size() * SIZE * pl.FP32.get_byte())
+        signal_buf = pld.alloc_window_buffer(pld.world_size() * pl.INT32.get_byte())
+        signal = pld.window(signal_buf, [pld.world_size()], dtype=pl.INT32)
 
-            # Round 1 — distinct stage/data windows per round, ONE shared signal.
-            for r in pl.range(pld.world_size()):
-                stage = pld.window(stage_buf_1, [1, SIZE], dtype=pl.FP32)
-                self.publish_orch(inputs[0, r], stage, r, pld.world_size(), device=r)
+        # Round 1 — distinct stage/data windows per round, ONE shared signal.
+        for r in pl.range(pld.world_size()):
             stage = pld.window(stage_buf_1, [1, SIZE], dtype=pl.FP32)
-            data = pld.window(data_buf_1, [pld.world_size(), SIZE], dtype=pl.FP32)
-            data = pld.tensor.allgather(stage, data, signal)
-            for r in pl.range(pld.world_size()):
-                self.consume_orch(data, outputs[0, r], pld.world_size(), device=r)
+            publish_orch(inputs[0, r], stage, r, pld.world_size(), device=r)
+        stage = pld.window(stage_buf_1, [1, SIZE], dtype=pl.FP32)
+        data = pld.window(data_buf_1, [pld.world_size(), SIZE], dtype=pl.FP32)
+        data = pld.tensor.allgather(stage, data, signal)
+        for r in pl.range(pld.world_size()):
+            consume_orch(data, outputs[0, r], pld.world_size(), device=r)
 
-            # Round 2 — reuse the same signal.
-            for r in pl.range(pld.world_size()):
-                stage = pld.window(stage_buf_2, [1, SIZE], dtype=pl.FP32)
-                self.publish_orch(inputs[1, r], stage, r, pld.world_size(), device=r)
+        # Round 2 — reuse the same signal.
+        for r in pl.range(pld.world_size()):
             stage = pld.window(stage_buf_2, [1, SIZE], dtype=pl.FP32)
-            data = pld.window(data_buf_2, [pld.world_size(), SIZE], dtype=pl.FP32)
-            data = pld.tensor.allgather(stage, data, signal)
-            for r in pl.range(pld.world_size()):
-                self.consume_orch(data, outputs[1, r], pld.world_size(), device=r)
-            return outputs
+            publish_orch(inputs[1, r], stage, r, pld.world_size(), device=r)
+        stage = pld.window(stage_buf_2, [1, SIZE], dtype=pl.FP32)
+        data = pld.window(data_buf_2, [pld.world_size(), SIZE], dtype=pl.FP32)
+        data = pld.tensor.allgather(stage, data, signal)
+        for r in pl.range(pld.world_size()):
+            consume_orch(data, outputs[1, r], pld.world_size(), device=r)
+        return outputs
 
-    return HostTensorAllGatherSignalReuse
+    return host_orch
 
 
 class TestL3HostTensorAllGather:
@@ -235,12 +226,19 @@ class TestL3HostTensorAllGather:
         if len(device_ids) < n_ranks:
             pytest.skip(f"host allgather P={n_ranks} needs {n_ranks} devices, got {device_ids}")
 
-        compiled = ir.compile(
-            HostTensorAllGather,
-            platform=test_config.platform,
-            distributed_config=DistributedConfig(
-                device_ids=device_ids[:n_ranks],
-                num_sub_workers=0,
+        inputs = _make_rank_inputs(n_ranks)
+        outputs = torch.zeros((n_ranks, 1, n_ranks, SIZE), dtype=torch.float32)
+
+        host_orch = _build_host_allgather_program()
+        compiled = host_orch.compile(
+            inputs,
+            outputs,
+            config=RunConfig(
+                platform=test_config.platform,
+                distributed_config=DistributedConfig(
+                    device_ids=device_ids[:n_ranks],
+                    num_sub_workers=0,
+                ),
             ),
         )
 
@@ -286,10 +284,7 @@ class TestL3HostTensorAllGather:
                     f"ordering token is not a well-formed make_tensor_arg call: {token}"
                 )
 
-        inputs = _make_rank_inputs(n_ranks)
-        outputs = torch.zeros((n_ranks, 1, n_ranks, SIZE), dtype=torch.float32)
-
-        compiled(inputs, outputs)
+        compiled(inputs, outputs, config=RunConfig(platform=test_config.platform))
 
         expected = _expected_allgather(inputs, n_ranks)
         assert torch.allclose(outputs, expected), (
@@ -303,22 +298,27 @@ class TestL3HostTensorAllGather:
             pytest.skip(f"host allgather P={n_ranks} needs {n_ranks} devices, got {device_ids}")
 
         rounds = 2
-        compiled = ir.compile(
-            _build_host_allgather_signal_reuse_program(),
-            platform=test_config.platform,
-            distributed_config=DistributedConfig(
-                device_ids=device_ids[:n_ranks],
-                num_sub_workers=0,
+        # Each round carries a distinct offset so a stale earlier-round result
+        # (a missed epilogue reset) cannot match the round's golden.
+        inputs = torch.stack([_make_rank_inputs(n_ranks, round_offset=rd * 10000.0) for rd in range(rounds)])
+        outputs = torch.zeros((rounds, n_ranks, 1, n_ranks, SIZE), dtype=torch.float32)
+
+        host_orch = _build_host_allgather_signal_reuse_program()
+        compiled = host_orch.compile(
+            inputs,
+            outputs,
+            config=RunConfig(
+                platform=test_config.platform,
+                distributed_config=DistributedConfig(
+                    device_ids=device_ids[:n_ranks],
+                    num_sub_workers=0,
+                ),
             ),
         )
         variant_dir = compiled.output_dir / "next_levels" / "builtin.tensor.allgather__fp32"
         assert variant_dir.is_dir()
 
-        # Each round carries a distinct offset so a stale earlier-round result
-        # (a missed epilogue reset) cannot match the round's golden.
-        inputs = torch.stack([_make_rank_inputs(n_ranks, round_offset=rd * 10000.0) for rd in range(rounds)])
-        outputs = torch.zeros((rounds, n_ranks, 1, n_ranks, SIZE), dtype=torch.float32)
-        compiled(inputs, outputs)
+        compiled(inputs, outputs, config=RunConfig(platform=test_config.platform))
 
         for rd in range(rounds):
             expected = _expected_allgather(inputs[rd], n_ranks)

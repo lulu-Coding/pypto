@@ -16,16 +16,19 @@ Closes hw-native-sys/pypto#1455.
 
 import ctypes
 import importlib
+import re
+import warnings
 
 import pypto.language as pl
 import pytest
+from pypto.backend import BackendType
 from pypto.compile_profiling import CompileProfiler
 from pypto.ir import OptimizationStrategy, PassDumpLevel
 from pypto.ir.compiled_program import CompiledProgram
 from pypto.jit.decorator import jit
 from pypto.language.parser.diagnostics.exceptions import ParserTypeError
 from pypto.pypto_core import ir, passes
-from pypto.runtime.runner import RunConfig
+from pypto.runtime.runner import ExecutionMode, RunConfig
 
 
 @pytest.fixture(autouse=True)
@@ -367,9 +370,9 @@ class TestCompileFromSignature:
         any concrete extent (dynamic dim marked, static dim/dtype identical)."""
         torch = pytest.importorskip("torch")
 
-        _, _, meta_sig, _, _, _ = sig_kernel._bind_args_from_signature({})
+        _, _, meta_sig, _, cx, _ = sig_kernel._bind_args_from_signature({})
         t = torch.zeros(512, 128, dtype=torch.float32)
-        _, _, meta_tensor, _, _, _ = sig_kernel._bind_args((t, t), {})
+        _, _, meta_tensor, _, cx, _ = sig_kernel._bind_args((t, t), {})
         for name in ("a", "c"):
             assert meta_sig[name].dynamic_dim_indices() == meta_tensor[name].dynamic_dim_indices() == {0}
             assert meta_sig[name].static_shape()[1] == meta_tensor[name].static_shape()[1] == 128
@@ -379,12 +382,12 @@ class TestCompileFromSignature:
         """Specializing from the signature yields the same IR as from tensors."""
         torch = pytest.importorskip("torch")
 
-        _, _, tm_s, sv_s, sd_s, dyn_s = sig_kernel._bind_args_from_signature({})
-        prog_sig = sig_kernel._compile_to_program(tm_s, sv_s, sd_s, dyn_s, pl)
+        _, _, tm_s, sd_s, cx, dyn_s = sig_kernel._bind_args_from_signature({})
+        prog_sig = sig_kernel._compile_to_program(tm_s, sd_s, cx, dyn_s, pl)
 
         t = torch.zeros(64, 128, dtype=torch.float32)
-        _, _, tm_t, sv_t, sd_t, dyn_t = sig_kernel._bind_args((t, t), {})
-        prog_tensor = sig_kernel._compile_to_program(tm_t, sv_t, sd_t, dyn_t, pl)
+        _, _, tm_t, sd_t, cx, dyn_t = sig_kernel._bind_args((t, t), {})
+        prog_tensor = sig_kernel._compile_to_program(tm_t, sd_t, cx, dyn_t, pl)
 
         ir.assert_structural_equal(prog_sig, prog_tensor)
 
@@ -394,8 +397,13 @@ class TestCompileFromSignature:
         with pytest.raises(TypeError, match="bare 'pl.Tensor'"):
             add_kernel.compile()
 
-    def test_scalar_param_needs_value(self):
-        """Scalar params carry no value in the signature; must be supplied."""
+    def test_scalar_param_needs_no_value(self):
+        """A scalar parameter is a runtime value, so the signature needs none.
+
+        Its value arrives at dispatch (issue #2751), so only the declared dtype
+        is read here. A keyword is still accepted — it used to mean "specialize
+        this value", so it warns rather than changing meaning silently.
+        """
 
         s_m = pl.dynamic("SM")
 
@@ -408,61 +416,62 @@ class TestCompileFromSignature:
             c = a
             return c
 
-        with pytest.raises(TypeError, match="scalar parameter 'n'"):
-            scalar_sig_kernel._bind_args_from_signature({})
+        _, _, _, scalar_dtypes, cx, _ = scalar_sig_kernel._bind_args_from_signature({})
+        assert scalar_dtypes == {"n": pl.INT32}
 
-        # Supplied via keyword: value flows into scalar_values.
-        _, _, _, scalar_values, _, _ = scalar_sig_kernel._bind_args_from_signature({"n": 7})
-        assert scalar_values == {"n": 7}
+        with pytest.warns(DeprecationWarning, match="no longer folds that value"):
+            _, _, _, kw_dtypes, cx, _ = scalar_sig_kernel._bind_args_from_signature({"n": 7})
+        assert kw_dtypes == {"n": pl.INT32}
 
-    def test_runtime_scalar_left_unspecialized(self):
-        """``pl.RUNTIME`` keeps a scalar out of ``scalar_values`` (issue #2283):
-        the value is supplied at dispatch, not baked into the artifact. The
-        dtype is still recorded — only the value is withheld."""
-        _, _, _, scalar_values, scalar_dtypes, _ = rt_scalar_kernel._bind_args_from_signature(
-            {"n": pl.RUNTIME}
-        )
-        assert scalar_values == {}
-        assert scalar_dtypes == {"n": pl.FP32}
+    def test_runtime_marker_still_accepted(self):
+        """``pl.RUNTIME`` (issue #2283) is now what every scalar does by default.
 
-    def test_runtime_scalar_keeps_symbolic_param_in_program(self):
-        """A ``pl.RUNTIME`` scalar survives specialization as a real parameter
-        reference — in the entry *and* in the incore dep it is forwarded to.
-        A literal is folded into a constant in both instead."""
-        _, _, tm_r, sv_r, sd_r, dyn_r = rt_scalar_kernel._bind_args_from_signature({"n": pl.RUNTIME})
-        prog_runtime = str(rt_scalar_kernel._compile_to_program(tm_r, sv_r, sd_r, dyn_r, pl))
+        It stays accepted so existing signatures keep working; the resulting
+        metadata is the dtype alone, exactly as when nothing is passed.
+        """
+        _, _, _, marked, cx, _ = rt_scalar_kernel._bind_args_from_signature({"n": pl.RUNTIME})
+        _, _, _, unmarked, cx, _ = rt_scalar_kernel._bind_args_from_signature({})
+        assert marked == unmarked == {"n": pl.FP32}
 
-        _, _, tm_s, sv_s, sd_s, dyn_s = rt_scalar_kernel._bind_args_from_signature({"n": 7.0})
-        prog_specialized = str(rt_scalar_kernel._compile_to_program(tm_s, sv_s, sd_s, dyn_s, pl))
+    def test_scalar_stays_symbolic_in_program_whatever_was_passed(self):
+        """A scalar is symbolic end to end — in the entry *and* in the incore dep
+        it is forwarded to — whether the caller marked it ``pl.RUNTIME``, passed
+        a literal, or passed nothing (issue #2751).
 
-        # Both keep 'n' in the entry *and* dep signatures — the parameter list
-        # comes from the annotations either way. What differs is every *use*:
-        # runtime forwards and consumes the symbol, specialized folds a constant.
-        assert prog_runtime.count("n: pl.Scalar[pl.FP32]") == 2
-        assert prog_specialized.count("n: pl.Scalar[pl.FP32]") == 2
-        assert "self._rt_add_scalar_incore(a, n, c)" in prog_runtime
-        assert "self._rt_add_scalar_incore(a, 7.0, c)" in prog_specialized
-        assert "pl.tile.adds(tile, n)" in prog_runtime
-        assert "pl.tile.adds(tile, 7.0)" in prog_specialized
+        A literal used to be folded here, which is what made one artifact per
+        value and left the declared parameter unused.
+        """
+        programs = []
+        for kwargs in ({"n": pl.RUNTIME}, {"n": 7.0}, {}):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                _, _, tm, sd, cx, dyn = rt_scalar_kernel._bind_args_from_signature(kwargs)
+            programs.append(str(rt_scalar_kernel._compile_to_program(tm, sd, cx, dyn, pl)))
+
+        for prog in programs:
+            # 'n' is a parameter of both the entry and the dep, and every use
+            # forwards or consumes the symbol rather than a constant.
+            assert prog.count("n: pl.Scalar[pl.FP32]") == 2
+            assert "self._rt_add_scalar_incore(a, n, c)" in prog
+            assert "pl.tile.adds(tile, n)" in prog
+        assert programs[0] == programs[1] == programs[2]
 
     def test_runtime_scalar_forwards_dtype_to_dep(self):
         """A runtime scalar carries no value, but its dtype still reaches the dep
         it is forwarded to."""
-        _, _, tm, sv, sd, dyn = rt_scalar_kernel._bind_args_from_signature({"n": pl.RUNTIME})
-        contexts = rt_scalar_kernel._build_contexts(tm, sv, sd, dyn)
+        _, _, tm, sd, cx, dyn = rt_scalar_kernel._bind_args_from_signature({"n": pl.RUNTIME})
+        contexts = rt_scalar_kernel._build_contexts(tm, sd, cx, dyn)
         dep_ctx = next(c for c in contexts if c.func_name == "_rt_add_scalar_incore")
-        assert dep_ctx.scalar_values == {}
         assert dep_ctx.scalar_dtypes == {"n": pl.FP32}
 
     def test_runtime_scalar_default_needs_no_keyword(self):
         """``pl.RUNTIME`` as the signature default makes the parameter runtime
         without the caller passing anything — through to the generated program
         (the specializer drops Python defaults, so the marker never leaks)."""
-        _, _, tm, sv, sd, dyn = rt_scalar_default_kernel._bind_args_from_signature({})
-        assert sv == {}
+        _, _, tm, sd, cx, dyn = rt_scalar_default_kernel._bind_args_from_signature({})
         assert sd == {"n": pl.FP32}
 
-        prog = str(rt_scalar_default_kernel._compile_to_program(tm, sv, sd, dyn, pl))
+        prog = str(rt_scalar_default_kernel._compile_to_program(tm, sd, cx, dyn, pl))
         assert "n: pl.Scalar[pl.FP32]" in prog
         assert "pl.RUNTIME" not in prog
         assert "pl.tile.adds(tile, n)" in prog
@@ -480,14 +489,19 @@ class TestCompileFromSignature:
         with pytest.raises(TypeError, match=r"'n' received pl\.RUNTIME"):
             rt_scalar_kernel._bind_args((t, pl.RUNTIME, t), {})
 
-    def test_runtime_scalar_and_literal_do_not_share_cache(self):
-        """Specializing the value and leaving it runtime are different artifacts."""
+    def test_scalar_value_never_splits_the_cache(self):
+        """One artifact serves every scalar value (issue #2751).
+
+        A literal used to compile its own artifact, so a caller that varied a
+        token count or an offset paid a compilation per value.
+        """
         from_runtime = rt_scalar_kernel.compile(n=pl.RUNTIME)
-        from_literal = rt_scalar_kernel.compile(n=7.0)
         assert isinstance(from_runtime, CompiledProgram)
-        assert from_runtime is not from_literal
-        # Re-requesting the runtime specialization hits the same cache entry.
-        assert rt_scalar_kernel.compile(n=pl.RUNTIME) is from_runtime
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            assert rt_scalar_kernel.compile(n=7.0) is from_runtime
+            assert rt_scalar_kernel.compile(n=9.0) is from_runtime
+        assert rt_scalar_kernel.compile() is from_runtime
 
     def test_unsupported_scalar_value_points_at_runtime_marker(self):
         """A value that is neither a literal nor ``pl.RUNTIME`` names both paths."""
@@ -521,7 +535,7 @@ class TestCompileFromSignature:
         spec.loader.exec_module(module)
 
         kernel = module.make_closure_kernel()
-        _, _, tensor_meta, _, _, _ = kernel._bind_args_from_signature({})
+        _, _, tensor_meta, _, cx, _ = kernel._bind_args_from_signature({})
         assert tensor_meta["a"].dynamic_dim_indices() == {0}
         assert tensor_meta["a"].static_shape()[1] == 64
         assert tensor_meta["a"].dtype == pl.FP32
@@ -558,8 +572,8 @@ class TestAnnotationLayoutReachesTheProgram:
     """
 
     def _entry_param_type(self, kernel):
-        _, _, tm, sv, sd, dyn = kernel._bind_args_from_signature({})
-        program = kernel._compile_to_program(tm, sv, sd, dyn, pl)
+        _, _, tm, sd, cx, dyn = kernel._bind_args_from_signature({})
+        program = kernel._compile_to_program(tm, sd, cx, dyn, pl)
         return list(program.functions.values())[0].params[0].type
 
     def test_layout_reaches_the_param_type(self):
@@ -570,8 +584,8 @@ class TestAnnotationLayoutReachesTheProgram:
 
     def test_unannotated_layout_stays_absent(self):
         """The plain two-slot form must not gain a view."""
-        _, _, tm, sv, sd, dyn = _mx_kernel._bind_args_from_signature({})
-        program = _mx_kernel._compile_to_program(tm, sv, sd, dyn, pl)
+        _, _, tm, sd, cx, dyn = _mx_kernel._bind_args_from_signature({})
+        program = _mx_kernel._compile_to_program(tm, sd, cx, dyn, pl)
         out_param = list(program.functions.values())[0].params[1]
         assert out_param.type.tensor_view is None
 
@@ -587,7 +601,7 @@ class TestAnnotationLayoutReachesTheProgram:
 
         span = exc_info.value.span
         assert span is not None
-        assert span["filename"].endswith("test_jit_compile_extraction.py")
+        assert str(span["filename"]).endswith("test_jit_compile_extraction.py")
 
 
 @jit.incore
@@ -613,8 +627,8 @@ class TestDepDeclaredLayout:
     """
 
     def test_dep_layout_survives_when_caller_declares_none(self):
-        _, _, tm, sv, sd, dyn = _calls_mx_dep._bind_args_from_signature({})
-        program = _calls_mx_dep._compile_to_program(tm, sv, sd, dyn, pl)
+        _, _, tm, sd, cx, dyn = _calls_mx_dep._bind_args_from_signature({})
+        program = _calls_mx_dep._compile_to_program(tm, sd, cx, dyn, pl)
         views = [
             p.type.tensor_view
             for f in program.functions.values()
@@ -651,7 +665,7 @@ class TestNzOnTensorIsNotJitSpecific:
 
     NZ on a TensorType asserts that the GM bytes are already in PTO-native NZ
     fractal order; ``BlockNzTensorViews`` later rewrites the shape into the
-    blocked rank-(r+2) form pto-isa needs. What matters here is only that the
+    blocked rank-5 form pto-isa needs. What matters here is only that the
     annotation *survives specialization* — dropping it is what silently produced
     an ND buffer from an NZ annotation.
 
@@ -671,9 +685,9 @@ class TestNzOnTensorIsNotJitSpecific:
             pl.store(t, [0, 0], c)
             return c
 
-        _, _, tm, sv, sd, dyn = kernel._bind_args_from_signature({})
+        _, _, tm, sd, cx, dyn = kernel._bind_args_from_signature({})
         assert tm["a"].layout == ir.TensorLayout.NZ
-        program = kernel._compile_to_program(tm, sv, sd, dyn, pl)
+        program = kernel._compile_to_program(tm, sd, cx, dyn, pl)
         view = list(program.functions.values())[0].params[0].type.tensor_view
         assert view is not None and view.layout == ir.TensorLayout.NZ
 
@@ -737,7 +751,9 @@ def test_default_and_runtime_only_requests_share_cache(kernel, compile_calls):
         assert kernel.compile() is cached
     assert len(compile_calls) == 1
     kwargs = compile_calls[0][0]
-    assert kwargs["platform"] == "a2a3sim"
+    assert kwargs["backend_type"] == BackendType.Ascend910
+    assert kwargs["execution_mode"] is ExecutionMode.SIM
+    assert "platform" not in kwargs
     assert kwargs["dump_passes"] is PassDumpLevel.NONE
 
 
@@ -921,6 +937,487 @@ def test_warm_cache_hit_does_not_probe_toolchain(kernel, monkeypatch):
 
     monkeypatch.setattr(importlib.import_module("pypto.jit.decorator"), "find_ptoas_binary", fail_discovery)
     assert kernel.compile() is cached
+
+
+@jit.incore
+def _constexpr_dep(
+    x: pl.Tensor[[32, 32], pl.FP32],
+    out: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+    scale: pl.Scalar[pl.FP32],
+    BLOCK: pl.constexpr,
+):
+    tile = pl.load(x, [0, 0], [BLOCK, BLOCK])
+    pl.store(pl.add(tile, scale), [0, 0], out)
+    return out
+
+
+@jit
+def _constexpr_entry(
+    x: pl.Tensor[[32, 32], pl.FP32],
+    out: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+    scale: pl.Scalar[pl.FP32],
+    BLOCK: pl.constexpr,
+):
+    return _constexpr_dep(x, out, scale, BLOCK)
+
+
+_DEP_TILE = 8
+
+
+@jit.incore
+def _module_constant_dep(
+    x: pl.Tensor[[32, 32], pl.FP32], out: pl.Out[pl.Tensor[[32, 32], pl.FP32]], N: pl.constexpr
+):
+    pl.store(pl.load(x, [0, 0], [N, N]), [0, 0], out)
+    return out
+
+
+@jit.incore
+def _literal_forms_dep(
+    a: pl.Tensor[[32, 32], pl.FP32],
+    o: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+    BIAS: pl.constexpr,
+    SHAPE: pl.constexpr,
+    MEM: pl.constexpr,
+):
+    tile = pl.load(a, [0, 0], SHAPE, target_memory=MEM)
+    pl.store(pl.add(tile, BIAS), [0, 0], o)
+    return o
+
+
+@jit
+def _literal_forms_entry(a: pl.Tensor[[32, 32], pl.FP32], o: pl.Out[pl.Tensor[[32, 32], pl.FP32]]):
+    with pl.at(level=pl.Level.CORE_GROUP):
+        pass
+    return _literal_forms_dep(a, o, -1, [16, 32], pl.Mem.Vec)
+
+
+@jit
+def _slice_write_literal(x: pl.Tensor[[128, 128], pl.FP32], out: pl.Out[pl.Tensor[[128, 128], pl.FP32]]):
+    out[0:64, 0:128] = pl.add(x[0:64, 0:128], 1.0)
+    return out
+
+
+@jit
+def _slice_write_constexpr(
+    x: pl.Tensor[[128, 128], pl.FP32],
+    out: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
+    BLOCK: pl.constexpr,
+):
+    out[0:BLOCK, 0:128] = pl.add(x[0:BLOCK, 0:128], 1.0)
+    return out
+
+
+@jit
+def _rebind_plain(
+    x: pl.Tensor[[128, 128], pl.FP32],
+    out: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
+    BLOCK: pl.constexpr,
+):
+    BLOCK = 32  # pyright: ignore[reportConstantRedefinition] — the rebind is the subject under test
+    out[0:BLOCK, 0:128] = pl.add(x[0:BLOCK, 0:128], 1.0)
+    return out
+
+
+@jit
+def _rebind_augmented(
+    x: pl.Tensor[[128, 128], pl.FP32],
+    out: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
+    BLOCK: pl.constexpr,
+):
+    BLOCK += 1  # pyright: ignore[reportConstantRedefinition] — the rebind is the subject under test
+    out[0:BLOCK, 0:128] = pl.add(x[0:BLOCK, 0:128], 1.0)
+    return out
+
+
+@jit
+def _rebind_unpacked(
+    x: pl.Tensor[[128, 128], pl.FP32],
+    out: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
+    BLOCK: pl.constexpr,
+):
+    _unused, BLOCK = 1, 32  # pyright: ignore[reportConstantRedefinition] — the rebind is the subject under test
+    out[0:BLOCK, 0:128] = pl.add(x[0:BLOCK, 0:128], 1.0)
+    return out
+
+
+@jit
+def _rebind_loop_target(
+    x: pl.Tensor[[128, 128], pl.FP32],
+    out: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
+    BLOCK: pl.constexpr,
+):
+    # PLR1704 is the point: this fixture exists to be refused by the specializer.
+    for BLOCK in pl.range(2):  # noqa: PLR1704  # pyright: ignore[reportConstantRedefinition] — the rebind is the subject under test
+        out[0:64, 0:128] = pl.add(x[0:64, 0:128], 1.0)
+    return out
+
+
+def _generated_functions(source: str) -> dict[str, str]:
+    """Split generated ``@pl.program`` source into ``{function name: body text}``.
+
+    Lets a test assert which *specific* generated function a constant folded
+    into, rather than only that the constant appears somewhere in the program —
+    the distinction that matters once one dep is emitted once per binding.
+    """
+    bodies: dict[str, str] = {}
+    current: str | None = None
+    for line in source.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("def ") and "(" in stripped:
+            current = stripped[len("def ") : stripped.index("(")]
+            bodies[current] = ""
+        elif current is not None:
+            bodies[current] += line + "\n"
+    return bodies
+
+
+class TestConstexprThroughDeps:
+    """A compile-time parameter keeps its meaning across a JIT call (issue #2759)."""
+
+    @pytest.fixture
+    def samples(self):
+        torch = pytest.importorskip("torch")
+        x = torch.zeros(32, 32, dtype=torch.float32)
+        return x, torch.zeros_like(x)
+
+    def test_forwarded_constant_folds_in_the_dep(self, samples):
+        """The entry's constant reaches the dep body, and the call drops the arg.
+
+        The dep no longer declares the parameter, so a forwarded argument would
+        be an arity mismatch at the generated call site.
+        """
+        x, out = samples
+        source = _constexpr_entry.specialize(x, out, 1.0, 16).as_python()
+
+        assert "pl.tile.load(x, [0, 0], [16, 16]" in source
+        assert "self._constexpr_dep(x, out, scale)" in source
+        assert "BLOCK" not in source
+
+        other = _constexpr_entry.specialize(x, out, 1.0, 32).as_python()
+        assert "pl.tile.load(x, [0, 0], [32, 32]" in other
+
+    def test_a_literal_at_the_dep_call_site_binds_it(self, samples):
+        x, out = samples
+
+        @jit
+        def entry(x: pl.Tensor[[32, 32], pl.FP32], out: pl.Out[pl.Tensor[[32, 32], pl.FP32]]):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                pass
+            return _module_constant_dep(x, out, 4)
+
+        assert "[4, 4]" in entry.specialize(x, out).as_python()
+
+    def test_a_module_constant_at_the_dep_call_site_binds_it(self, samples):
+        x, out = samples
+
+        @jit
+        def entry(x: pl.Tensor[[32, 32], pl.FP32], out: pl.Out[pl.Tensor[[32, 32], pl.FP32]]):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                pass
+            return _module_constant_dep(x, out, _DEP_TILE)
+
+        assert "[8, 8]" in entry.specialize(x, out).as_python()
+
+    def test_two_call_sites_with_different_constants_each_get_a_function(self, samples):
+        """One generated function per *binding*, so both constants survive.
+
+        The value is folded into the body, so a single generated function
+        cannot serve both call sites. Each binding is emitted separately and
+        each site is rewritten to reach its own.
+        """
+        x, out = samples
+
+        @jit
+        def entry(x: pl.Tensor[[32, 32], pl.FP32], out: pl.Out[pl.Tensor[[32, 32], pl.FP32]]):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                pass
+            out = _module_constant_dep(x, out, 4)
+            return _module_constant_dep(x, out, 16)
+
+        source = entry.specialize(x, out).as_python()
+        bodies = _generated_functions(source)
+
+        assert "[4, 4]" in bodies["_module_constant_dep"]
+        assert "[16, 16]" in bodies["_module_constant_dep__2"]
+        # Each site reaches its own compilation, in source order — the first
+        # keeps the unsuffixed name.
+        called = re.findall(r"self\.(_module_constant_dep(?:__\d+)?)\(", source)
+        assert called == ["_module_constant_dep", "_module_constant_dep__2"]
+
+    def test_call_sites_that_agree_still_share_one_function(self, samples):
+        """Two sites at the same value must not split into two functions.
+
+        The binding is the identity, not the call site, so agreeing sites
+        collapse — otherwise every repeated call would duplicate the callee.
+        """
+        x, out = samples
+
+        @jit
+        def entry(x: pl.Tensor[[32, 32], pl.FP32], out: pl.Out[pl.Tensor[[32, 32], pl.FP32]]):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                pass
+            out = _module_constant_dep(x, out, 16)
+            return _module_constant_dep(x, out, 16)
+
+        source = entry.specialize(x, out).as_python()
+
+        assert "def _module_constant_dep(" in source
+        assert "def _module_constant_dep__2(" not in source
+
+    def test_every_documented_literal_form_binds_at_a_dep_call_site(self, samples):
+        """A dep must accept the value forms the entry path accepts.
+
+        Only ``ast.Constant`` reached the renderer at first, so a negative
+        number, a list and an enum member — ``UnaryOp`` / ``List`` /
+        ``Attribute`` nodes — were rejected as having no compile-time value.
+        """
+        x, out = samples
+        source = _literal_forms_entry.specialize(x, out).as_python()
+
+        assert "[16, 32]" in source
+        assert "Mem.Vec" in source
+        assert "-1" in source
+
+    def test_two_callers_of_one_dep_each_get_a_function(self, samples):
+        """Divergence across *callers*, not just within one body, splits too.
+
+        A diamond reaches the dep down two branches. Resolving from the
+        first-recorded caller would fold its value and hand the other branch
+        the wrong constant, so each branch gets its own compilation.
+        """
+        x, out = samples
+
+        @jit.incore
+        def shared(
+            a: pl.Tensor[[32, 32], pl.FP32],
+            o: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+            N: pl.constexpr,
+        ):
+            pl.store(pl.load(a, [0, 0], [N, N]), [0, 0], o)
+            return o
+
+        @jit.inline
+        def left(a: pl.Tensor[[32, 32], pl.FP32], o: pl.Out[pl.Tensor[[32, 32], pl.FP32]]):
+            return shared(a, o, 16)
+
+        @jit.inline
+        def right(a: pl.Tensor[[32, 32], pl.FP32], o: pl.Out[pl.Tensor[[32, 32], pl.FP32]]):
+            return shared(a, o, 32)
+
+        @jit
+        def diamond(a: pl.Tensor[[32, 32], pl.FP32], o: pl.Out[pl.Tensor[[32, 32], pl.FP32]]):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                pass
+            o = left(a, o)
+            return right(a, o)
+
+        bodies = _generated_functions(diamond.specialize(x, out).as_python())
+
+        assert "[16, 16]" in bodies["shared"]
+        assert "[32, 32]" in bodies["shared__2"]
+
+    def test_splitting_survives_an_aliased_call_name(self, samples):
+        """The alias and the split resolve the callee together, not in turn.
+
+        ``dep_func_names`` maps a call name onto the generated function it
+        reaches; the split needs a *different* function per site of that same
+        name. Resolving either one alone gives the wrong callee.
+        """
+        x, out = samples
+        aliased = _module_constant_dep
+
+        @jit
+        def entry(a: pl.Tensor[[32, 32], pl.FP32], o: pl.Out[pl.Tensor[[32, 32], pl.FP32]]):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                pass
+            o = aliased(a, o, 8)
+            return aliased(a, o, 24)
+
+        source = entry.specialize(x, out).as_python()
+        bodies = _generated_functions(source)
+
+        # Named after the callee, not the alias, and one per binding.
+        assert "[8, 8]" in bodies["_module_constant_dep"]
+        assert "[24, 24]" in bodies["_module_constant_dep__2"]
+        called = re.findall(r"self\.(_module_constant_dep(?:__\d+)?)\(", source)
+        assert called == ["_module_constant_dep", "_module_constant_dep__2"]
+
+    def test_a_forwarded_constant_splits_the_whole_chain(self, samples):
+        """Splitting a dep splits everything it forwards the value to.
+
+        ``entry -> mid(N) -> leaf(N)`` at two values needs two ``mid``s *and*
+        two ``leaf``s, with each ``mid`` calling its own ``leaf`` — one shared
+        ``leaf`` would serve one of them the other's constant.
+        """
+        x, out = samples
+
+        @jit.incore
+        def leaf(
+            a: pl.Tensor[[32, 32], pl.FP32],
+            o: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+            N: pl.constexpr,
+        ):
+            pl.store(pl.load(a, [0, 0], [N, N]), [0, 0], o)
+            return o
+
+        @jit.incore
+        def mid(
+            a: pl.Tensor[[32, 32], pl.FP32],
+            o: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+            N: pl.constexpr,
+        ):
+            return leaf(a, o, N)
+
+        @jit
+        def entry(a: pl.Tensor[[32, 32], pl.FP32], o: pl.Out[pl.Tensor[[32, 32], pl.FP32]]):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                pass
+            o = mid(a, o, 8)
+            return mid(a, o, 24)
+
+        bodies = _generated_functions(entry.specialize(x, out).as_python())
+
+        assert "[8, 8]" in bodies["leaf"]
+        assert "[24, 24]" in bodies["leaf__2"]
+        assert "self.leaf(" in bodies["mid"]
+        assert "self.leaf__2(" in bodies["mid__2"]
+
+    def test_each_specialization_reads_its_own_call_site_metadata(self, samples):
+        """A split dep must take its tensors from the call that produced it.
+
+        Call-site arguments were resolved from the first call bearing the
+        name. That was sound while one binding meant one function; once the
+        second binding compiles separately it would fold its own constant over
+        the *first* site's tensors — here a ``[32, 32]`` extent loaded from a
+        ``[16, 16]`` parameter.
+        """
+        x, out = samples
+
+        @jit.incore
+        def sized(a: pl.Tensor, o: pl.Out[pl.Tensor], N: pl.constexpr):
+            pl.store(pl.load(a, [0, 0], [N, N]), [0, 0], o)
+            return o
+
+        @jit
+        def entry(a: pl.Tensor[[32, 32], pl.FP32], o: pl.Out[pl.Tensor[[32, 32], pl.FP32]]):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                pass
+            small = pl.create_tensor([16, 16], dtype=pl.FP32)
+            big = pl.create_tensor([32, 32], dtype=pl.FP32)
+            sized(small, small, 16)
+            sized(big, big, 32)
+            return o
+
+        source = entry.specialize(x, out).as_python()
+        signatures = {
+            line.strip()[len("def ") : line.strip().index("(")]: line.strip()
+            for line in source.splitlines()
+            if line.strip().startswith("def sized")
+        }
+
+        assert "pl.Tensor[[16, 16], pl.FP32]" in signatures["sized"]
+        assert "pl.Tensor[[32, 32], pl.FP32]" in signatures["sized__2"]
+
+    def test_assigning_to_a_constexpr_parameter_is_rejected(self, samples):
+        """A rebind cannot take effect, so it must not compile silently.
+
+        Every load folds to the call-site value, so ``BLOCK = BLOCK // 2``
+        left the later loads on the original constant and leaked the
+        assignment into the body as a stray runtime local.
+        """
+        x, out = samples
+
+        @jit
+        def rebind(
+            a: pl.Tensor[[32, 32], pl.FP32],
+            o: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+            BLOCK: pl.constexpr,
+        ):
+            BLOCK = BLOCK // 2  # pyright: ignore[reportConstantRedefinition] — the rebind is the subject under test
+            with pl.at(level=pl.Level.CORE_GROUP):
+                pl.store(pl.load(a, [0, 0], [BLOCK, BLOCK]), [0, 0], o)
+            return o
+
+        with pytest.raises(ValueError, match=r"'BLOCK' is a 'pl.constexpr' parameter"):
+            rebind.specialize(x, out, 32)
+
+    def test_a_constexpr_read_in_a_slice_assign_target_is_not_a_rebind(self):
+        """Reading a constexpr inside a store target must stay legal.
+
+        ``out[0:BLOCK, ...] = ...`` stores through a subscript whose *slice*
+        loads ``BLOCK``. Walking the target for any occurrence rejected it,
+        refusing the most natural use of a compile-time extent while the same
+        statement written with a literal compiled.
+        """
+        torch = pytest.importorskip("torch")
+        a = torch.zeros(128, 128, dtype=torch.float32)
+        out = torch.zeros_like(a)
+
+        literal = _slice_write_literal.specialize(a, out).as_python()
+        folded = _slice_write_constexpr.specialize(a, out, 64).as_python()
+        assert "64" in literal
+        assert "64" in folded
+
+    @pytest.mark.parametrize(
+        "kernel",
+        ["_rebind_plain", "_rebind_augmented", "_rebind_unpacked", "_rebind_loop_target"],
+    )
+    def test_every_binding_form_of_a_constexpr_is_rejected(self, kernel):
+        """The Store-only rule must still catch each way a name can be bound."""
+        torch = pytest.importorskip("torch")
+        a = torch.zeros(128, 128, dtype=torch.float32)
+
+        with pytest.raises(ValueError, match=r"'BLOCK' is a 'pl.constexpr' parameter"):
+            globals()[kernel].specialize(a, torch.zeros_like(a), 64)
+
+    def test_a_runtime_scalar_at_the_dep_call_site_is_rejected(self, samples):
+        """A value that only exists at dispatch cannot fill a compile-time slot."""
+        x, out = samples
+
+        @jit
+        def entry(
+            x: pl.Tensor[[32, 32], pl.FP32],
+            out: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+            n: pl.Scalar[pl.INT32],
+        ):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                pass
+            return _module_constant_dep(x, out, n)
+
+        with pytest.raises(TypeError, match=r"no compile-time value"):
+            entry.specialize(x, out, 4)
+
+
+def test_jit_fixture_detects_printer_failure(monkeypatch, pass_verification_instruments):
+    """A printer regression must fail JIT lowering under the default test checks."""
+    torch = pytest.importorskip("torch")
+    printer = importlib.import_module("pypto.ir.printer")
+
+    def broken_print(*args, **kwargs):
+        raise RuntimeError("injected printer fidelity regression")
+
+    monkeypatch.setattr(printer, "python_print", broken_print)
+    x = torch.zeros(16, 16)
+    if any(i.get_name() == "RoundtripInstrument" for i in pass_verification_instruments):
+        with pytest.raises(RuntimeError, match="(?s)Printer failed after pass.*injected printer fidelity"):
+            add_kernel.lower(x, x, torch.empty_like(x))
+    else:
+        # Explicit basic/none modes do not request a print/reparse check.
+        assert isinstance(add_kernel.lower(x, x, torch.empty_like(x)), ir.Program)
+
+
+@pytest.mark.parametrize("platform", ["a2a3", "a2a3sim", "a5", "a5sim"])
+def test_deprecated_and_explicit_target_share_cache(kernel, compile_calls, platform):
+    with pytest.warns(DeprecationWarning, match=r"RunConfig\(platform="):
+        legacy = RunConfig(platform=platform)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        explicit = RunConfig(backend_type=legacy.backend_type, execution_mode=legacy.execution_mode)
+        artifact = kernel.compile(config=explicit)
+        assert kernel.compile(config=legacy) is artifact
+    assert len(compile_calls) == 1
+    assert next(iter(kernel._cache)).platform == platform
 
 
 if __name__ == "__main__":

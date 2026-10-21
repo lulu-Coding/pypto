@@ -97,7 +97,8 @@ def hand_step(self, x, y, data, signal, root):
 开启 pass dump 编译并对比两种模式的 lowering 后 IR：
 
 - `--mode hand` 恰好 lowering 为上述三个阶段——一次对根的 `remote_load`，由 notify/wait barrier 保护。
-- `--mode builtin` 得到相同的*形状*——`[nr, 1]` 信号上的就绪 barrier，然后是根读取——但有两处差异值得留意。其读取是单次 `pld.tile.get`（经由 staging tile 流式传输的 window 到 window 的 TGET），而不是你那对 `remote_load` + `pl.store`；并且 composite 会追加**自清理尾声**，把本次调用的信用额度再减回去——这正是该信号能被后续集合通信复用的原因（步骤 16）。方向与 barrier 的位置则与你一致。
+- `--mode builtin` 得到相同的*形状*——`[nr, 1]` 信号上的就绪 barrier，然后是根读取——但有两处差异值得留意。其读取是单次 `pld.tile.get`（经由 staging tile 流式传输的 window 到 window 的 TGET），而不是你那对 `remote_load` + `pl.store`；并且 composite 会追加**自清理尾声**，把本次调用的信用额度再减回去——这正是该信号能被后续集合通信复用的原因（[21-putting_it_together](21-putting_it_together.md)，
+步骤 16）。方向与 barrier 的位置则与你一致。
 
 **成本卡（每 rank）：** 根写入 `N` 字节；每个对端读取——共 `(P-1)·N` 字节，一步完成。这是每字节最便宜的集合通信，因为每个 rank 想要的是*相同*的字节。
 

@@ -26,6 +26,7 @@
 namespace pypto {
 
 namespace backend {
+class Backend;
 class BackendHandler;
 }  // namespace backend
 
@@ -302,14 +303,16 @@ class PassContext {
    * @param runtime Which Simpler runtime ABI to target (default:
    *        TensorMapAndRingBuffer). Passes that must legalize IR for a specific
    *        runtime switch on this rather than inspecting codegen options.
+   * @param enable_buffer_ir Enable Buffer IR for supported whole kernels (default: true).
+   *        Unsupported kernels retain Tile IR; selected-kernel failures propagate.
    */
   explicit PassContext(std::vector<PassInstrumentPtr> instruments,
                        VerificationLevel verification_level = VerificationLevel::Basic,
                        DiagnosticPhase diagnostic_phase = DiagnosticPhase::PrePipeline,
                        DiagnosticCheckSet disabled_diagnostics = {DiagnosticCheck::UnusedControlFlowResult},
                        MemoryPlanner memory_planner = MemoryPlanner::PyPTO,
-                       bool enable_pypto_l0c_double_buffer = false,
-                       RuntimeKind runtime = kDefaultRuntimeKind);
+                       bool enable_pypto_l0c_double_buffer = false, RuntimeKind runtime = kDefaultRuntimeKind,
+                       bool enable_buffer_ir = true);
 
   /**
    * @brief Push this context onto the thread-local stack
@@ -381,11 +384,18 @@ class PassContext {
    */
   [[nodiscard]] RuntimeKind GetRuntime() const;
 
+  /// Whether supported whole kernels use Buffer IR.
+  [[nodiscard]] bool GetEnableBufferIR() const;
+
   /**
    * @brief Get the currently active context (top of thread-local stack)
    * @return Pointer to current context, or nullptr if none
    */
   static PassContext* Current();
+
+  /// Access registered operator rules through the same target resolution as
+  /// GetBackendHandler; this does not introduce per-context target ownership.
+  [[nodiscard]] const backend::Backend* GetBackend() const;
 
   /**
    * @brief Convenience accessor for the currently configured BackendHandler.
@@ -408,6 +418,7 @@ class PassContext {
   MemoryPlanner memory_planner_;
   bool enable_pypto_l0c_double_buffer_;
   RuntimeKind runtime_;
+  bool enable_buffer_ir_;
   PassContext* previous_;
 
   static thread_local PassContext* current_;

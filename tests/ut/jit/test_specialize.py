@@ -22,12 +22,14 @@ this method, whichever surface authored the kernel.
 from typing import Any
 
 import pypto.language as pl
+import pypto.language.distributed as pld
 import pytest
 import torch
+from pypto.ir import DistributedConfig
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 from pypto.jit.decorator import jit
 from pypto.language.parser.diagnostics import ParserTypeError
-from pypto.pypto_core import DataType, ir
+from pypto.pypto_core import DataType, ir, passes
 from pypto.pypto_core.ir import MemorySpace
 from pypto.runtime.runner import RunConfig
 
@@ -217,6 +219,155 @@ class TestFreeNameResolution:
         cast_call = _find_call(program, "tile.cast")
         assert cast_call.kwargs["mode"] == expected_mode
         assert cast_call.kwargs["target_type"] == expected_dtype
+
+
+_GLOBAL_REDUCE_OP = pld.ReduceOp.Sum
+
+
+@pl.jit
+def _initialize_allreduce(data: pl.InOut[pld.DistributedTensor[[1, 256], pl.FP32]]):
+    with pl.at(level=pl.Level.CORE_GROUP):
+        data = pl.store(pl.tile.full([1, 256], pl.FP32, 1.0), [0, 0], data)
+    return data
+
+
+def _global_allreduce():
+    data_buf = pld.alloc_window_buffer(256 * 4)
+    signal_buf = pld.alloc_window_buffer(2 * 4)
+    for rank in pl.range(pld.world_size()):
+        data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+        _initialize_allreduce(data, device=rank)
+    data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+    signal = pld.window(signal_buf, [2], dtype=pl.INT32)
+    data = pld.tensor.allreduce(data, signal, op=_GLOBAL_REDUCE_OP)
+
+
+def _make_allreduce(reduce_op):
+    @pl.jit.host
+    def host():
+        data_buf = pld.alloc_window_buffer(256 * 4)
+        signal_buf = pld.alloc_window_buffer(2 * 4)
+        for rank in pl.range(pld.world_size()):
+            data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+            _initialize_allreduce(data, device=rank)
+        data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+        signal = pld.window(signal_buf, [2], dtype=pl.INT32)
+        data = pld.tensor.allreduce(data, signal, op=reduce_op)
+
+    def set_op(value):
+        nonlocal reduce_op
+        reduce_op = value
+
+    return host, set_op
+
+
+@pl.jit.host
+def _literal_allreduce_sum():
+    data_buf = pld.alloc_window_buffer(256 * 4)
+    signal_buf = pld.alloc_window_buffer(2 * 4)
+    for rank in pl.range(pld.world_size()):
+        data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+        _initialize_allreduce(data, device=rank)
+    data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+    signal = pld.window(signal_buf, [2], dtype=pl.INT32)
+    data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+
+
+@pl.jit.host
+def _literal_allreduce_max():
+    data_buf = pld.alloc_window_buffer(256 * 4)
+    signal_buf = pld.alloc_window_buffer(2 * 4)
+    for rank in pl.range(pld.world_size()):
+        data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+        _initialize_allreduce(data, device=rank)
+    data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+    signal = pld.window(signal_buf, [2], dtype=pl.INT32)
+    data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Max)
+
+
+@pl.jit.host
+def _literal_allreduce_min():
+    data_buf = pld.alloc_window_buffer(256 * 4)
+    signal_buf = pld.alloc_window_buffer(2 * 4)
+    for rank in pl.range(pld.world_size()):
+        data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+        _initialize_allreduce(data, device=rank)
+    data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+    signal = pld.window(signal_buf, [2], dtype=pl.INT32)
+    data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Min)
+
+
+@pl.jit.host
+def _literal_allreduce_prod():
+    data_buf = pld.alloc_window_buffer(256 * 4)
+    signal_buf = pld.alloc_window_buffer(2 * 4)
+    for rank in pl.range(pld.world_size()):
+        data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+        _initialize_allreduce(data, device=rank)
+    data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+    signal = pld.window(signal_buf, [2], dtype=pl.INT32)
+    data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Prod)
+
+
+class TestDistributedEnumConstants:
+    @pytest.fixture
+    def pass_verification_instruments(self):
+        # Distributed tensor dumps with absent memref/tensor_view cannot reparse,
+        # including the literal controls. Keep full compilation and before/after
+        # IR property checks; enum folding is checked independently above.
+        return [passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]
+
+    @pytest.fixture(params=["closure", "global"])
+    def allreduce(self, request, monkeypatch):
+        if request.param == "closure":
+            return _make_allreduce(pld.ReduceOp.Sum)
+
+        def set_op(value):
+            monkeypatch.setitem(_global_allreduce.__globals__, "_GLOBAL_REDUCE_OP", value)
+
+        return pl.jit.host(_global_allreduce), set_op
+
+    @pytest.fixture
+    def config(self):
+        return RunConfig(platform="a2a3", distributed_config=DistributedConfig(device_ids=[0, 1]))
+
+    @pytest.mark.parametrize(
+        "reduce_op, literal",
+        [
+            (pld.ReduceOp.Sum, _literal_allreduce_sum),
+            (pld.ReduceOp.Max, _literal_allreduce_max),
+            (pld.ReduceOp.Min, _literal_allreduce_min),
+            (pld.ReduceOp.Prod, _literal_allreduce_prod),
+        ],
+    )
+    def test_alias_matches_literal_through_compile(self, allreduce, config, reduce_op, literal):
+        kernel, set_op = allreduce
+        set_op(reduce_op)
+        specialized = kernel.specialize()
+        assert _find_call(specialized, "pld.tensor.allreduce").kwargs["op"] == int(reduce_op)
+        control = literal.compile(config=config)
+        compiled = kernel.compile(config=config)
+        assert compiled.program is not None and control.program is not None
+        actual_op = _find_call(compiled.program, "builtin.tensor.allreduce").kwargs["op"]
+        literal_op = _find_call(control.program, "builtin.tensor.allreduce").kwargs["op"]
+        assert actual_op == literal_op == int(reduce_op)
+
+    def test_rebinding_enum_invalidates_cache(self, allreduce, config):
+        kernel, set_op = allreduce
+        hashes = set()
+        compiled_by_op = {}
+        for reduce_op in pld.ReduceOp:
+            set_op(reduce_op)
+            hashes.add(kernel._get_source_hash())
+            compiled = kernel.compile(config=config)
+            assert compiled.program is not None
+            assert _find_call(compiled.program, "builtin.tensor.allreduce").kwargs["op"] == int(reduce_op)
+            assert kernel.compile(config=config) is compiled
+            compiled_by_op[reduce_op] = compiled
+        assert len(hashes) == len(compiled_by_op) == 4
+        assert len({id(compiled) for compiled in compiled_by_op.values()}) == 4
+        set_op(pld.ReduceOp.Sum)
+        assert kernel.compile(config=config) is compiled_by_op[pld.ReduceOp.Sum]
 
 
 class TestSpecialize:

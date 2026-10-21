@@ -1,5 +1,9 @@
 # 混合 kernel
 
+> **旧 Python 接口示例：** 本页为兼容现有用法保留 `platform=` 调用，
+> 这些调用会发出 `DeprecationWarning`；新代码应使用 `backend_type` 和
+> `execution_mode`。参见[目标映射](../../dev/08-entry-points.md#迁移旧-platform-示例)。
+
 cube 与 vector 在同一个作用域里同时工作。
 
 > **前置**：[分块 matmul](02-matmul.md)。
@@ -118,7 +122,7 @@ tile that crosses the cube/vector boundary
 
 当 `pl.split` 表达不了所需形状时才动用显式形式：逐通道寻址、只有某一个通道算得出的 gather、或者一个混合了 split 与非 split 工作的区域。`tests/st/codegen/dsl/test_split_aiv_gather_row_codegen.py` 是一个实例。其余情况留在 `pl.split` 上 —— 它插入的是同样的算子，而且配对不会错。
 
-机器级契约见 [TPUSH/TPOP](../../reference/pto-isa/01-tpush_tpop.md)；pass 做了什么见 [ExpandMixedKernel](../../dev/passes/24-expand_mixed_kernel.md)。
+机器级契约见 [TPUSH/TPOP](../../reference/pto-isa/01-tpush_tpop.md)；pass 做了什么见 [ExpandMixedKernel](../../dev/passes/25-expand_mixed_kernel.md)。
 
 ## 边界情况
 

@@ -15,9 +15,10 @@ from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, Union, cast, overload
 
 if TYPE_CHECKING:
-    from pypto.language.typing import Array, Scalar, Tensor, Tile
+    from pypto.language.typing import Array, Tensor, Tile
     from pypto.pypto_core import ir
 
+from pypto.language.typing.scalar import Scalar
 from pypto.pypto_core import ir as _ir
 
 from .optimizations import Optimization
@@ -138,18 +139,22 @@ def _make_range_iterator(
 ) -> RangeIterator[Scalar] | RangeIterator[tuple[Scalar, tuple[Any, ...]]]:
     """Shared implementation for range(), parallel(), unroll(), and pipeline()."""
     if pipeline_stages is not None:
-        if not isinstance(pipeline_stages, int) or isinstance(pipeline_stages, bool) or pipeline_stages < 1:
+        # bool is an int subclass and must not pose as a stage count; the
+        # isinstance pair is a mistyped-input guard (the annotation is the contract).
+        if (
+            not isinstance(pipeline_stages, int)  # pyright: ignore[reportUnnecessaryIsInstance]
+            or isinstance(pipeline_stages, bool)
+            or pipeline_stages < 1
+        ):
             raise ValueError(f"{func_name}() stage must be a positive integer, got {pipeline_stages!r}")
-    kwargs = {
-        "init_values": init_values,
-        "pipeline_stages": pipeline_stages,
-    }
     if len(args) == 1:
-        return RangeIterator(args[0], **kwargs)
+        return RangeIterator(args[0], init_values=init_values, pipeline_stages=pipeline_stages)
     elif len(args) == 2:
-        return RangeIterator(args[1], args[0], **kwargs)
+        return RangeIterator(args[1], args[0], init_values=init_values, pipeline_stages=pipeline_stages)
     elif len(args) == 3:
-        return RangeIterator(args[1], args[0], args[2], **kwargs)
+        return RangeIterator(
+            args[1], args[0], args[2], init_values=init_values, pipeline_stages=pipeline_stages
+        )
     else:
         raise ValueError(f"{func_name}() takes 1 to 3 positional arguments")
 
@@ -284,22 +289,64 @@ def parallel(
     return _make_range_iterator(*args, init_values=init_values, func_name="parallel")
 
 
+@overload
+def unroll(*args: RangeArg, init_values: None = None) -> RangeIterator[Scalar]: ...
+
+
+@overload
+def unroll(*args: RangeArg, init_values: tuple[T1]) -> RangeIterator[tuple[Scalar, tuple[T1]]]: ...
+
+
+@overload
+def unroll(*args: RangeArg, init_values: tuple[T1, T2]) -> RangeIterator[tuple[Scalar, tuple[T1, T2]]]: ...
+
+
+@overload
 def unroll(
     *args: RangeArg,
-) -> RangeIterator[Scalar]:
+    init_values: tuple[T1, T2, T3],
+) -> RangeIterator[tuple[Scalar, tuple[T1, T2, T3]]]: ...
+
+
+@overload
+def unroll(
+    *args: RangeArg,
+    init_values: tuple[T1, T2, T3, T4],
+) -> RangeIterator[tuple[Scalar, tuple[T1, T2, T3, T4]]]: ...
+
+
+@overload
+def unroll(
+    *args: RangeArg,
+    init_values: tuple[T1, T2, T3, T4, T5],
+) -> RangeIterator[tuple[Scalar, tuple[T1, T2, T3, T4, T5]]]: ...
+
+
+def unroll(
+    *args: RangeArg,
+    init_values: tuple[Any, ...] | None = None,
+) -> RangeIterator[Scalar] | RangeIterator[tuple[Scalar, tuple[Any, ...]]]:
     """Create an unroll range iterator for compile-time loop unrolling.
 
     Behaves identically to range() at runtime. The distinction is used by the
     parser to emit ForKind.Unroll instead of ForKind.Sequential.
 
-    Unrolled loops do not support init_values (loop-carried state).
+    Explicit init_values represent transitional SSA IR for print/parse roundtrips.
+    UnrollLoops requires non-SSA input: in executable kernels use ordinary
+    assignments and run UnrollLoops before ConvertToSSA.
+
+    The trip count is capped at 1024 iterations by the ``UnrollLoops`` pass
+    (``kMaxUnrollIterations``); a larger loop raises ``ValueError`` — use
+    ``range()`` (a device-side loop) for larger trip counts.
 
     Args:
         *args: Positional arguments (stop) or (start, stop) or (start, stop, step).
             Each argument must be an int literal (compile-time constant).
+        init_values: Initial values for iteration arguments in transitional SSA IR.
 
     Returns:
-        RangeIterator yielding loop variable (Scalar)
+        If no init_values: RangeIterator yielding loop variable (Scalar)
+        If init_values: RangeIterator yielding (loop_var, (iter_args...))
 
     Examples:
         >>> for i in pl.unroll(4):
@@ -307,10 +354,7 @@ def unroll(
         >>> for i in pl.unroll(0, 6, 2):
         ...     x = pl.add(x, i)
     """
-    return cast(
-        RangeIterator["Scalar"],
-        _make_range_iterator(*args, func_name="unroll"),
-    )
+    return _make_range_iterator(*args, init_values=init_values, func_name="unroll")
 
 
 @overload
@@ -659,8 +703,9 @@ class ClusterContext:
     The parser recognizes this pattern and creates a ScopeStmt(Cluster).
     """
 
-    def __init__(self, *, name_hint: str = "") -> None:
+    def __init__(self, *, name_hint: str = "", dumps: list[Any] | None = None) -> None:
         self.name_hint = name_hint
+        self.dumps = dumps
 
     def __enter__(self) -> None:
         """Enter the Cluster scope context."""
@@ -671,7 +716,7 @@ class ClusterContext:
         pass
 
 
-def cluster(*, name_hint: str = "") -> ClusterContext:
+def cluster(*, name_hint: str = "", dumps: list[Any] | None = None) -> ClusterContext:
     """Mark a region of code as belonging to a Cluster execution context.
 
     A cluster groups co-scheduled AIC (Cube) and AIV (Vector) kernels that
@@ -680,6 +725,12 @@ def cluster(*, name_hint: str = "") -> ClusterContext:
 
     Args:
         name_hint: Optional name hint for the outlined function.
+        dumps: Optional list literal of outer-scope tensor names to mark for
+            selective tensor dump on the Group dispatch the cluster outlines to
+            — the same surface as ``pl.at(..., dumps=[...])``. This marks only
+            this Group launch. A preceding ``pl.dump_tag(t)`` also marks later
+            consuming dispatches and may mark nested ones. The printer emits
+            ``dumps=`` for a scope carrying dump marks.
 
     Returns:
         Context manager for Cluster scope
@@ -689,7 +740,7 @@ def cluster(*, name_hint: str = "") -> ClusterContext:
         ...     with pl.at(level=pl.Level.CORE_GROUP):
         ...         y = pl.add(x, x)
     """
-    return ClusterContext(name_hint=name_hint)
+    return ClusterContext(name_hint=name_hint, dumps=dumps)
 
 
 class GraphContext:
@@ -699,8 +750,9 @@ class GraphContext:
     a ``GraphScopeStmt``.
     """
 
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, *, dumps: list[Any] | None = None) -> None:
         self.name = name
+        self.dumps = dumps
 
     def __enter__(self) -> None:
         """Enter the Graph scope context."""
@@ -711,7 +763,7 @@ class GraphContext:
         pass
 
 
-def graph(name: str) -> GraphContext:
+def graph(name: str, *, dumps: list[Any] | None = None) -> GraphContext:
     """Mark a repeated region of orchestration as one recordable graph.
 
     Under ``runtime="host_build_graph"`` the runtime records the region's task
@@ -736,6 +788,13 @@ def graph(name: str) -> GraphContext:
         name: Region name. Must be a valid Python identifier; it becomes the
             outlined function's name and hence the runtime's graph key, so keep
             it stable across edits.
+        dumps: Optional list literal of outer-scope tensor names to mark for
+            selective tensor dump on the Graph task itself (distinct from the
+            kernel dispatches recorded inside it) — the same surface as
+            ``pl.at(..., dumps=[...])``. This marks only this Graph launch.
+            A preceding ``pl.dump_tag(t)`` may also mark recorded kernel
+            dispatches and later consumers. The printer emits ``dumps=`` for
+            a scope carrying dump marks.
 
     Returns:
         Context manager for the Graph scope.
@@ -751,7 +810,7 @@ def graph(name: str) -> GraphContext:
         ...         h = attention(x, wq, h)
         ...         x = mlp(h, w1, x)
     """
-    return GraphContext(name)
+    return GraphContext(name, dumps=dumps)
 
 
 class SpmdContext:
@@ -774,12 +833,14 @@ class SpmdContext:
         deps: list[Any] | None = None,
         allow_early_resolve: bool = False,
         predicate: Any = None,
+        dumps: list[Any] | None = None,
     ) -> None:
         self.core_num = core_num
         self.sync_start = sync_start
         self.name_hint = name_hint
         self.optimizations = optimizations
         self.deps = deps
+        self.dumps = dumps
         self.allow_early_resolve = allow_early_resolve
         self.predicate = predicate
 
@@ -811,7 +872,7 @@ class SpmdContext:
 
 
 def spmd(
-    core_num: RangeArg,
+    core_num: int | Scalar | _ir.Expr,
     *,
     sync_start: bool = False,
     name_hint: str = "",
@@ -819,6 +880,7 @@ def spmd(
     deps: list[Any] | None = None,
     allow_early_resolve: bool = False,
     predicate: Any = None,
+    dumps: list[Any] | None = None,
 ) -> SpmdContext:
     """Dispatch a kernel with SPMD (Single Program Multiple Data) multi-block execution.
 
@@ -876,7 +938,8 @@ def spmd(
 
     Args:
         core_num: Number of blocks for SPMD dispatch. Positional; accepts a
-            Python ``int`` or any ``ir.Expr`` of integer type. Closure-captured
+            Python ``int``, a ``Scalar`` facade, or any ``ir.Expr`` of integer
+            type. Closure-captured
             integer constants and closure arithmetic are folded to ``ConstInt``
             by the parser and ``Simplify``; non-foldable expressions flow
             through to codegen unchanged. Pass
@@ -929,6 +992,14 @@ def spmd(
             ``deps=`` — otherwise the predicate may read a stale value. The parser
             makes a best-effort check (see ``pl.spmd_submit``); getting ``deps=``
             right remains the author's responsibility.
+        dumps: Optional list literal of outer-scope tensor names to mark for
+            selective tensor dump on the grid dispatch — the same surface as
+            ``pl.at(..., dumps=[...])``, accepted on all three forms. It rides
+            on the Spmd scope; a forward-sticky ``pl.dump_tag(t)`` before an
+            inline body lands on the auto-outlined kernel instead, and either
+            way the tensor is dumped on the one launch. Unlike ``deps=`` it is
+            legal on a ``pl.cluster()``-nested ``pl.spmd``, whose marks move
+            onto the Group dispatch.
 
     Returns:
         Context manager / loop iterator for the SPMD scope.
@@ -981,8 +1052,18 @@ def spmd(
         >>> with pl.spmd(4, deps=[gate_tid], predicate=(row_count[0, 0] > 0)) as tid:
         ...     out = self.expert(x, out)
     """
-    if isinstance(core_num, bool) or not isinstance(core_num, (int, _ir.Expr)):
-        raise ValueError(f"core_num must be a positive integer or ir.Expr, got {core_num!r}")
+    # A Scalar facade (``pl.min`` and friends return Scalar) carries the
+    # count as its wrapped expression; unwrap before validation so traced
+    # bodies can size a launch off a computed count.
+    if isinstance(core_num, Scalar):
+        core_num = core_num.unwrap()
+    # bool is an int subclass and must not pose as a core count; the isinstance
+    # pair is a mistyped-input guard (the annotation is the contract).
+    if (
+        not isinstance(core_num, (int, _ir.Expr))  # pyright: ignore[reportUnnecessaryIsInstance]
+        or isinstance(core_num, bool)
+    ):
+        raise ValueError(f"core_num must be a positive int, a Scalar, or an ir.Expr, got {core_num!r}")
     if isinstance(core_num, int) and core_num <= 0:
         raise ValueError(f"core_num must be a positive integer, got {core_num!r}")
     return SpmdContext(
@@ -993,6 +1074,7 @@ def spmd(
         deps=deps,
         allow_early_resolve=allow_early_resolve,
         predicate=predicate,
+        dumps=dumps,
     )
 
 
@@ -1181,8 +1263,8 @@ def split_aiv(n: int, *, mode: ir.SplitMode) -> SplitAivContext:
 
     The region survives parse -> SSA -> ResolveBackendOpLayouts as a structural
     node (printer emits ``for aiv_id in pl.split_aiv(...):`` so parse->print->parse
-    is a fixpoint), then is consumed and erased by LowerAutoVectorSplit (pass 23);
-    it never reaches ExpandMixedKernel or codegen.
+    is a fixpoint), then is lowered by LowerAutoVectorSplit and erased by ExpandMixedKernel;
+    it never reaches codegen.
 
     Args:
         n: The AIV sub-core count. Positional; hardware-fixed at 2 (the two AIV
@@ -1209,11 +1291,13 @@ def split_aiv(n: int, *, mode: ir.SplitMode) -> SplitAivContext:
         >>> for _ in pl.split_aiv(2, mode=pl.SplitMode.NONE):
         ...     out = pl.add(mm, bias)  # phase 2, full width on both lanes
     """
-    if isinstance(n, bool) or not isinstance(n, int):
+    # bool is an int subclass and must not pose as the lane count; the isinstance
+    # pair is a mistyped-input guard (the annotation is the contract).
+    if not isinstance(n, int) or isinstance(n, bool):  # pyright: ignore[reportUnnecessaryIsInstance]
         raise ValueError(f"pl.split_aiv(n): n must be the integer 2, got {n!r}")
     if n != 2:
         raise ValueError(f"pl.split_aiv(n): n must be the integer 2 (the two AIV lanes), got {n}")
-    if not isinstance(mode, _ir.SplitMode):
+    if type(mode) is not _ir.SplitMode:
         raise ValueError(f"pl.split_aiv(mode=...): mode must be a pl.SplitMode, got {mode!r}")
     return SplitAivContext(n=n, mode=mode)
 

@@ -219,8 +219,8 @@ def vec_carry_narrowed_by_yield(
 
 def _jit_program(kernel):
     """Specialize a fully annotated JIT function without running passes."""
-    _, _, tensor_meta, scalar_values, scalar_dtypes, per_func_dyn = kernel._bind_args_from_signature({})
-    return kernel._compile_to_program(tensor_meta, scalar_values, scalar_dtypes, per_func_dyn, pl)
+    _, _, tensor_meta, scalar_dtypes, cx, per_func_dyn = kernel._bind_args_from_signature({})
+    return kernel._compile_to_program(tensor_meta, scalar_dtypes, cx, per_func_dyn, pl)
 
 
 _TENSOR_PREFIX = (
@@ -250,7 +250,7 @@ def _lower(kernel, stop_after="flatten_tile_nd_to_2d"):
     and yielding ``min(v, 64)``, and verification rejected it on the spot.
     """
     _backend.reset_for_testing()
-    _backend.set_backend_type(BackendType.Ascend910B)
+    _backend.set_backend_type(BackendType.Ascend910)
     program = _jit_program(kernel)
     for name in _TENSOR_PREFIX:
         program = getattr(passes, name)()(program)
@@ -378,14 +378,25 @@ def test_flatten_repairs_an_nd_seeded_carry():
     assert stored.memory_space == ir.MemorySpace.Acc
 
 
+def test_ssa_reconciles_fresh_tensor_matmul_carry_valid_shape():
+    """The new tensor result view agrees across seed, branches and carry before lowering."""
+    after = _lower(create_tensor_seeded_acc_2d, stop_after="convert_to_ssa")
+    carries = [arg for loop in _loops(after) for arg in loop.iter_args if isinstance(arg.type, ir.TensorType)]
+    assert len(carries) == 1
+    view = carries[0].type.tensor_view
+    assert view is not None
+    assert not _is_const(view.valid_shape[0], M_TILE)
+    assert [dim.value for dim in carries[0].type.shape] == [M_TILE, N_TILE]
+    ir.assert_structural_equal(pl.parse(ir.python_print(after)), after)
+
+
 def test_convert_tensor_to_tile_ops_repairs_a_2d_seeded_carry():
     """A 2D seed is narrowed one pass earlier, so it is repaired one pass earlier.
 
-    ``tensor.matmul`` drops its operands' ``valid_shape``, so the carry is still
-    consistent at pipeline input; it stops being consistent the moment
-    ``ConvertTensorToTileOps`` produces a ``tile.matmul`` over a row-narrowed left
-    operand. Stopping the prefix right there pins that the repair happens in the same
-    pass rather than several passes downstream.
+    ``tensor.matmul`` already propagates valid M/N, but the carry still inherits
+    its seed type. ``ConvertTensorToTileOps`` must reconcile that seed with the
+    narrowed Acc metadata. Stopping the prefix there pins that the repair happens
+    in the same pass rather than several passes downstream.
     """
     after = _lower(create_tensor_seeded_acc_2d, stop_after="convert_tensor_to_tile_ops")
     stored = _stored_tile_type(after)
@@ -535,7 +546,7 @@ def test_single_fractal_block_accumulator_still_reaches_codegen():
     from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
 
     _backend.reset_for_testing()
-    _backend.set_backend_type(BackendType.Ascend910B)
+    _backend.set_backend_type(BackendType.Ascend910)
     with passes.PassContext([]):
         lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(
             _jit_program(single_fractal_block_acc)
@@ -565,7 +576,7 @@ def test_extent_computed_inside_the_loop_is_declined_loudly():
     assert _is_const(_valid_rows(_stored_tile_type(after)), M_TILE)
 
     _backend.reset_for_testing()
-    _backend.set_backend_type(BackendType.Ascend910B)
+    _backend.set_backend_type(BackendType.Ascend910)
     with pytest.raises(pypto.Error, match="AccCompactValid"):
         with passes.PassContext([]):
             PassManager.get_strategy(OptimizationStrategy.Default).run_passes(
@@ -618,7 +629,7 @@ def test_default_pipeline_accepts_the_narrowed_carry(kernel):
     from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
 
     _backend.reset_for_testing()
-    _backend.set_backend_type(BackendType.Ascend910B)
+    _backend.set_backend_type(BackendType.Ascend910)
     pass_manager = PassManager.get_strategy(OptimizationStrategy.Default)
     result = pass_manager.run_passes(_jit_program(kernel))
 
@@ -639,7 +650,7 @@ def test_emitted_pto_stores_at_the_pitch_mad_wrote_at():
     from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
 
     _backend.reset_for_testing()
-    _backend.set_backend_type(BackendType.Ascend910B)
+    _backend.set_backend_type(BackendType.Ascend910)
     lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(
         _jit_program(create_tensor_seeded_acc)
     )

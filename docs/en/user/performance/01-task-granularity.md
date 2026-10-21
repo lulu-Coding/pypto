@@ -1,5 +1,9 @@
 # Task Granularity
 
+> **Legacy Python API examples:** `platform=` calls on this page are retained for
+> compatibility. They emit `DeprecationWarning`; new code should use
+> `backend_type` and `execution_mode`. See the [target mapping](../../dev/08-entry-points.md#legacy-platform-examples).
+
 Dispatch is not free. Sizing InCore functions so the cores spend their time computing
 rather than waiting to be told what to compute.
 
@@ -205,7 +209,7 @@ GM traffic for the intermediate disappears from the kernel.
 
 ## The other direction: too coarse
 
-Granularity is not monotone. A single card has a fixed number of cores — on Ascend910B,
+Granularity is not monotone. A single card has a fixed number of cores — on Ascend910,
 **48 vector and 24 cube** — and a task occupies one of them.
 
 ```text

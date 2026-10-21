@@ -10,6 +10,7 @@
 """Runtime scope context managers and submit primitive for the PyPTO Language DSL."""
 
 from enum import Enum
+from types import TracebackType
 from typing import Any
 
 
@@ -57,13 +58,20 @@ class scope:
       - AUTO scope may not nest inside a MANUAL scope (runtime forbids).
     """
 
-    def __init__(self, mode: "ScopeMode" = ScopeMode.AUTO):
+    def __init__(self, mode: "ScopeMode" = ScopeMode.AUTO, *, name_hint: str = ""):
+        """Set the mode and a structural IR label (a string literal in DSL source)."""
         self.mode = mode
+        self.name_hint = name_hint
 
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> bool:
         return False
 
 
@@ -107,10 +115,19 @@ class manual_scope:
       - Cannot be nested inside another ``manual_scope`` (runtime forbids).
     """
 
+    def __init__(self, *, name_hint: str = ""):
+        """Set a structural IR label, preserved by printing and parsing."""
+        self.name_hint = name_hint
+
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> bool:
         return False
 
 

@@ -202,7 +202,7 @@ for_stmt = ir.ForStmt(i, start, stop, step, [sum_iter], body, [sum_final], span)
 | **ClusterScopeStmt** | `name_hint_`, `body_` | Cluster 区域；由 `OutlineClusterScopes` 提取为 `Function(Group)` |
 | **HierarchyScopeStmt** | `name_hint_`, `body_`, `level_`, `role_`（可选） | 给定 Level/Role 的流水线阶段区域 |
 | **SpmdScopeStmt** | `name_hint_`, `body_`, `core_num_`（整型 `Expr`）, `sync_start_` | SPMD 启动区域；提取为 `Function(Spmd)` |
-| **SplitAivScopeStmt** | `name_hint_`, `body_`, `split_`（`SplitMode`，永不为 `None`）, `count_`（= 2） | 显式 AIV 切分区域（`pl.split_aiv`）；可嵌套；由 `LowerAutoVectorSplit`（pass 23）消费并擦除 |
+| **SplitAivScopeStmt** | `name_hint_`, `body_`, `split_`（`SplitMode`，永不为 `None`）, `count_`（= 2） | 显式 AIV 切分区域（`pl.split_aiv`）；可嵌套；由 `LowerAutoVectorSplit` 下降、`ExpandMixedKernel` 消费并擦除 |
 | **GraphScopeStmt** | `name_hint_`, `body_` | 可录制的编排区域（`pl.graph`）；`name_hint_` 必填 —— 它决定 `OutlineGraphScopes` 提取出的函数名，进而决定运行时的 graph key |
 | **RuntimeScopeStmt** | `name_hint_`, `body_`, `manual_` | Orchestrator 运行时区域（`SIMPLER_SCOPE`）；`manual_=true` 选择手工依赖模式 |
 | **YieldStmt** | `values_` | 在循环迭代中产出值 |
@@ -336,8 +336,8 @@ runtime = ir.RuntimeScopeStmt(manual=True, name_hint="", body=body, span=span)
     与 `@pl.jit.graph` 在任何后续 Pass 看到它们之前就已汇聚
   - `SplitAivScopeStmt` **不被提取**：它对 SSA 与各 outliner 透明（保留在被
     提取出的 `Function(InCore)` 体内），随后由 `LowerAutoVectorSplit`
-    （pass 23）消费并**擦除**。它永不到达 `ExpandMixedKernel`（pass 24）或
-    codegen——下游只看到逐算子的 `aiv_shard` / `aic_gather` / `tpush` /
+    （pass 23）原地下降并保留包装。`ExpandMixedKernel`（pass 24）消费并
+    **擦除**它；后续 pass 与 codegen 只看到逐算子的 `aiv_shard` / `aic_gather` / `tpush` /
     `tpop` 标记；若有 `SplitAivScopeStmt` 残留到此，PTO codegen 守卫会显式
     报错。
   - `SplitAivScopeStmt` **可嵌套**：经由通用的 `BeginScope`/`EndScope` 构建，
@@ -346,7 +346,7 @@ runtime = ir.RuntimeScopeStmt(manual=True, name_hint="", body=body, span=span)
     的，因此每个区域独立减半。持有至少一个区域的函数进入**手动模式**：区域对
     向量计算的放置具有决定权，`AivSplitValid` 验证器会拒绝所有区域之外的向量
     计算（每个全宽阶段请写一个 `mode=None` 区域，参见
-    [LowerAutoVectorSplit](../passes/23-lower_auto_vector_split.md)）。顶层
+    [LowerAutoVectorSplit](../passes/24-lower_auto_vector_split.md)）。顶层
     `for aiv_id in pl.split_aiv(...)` 会被 parser 包裹在外层
     `InCoreScopeStmt` 中（以便 `OutlineIncoreScopes` 提取），即
     `InCoreScopeStmt{ body: SplitAivScopeStmt{...} }`。
@@ -417,6 +417,9 @@ for_stmt = ir.ForStmt(i, start, stop, step, [], body, [], span, ir.ForKind.Paral
 | `slot_count_` | uint64_t | 该声明包含的等长 slot 数 (`pl.MemRef("name", slots=N)`)；省略 `slots` 时为 1 |
 | `slot_index_` | ExprPtr \| None | 该 MemRef 指向哪个 slot (`l0c[k]`)；未选定 slot 前为 None，且可以是运行期值 |
 
+Python 构造函数省略 `slot` 参数或传入 `slot=None` 时，槽索引均为空，
+与 C++ 构造函数的默认值一致。
+
 ```python
 # base allocation name, byte offset within it, size in bytes
 memref = ir.MemRef("mem_left_0", 0, 1024)
@@ -471,6 +474,7 @@ func_orch = ir.Function("orchestrator", params, return_types, body, span, ir.Fun
 | ---- | ---- | ---- |
 | `name_` | string | 函数名称 |
 | `func_type_` | FunctionType | 函数类型（见下方 FunctionType 表格） |
+| `ir_stage_` | FunctionIRStage | 函数体表示：`Functional`（默认）或 `Buffer` |
 | `params_` | list[VarPtr] | 参数变量 (DefField) |
 | `param_directions_` | list[ParamDirection] | 参数方向，与 params_ 长度相同 |
 | `return_types_` | list[TypePtr] | 返回类型 |
@@ -478,6 +482,30 @@ func_orch = ir.Function("orchestrator", params, return_types, body, span, ir.Fun
 | `level_` | optional[Level] | 层次级别（对 InCore/AIC/AIV/Group/Orchestration/Graph 自动派生，详见下文） |
 | `role_` | optional[Role] | 层次角色（对 InCore/AIC/AIV/Group/Orchestration/Graph 自动派生，详见下文） |
 | `attrs_` | list[(str, Any)] | 有序的自由形式元数据，以 `UsualField` 暴露（参与结构遍历） |
+
+### 函数体表示
+
+`FunctionIRStage` 是独立于 `FunctionType`、`level` 和 `role` 的强类型反射字段。
+Python 通过 `function.ir_stage` 读取；`ir.Function` 和 `IRBuilder.function`
+均接受 `ir_stage=ir.FunctionIRStage.Buffer`。
+
+- `Functional` 表示 Tensor/Tile 值语义，是现有构造器以及缺少该字段的旧序列化函数的默认值。
+- `Buffer` 标记最终的显式存储表示。即使设备 kernel 为空或仅含标量，
+  该标记也会选择 Buffer 校验和代码生成；带标记 kernel 中的逻辑 Tile 操作会被拒绝。
+- 最终 lowering 边界作用于 `InCore`、`AIC` 和 `AIV` 函数；编排函数与
+  `Group`/`Spmd` 包装函数保留函数式表示。设置标记本身不会执行 lowering，
+  也不保证函数体满足 Buffer IR 契约。
+
+阶段参与结构相等性、哈希和二进制序列化；序列化中已存在但无效的阶段值会被拒绝。
+通用 mutator 和同一函数的重建会将其与其他函数元数据一起保留，
+但这不意味着函数式优化 pass 可以在 Buffer 边界后执行。
+该标记不保存 Buffer 绑定或存储决策。
+
+Python 打印会增加诊断注释 `# ir_stage: Buffer`。它不是 DSL 装饰器选项，
+也不承诺文本往返解析保留阶段；阶段通过二进制序列化持久化。
+Functional 输出保持不变。分阶段迁移期间，未标记的手工 Buffer kernel
+仍可通过操作数检测进入 Buffer 路径以保持兼容。
+此 API 不会启用自动 Tile-to-Buffer 转换。
 
 ### 保留的 `attrs_` 键
 

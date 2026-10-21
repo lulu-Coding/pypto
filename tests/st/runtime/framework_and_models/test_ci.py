@@ -499,6 +499,17 @@ class CiUint16AscendTestCase(_CiBaseTestCase):
 # --- Tests ---
 
 
+# These were skipped for hw-native-sys/PTOAS#1532: `pto-insert-sync` classified the
+# three-operand (scratch) form of `pto.tci` as PIPE_S although pto-isa implements it
+# with vector instructions, so the consuming store waited on a flag that fires when the
+# scalar unit *issues* the sequence rather than when the vector pipe retires it, and
+# MTE3 could copy out a half-written destination.
+#
+# PTOAS v0.63 (`fix(sync): select TCI pipeline by tmp operand`) selects the pipe from
+# the tmp operand, so the scratch form is now PIPE_V: the emitted C++ replaces the
+# `set_flag(PIPE_S, PIPE_V)` / `wait_flag` pair around `TCI` with `pipe_barrier(PIPE_V)`.
+# The skip is therefore dropped along with the v0.61 -> v0.63 bump in
+# `toolchain/versions.env`; it must come back if the pin ever moves below v0.63.
 class TestCi:
     """Verify tile.ci / tensor.ci produce correct integer sequences on device."""
 

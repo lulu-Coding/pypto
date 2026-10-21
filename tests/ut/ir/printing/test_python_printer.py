@@ -78,7 +78,7 @@ def test_python_print_tensor_type_annotation():
     result = assign.as_python()
 
     assert "a:" in result or "a :" in result
-    assert "pl.Tensor[[64, 128], pl.FP32]" in result
+    assert "pl.Tensor[[pl.const(64, pl.INT32), pl.const(128, pl.INT32)], pl.FP32]" in result
 
 
 def test_python_print_function_with_annotations():
@@ -511,7 +511,7 @@ def test_python_print_tile_type():
     result = assign.as_python()
 
     assert "t:" in result
-    assert "pl.Tile[[16, 16], pl.FP16]" in result
+    assert "pl.Tile[[pl.const(16, pl.INT32), pl.const(16, pl.INT32)], pl.FP16]" in result
 
 
 def test_python_print_tile_type_prints_explicit_tile_memory_space():
@@ -524,7 +524,7 @@ def test_python_print_tile_type_prints_explicit_tile_memory_space():
 
     result = ir.python_print_type(tile_type)
 
-    assert 'pl.MemRef("mem_vec_0", 0, 512)' in result
+    assert 'pl.MemRef("mem_vec_0", pl.const(0, pl.INDEX), 512)' in result
     assert ", pl.Mem.Vec" in result
 
 
@@ -545,7 +545,7 @@ def test_python_print_tile_type_explicit_layout_default_omits_implicit():
 
     result = python_print(acc)
 
-    assert result == "pl.Tile[[128, 128], pl.FP32, pl.Mem.Acc]"
+    assert result == "pl.Tile[[pl.const(128, pl.INT32), pl.const(128, pl.INT32)], pl.FP32, pl.Mem.Acc]"
     assert "TileView" not in result
 
 
@@ -561,7 +561,7 @@ def test_python_print_tile_type_explicit_layout_resolves_acc():
     result = python_print(acc, explicit_layout=True)
 
     assert result == (
-        "pl.Tile[[128, 128], pl.FP32, pl.Mem.Acc, "
+        "pl.Tile[[pl.const(128, pl.INT32), pl.const(128, pl.INT32)], pl.FP32, pl.Mem.Acc, "
         "pl.TileView(blayout=pl.TileLayout.col_major, "
         "slayout=pl.TileLayout.row_major, fractal=1024)]"
     )
@@ -599,18 +599,14 @@ def test_python_print_tile_type_explicit_layout_roundtrips_to_canonical():
 
     # The explicit view matched the implicit Acc view -> canonicalized to nullopt.
     assert reconstructed.tile_view is None
-    assert python_print(reconstructed) == "pl.Tile[[128, 128], pl.FP32, pl.Mem.Acc]"
+    assert (
+        python_print(reconstructed)
+        == "pl.Tile[[pl.const(128, pl.INT32), pl.const(128, pl.INT32)], pl.FP32, pl.Mem.Acc]"
+    )
 
 
-def test_python_print_distributed_tensor_explicit_layout_surfaces_window_buffer():
-    """explicit_layout surfaces a DistributedTensor's window-buffer back-reference.
-
-    Two same shape/dtype distributed tensors with different ``window_buffer_``
-    are structurally distinct, yet the concise form drops the field so they print
-    identically (issue #2088). The EXPLICIT dump surfaces the buffer name so a
-    dump can tell them apart. It is a debug-only marker (a quoted string), not
-    round-trip subscript syntax — the value re-derives from ``pld.tensor.window``.
-    """
+def test_python_print_distributed_tensor_preserves_window_reference():
+    """Both default and explicit dumps retain a distributed tensor's window identity."""
     span = ir.Span.unknown()
     dims = [ir.ConstInt(128, DataType.INT32, span), ir.ConstInt(128, DataType.INT32, span)]
     base = ir.Var("wbuf", ir.PtrType(), span)
@@ -618,15 +614,11 @@ def test_python_print_distributed_tensor_explicit_layout_surfaces_window_buffer(
     dt_plain = ir.DistributedTensorType(dims, DataType.FP16)
     dt_wb = ir.DistributedTensorType(dims, DataType.FP16, window_buffer)
 
-    # Concise: the window buffer is dropped, so both print identically.
-    assert python_print(dt_plain) == python_print(dt_wb)
-    assert "window_buffer" not in python_print(dt_wb)
-
-    # Explicit: the window buffer name is surfaced, distinguishing the two.
-    explicit_plain = python_print(dt_plain, explicit_layout=True)
-    explicit_wb = python_print(dt_wb, explicit_layout=True)
-    assert "window_buffer=wbuf" in explicit_wb
-    assert explicit_plain != explicit_wb
+    for explicit in (False, True):
+        plain = python_print(dt_plain, explicit_layout=explicit)
+        with_window = python_print(dt_wb, explicit_layout=explicit)
+        assert 'pl._dump.window_ref("wbuf_window")' in with_window
+        assert plain != with_window
 
 
 def test_python_print_var_subclasses_reach_the_expression_printer():
@@ -655,8 +647,8 @@ def test_python_print_var_subclasses_reach_the_expression_printer():
     for name, node in nodes.items():
         assert python_print(node, format=False) != unsupported, f"{name} did not reach the Expr printer"
 
-    # WindowBuffer prints through the name hint inherited from its base Ptr Var.
-    assert python_print(nodes["WindowBuffer"], format=False) == "wbuf"
+    # WindowBuffer uses the same identity reference as distributed tensor types.
+    assert python_print(nodes["WindowBuffer"], format=False) == 'pl._dump.window_ref("wbuf_window")'
 
 
 def test_python_print_all_scalar_types():
@@ -1185,8 +1177,8 @@ def test_python_print_const_float_default_dtype():
     assert result == "1.0"
 
 
-def test_python_print_tensor_shape_dims_always_bare():
-    """Test that tensor shape dimensions always print as bare integers."""
+def test_python_print_tensor_shape_dims_preserve_dtype():
+    """Test that tensor shape dimensions retain their integer dtype."""
     span = ir.Span.unknown()
     # Use INT32 (non-default) dtype for shape dims
     dim1 = ir.ConstInt(64, DataType.INT32, span)
@@ -1194,19 +1186,19 @@ def test_python_print_tensor_shape_dims_always_bare():
     tensor_type = ir.TensorType([dim1, dim2], DataType.FP32)
 
     result = ir.python_print_type(tensor_type)
-    # Shape dims should be bare integers, NOT pl.const(...)
-    assert "pl.Tensor[[64, 128], pl.FP32]" == result
+    # Non-INDEX shape dimensions need explicit dtype annotations
+    assert "pl.Tensor[[pl.const(64, pl.INT32), pl.const(128, pl.INT32)], pl.FP32]" == result
 
 
-def test_python_print_tile_shape_dims_always_bare():
-    """Test that tile shape dimensions always print as bare integers."""
+def test_python_print_tile_shape_dims_preserve_dtype():
+    """Test that tile shape dimensions retain their integer dtype."""
     span = ir.Span.unknown()
     dim1 = ir.ConstInt(16, DataType.INT32, span)
     dim2 = ir.ConstInt(16, DataType.INT32, span)
     tile_type = ir.TileType([dim1, dim2], DataType.FP16)
 
     result = ir.python_print_type(tile_type)
-    assert "pl.Tile[[16, 16], pl.FP16]" == result
+    assert "pl.Tile[[pl.const(16, pl.INT32), pl.const(16, pl.INT32)], pl.FP16]" == result
 
 
 def test_python_print_concise_assignment():
@@ -1578,8 +1570,153 @@ def test_composite_shape_dim_roundtrips(dim_factory):
     prog = _make_program_with_shape_dim(dim_factory(m, span))
     printed = python_print(prog, format=False)
     reparsed = pl.parse(printed)
-    ir.assert_structural_equal(prog, reparsed)
+    ir.assert_structural_equal(prog, reparsed, enable_auto_mapping=True)
     # Printing must also be a fixed point.
+    assert python_print(reparsed, format=False) == printed
+
+
+@pytest.mark.parametrize("prefix", ["pl", "custom"])
+@pytest.mark.parametrize("dtype", [DataType.INDEX, DataType.INT64])
+@pytest.mark.parametrize("composite", [False, True])
+@pytest.mark.parametrize("shape_position", ["parameter", "local"])
+def test_recorded_call_shape_dim_roundtrips(prefix, dtype, composite, shape_position):
+    """Storage operands select recorded calls even inside shape annotations."""
+    span = ir.Span.unknown()
+    storage = ir.MemRef("storage", 0, 1024, span)
+    x = ir.Var("x", ir.TensorType([8, 32], DataType.FP32, storage), span)
+    # INT64 deliberately differs from tensor.dim's inferred INDEX type: a
+    # recorded call must keep its saved type and metadata, without inference.
+    dim_call = ir.Call(
+        ir.get_op("tensor.dim"),
+        [x, ir.ConstInt(0, DataType.INDEX, span)],
+        {},
+        {"saved": True},
+        ir.ScalarType(dtype),
+        span,
+    )
+    dim = ir.Mul(dim_call, ir.ConstInt(2, dtype, span), dtype, span) if composite else dim_call
+    trailing = ir.ConstInt(16 if composite else 32, DataType.INDEX, span)
+    result_type = ir.TensorType([dim, trailing], DataType.FP32, storage)
+    y = ir.Var("y", result_type, span)
+    params = [x, y] if shape_position == "parameter" else [x]
+    stmts: list[ir.Stmt] = []
+    if shape_position == "local":
+        reshape = ir.Call(
+            ir.get_op("tensor.reshape"),
+            [x, ir.MakeTuple([dim, trailing], span)],
+            {},
+            {},
+            result_type,
+            span,
+        )
+        stmts.append(ir.AssignStmt(y, reshape, span))
+    stmts.append(ir.ReturnStmt([y], span))
+    body = ir.SeqStmts(stmts, span) if len(stmts) > 1 else stmts[0]
+    func = ir.Function("main", params, [result_type], body, span, ir.FunctionType.InCore)
+    program = ir.Program([func], "RecordedShapeDim", span)
+
+    canonical = python_print(program, format=False)
+    # Exercise the marker's configurable prefix independently of decorator
+    # syntax, whose function-type enum uses the canonical pl qualifier.
+    printed = canonical.replace("pl._dump.call(", f"{prefix}._dump.call(")
+    if prefix != "pl":
+        printed = f"import pypto.language as {prefix}\n{printed}"
+    assert f'{prefix}._dump.call("tensor.dim"' in printed
+    reparsed = pl.parse(printed)
+    assert isinstance(reparsed, ir.Program)
+    ir.verify_structural_bindings(reparsed)
+    ir.assert_structural_equal(program, reparsed)
+    assert ir.structural_hash(program) == ir.structural_hash(reparsed)
+    assert python_print(reparsed, format=False) == canonical
+
+    restored_func = next(iter(reparsed.functions.values()))
+    restored_type = restored_func.return_types[0]
+    assert isinstance(restored_type, ir.TensorType)
+    restored_dim = restored_type.shape[0]
+    if composite:
+        assert isinstance(restored_dim, ir.Mul)
+        assert isinstance(restored_dim.right, ir.ConstInt)
+        assert restored_dim.right.value == 2
+        assert restored_dim.right.dtype == dtype
+        restored_dim = restored_dim.left
+    assert isinstance(restored_dim, ir.Call)
+    assert restored_dim.op.name == ir.get_op("tensor.dim").name
+    assert isinstance(restored_dim.type, ir.ScalarType)
+    assert restored_dim.type.dtype == dtype
+    assert restored_dim.args[0] is restored_func.params[0]
+    assert restored_dim.attrs == {"saved": True}
+    source_type = restored_func.params[0].type
+    assert isinstance(source_type, ir.TensorType)
+    assert source_type.memref is not None
+    assert restored_type.memref is not None
+    assert restored_type.memref.base_ is source_type.memref.base_
+
+
+@pytest.mark.parametrize("operand_scope", ["parameter", "local"])
+@pytest.mark.parametrize("composite", [False, True])
+def test_recorded_shape_call_preserves_renamed_operand(operand_scope, composite):
+    """A shape call must keep the second x binding after name disambiguation."""
+    span = ir.Span.unknown()
+    storage = ir.MemRef("storage", 0, 1024, span)
+    first = ir.Var("x", ir.TensorType([8, 32], DataType.FP32, storage), span)
+    operand = ir.Var("x", ir.TensorType([16, 16], DataType.FP32, storage), span)
+    params = [first]
+    stmts: list[ir.Stmt] = []
+    if operand_scope == "parameter":
+        params.append(operand)
+    else:
+        shape = ir.MakeTuple([ir.ConstInt(16, DataType.INDEX, span)] * 2, span)
+        value = ir.Call(ir.get_op("tensor.reshape"), [first, shape], {}, {}, operand.type, span)
+        stmts.append(ir.AssignStmt(operand, value, span))
+    dim = ir.Call(
+        ir.get_op("tensor.dim"),
+        [operand, ir.ConstInt(0, DataType.INDEX, span)],
+        {},
+        {},
+        ir.ScalarType(DataType.INDEX),
+        span,
+    )
+    shape_dim = ir.Mul(dim, ir.ConstInt(2, DataType.INDEX, span), DataType.INDEX, span) if composite else dim
+    trailing = ir.ConstInt(8 if composite else 16, DataType.INDEX, span)
+    result_type = ir.TensorType([shape_dim, trailing], DataType.FP32, storage)
+    result = ir.Var("result", result_type, span)
+    if operand_scope == "parameter":
+        params.append(result)
+    else:
+        shape = ir.MakeTuple([shape_dim, trailing], span)
+        value = ir.Call(ir.get_op("tensor.reshape"), [operand, shape], {}, {}, result_type, span)
+        stmts.append(ir.AssignStmt(result, value, span))
+    stmts.append(ir.ReturnStmt([result], span))
+    body = ir.SeqStmts(stmts, span) if len(stmts) > 1 else stmts[0]
+    func = ir.Function("main", params, [], body, span, ir.FunctionType.InCore)
+    program = ir.Program([func], "RenamedShapeOperand", span)
+    ir.verify_structural_bindings(program)
+
+    printed = python_print(program, format=False)
+    reparsed = pl.parse(printed)
+    assert isinstance(reparsed, ir.Program)
+    restored = next(iter(reparsed.functions.values()))
+    if operand_scope == "parameter":
+        restored_operand = restored.params[1]
+        restored_result = restored.params[2]
+    else:
+        assert isinstance(restored.body, ir.SeqStmts)
+        assignments = [stmt for stmt in restored.body.stmts if isinstance(stmt, ir.AssignStmt)]
+        restored_operand, restored_result = (stmt.var for stmt in assignments)
+    restored_type = restored_result.type
+    assert isinstance(restored_type, ir.TensorType)
+    restored_dim = restored_type.shape[0]
+    if composite:
+        assert isinstance(restored_dim, ir.Mul)
+        restored_dim = restored_dim.left
+    assert isinstance(restored_dim, ir.Call)
+    # Both bindings are in scope: checking only parse success or scope validity
+    # misses a call silently rebound to the first x (extent 8 instead of 16).
+    assert restored_dim.args[0] is restored_operand
+    assert restored_dim.args[0] is not restored.params[0]
+    ir.verify_structural_bindings(reparsed)
+    ir.assert_structural_equal(program, reparsed)
+    assert ir.structural_hash(program) == ir.structural_hash(reparsed)
     assert python_print(reparsed, format=False) == printed
 
 
@@ -2129,3 +2266,57 @@ def test_dep_edge_attrs_are_rejected_outside_task_dummy():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize("multiple", [False, True])
+def test_loop_result_storage_annotations_roundtrip(multiple):
+    """Result storage is independent of both initializer and yielded value types."""
+    result_type = 'pl.Tensor[[4], pl.FP32, pl.MemRef("result", 16, 16)]'
+    initial_type = 'pl.Tensor[[4], pl.FP32, pl.MemRef("initial", 0, 16)]'
+    yield_line = (
+        f"x, y = pl._dump.yield_(a, b, types=[{result_type}, {initial_type}])"
+        if multiple
+        else f"x: {result_type} = pl.yield_(a)"
+    )
+    variables = "a, b" if multiple else "a,"
+    seeds = "seed, seed" if multiple else "seed,"
+    source = f"""@pl.program
+class Example:
+    @pl.function
+    def main(self, seed: {initial_type}):
+        for i, ({variables}) in pl.range(2, init_values=({seeds})):
+            {yield_line}
+        return x
+"""
+    program = pl.parse_program(source)
+    function = next(iter(program.functions.values()))
+    assert isinstance(function.body, ir.SeqStmts)
+    loop = function.body.stmts[0]
+    assert isinstance(loop, ir.ForStmt)
+    result_descriptor = loop.return_vars[0].type
+    assert isinstance(result_descriptor, ir.TensorType) and result_descriptor.memref is not None
+    assert isinstance(result_descriptor.memref.byte_offset_, ir.ConstInt)
+    assert result_descriptor.memref.byte_offset_.value == 16
+    if multiple:
+        second_type = loop.return_vars[1].type
+        assert isinstance(second_type, ir.TensorType) and second_type.memref is not None
+        assert isinstance(second_type.memref.byte_offset_, ir.ConstInt)
+        assert second_type.memref.byte_offset_.value == 0
+    printed = ir.python_print(program)
+    reparsed = pl.parse_program(printed)
+    ir.assert_structural_equal(program, reparsed)
+    assert ir.structural_hash(program) == ir.structural_hash(reparsed)
+
+
+@pytest.mark.parametrize("types", ["[]", "[pl.FP32]", "pl.FP32"])
+def test_multi_result_dump_yield_rejects_wrong_type_count(types):
+    source = f"""@pl.program
+class Example:
+    @pl.function
+    def main(self, seed: pl.Tensor[[4], pl.FP32]):
+        for i, (a, b) in pl.range(2, init_values=(seed, seed)):
+            x, y = pl._dump.yield_(a, b, types={types})
+        return x
+"""
+    with pytest.raises(ParserSyntaxError, match="types must match the number of results"):
+        pl.parse_program(source)

@@ -36,6 +36,7 @@ import ctypes
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -48,7 +49,7 @@ def _torch_dtype(name: str) -> torch.dtype:
     return dtype
 
 
-def _build_argspec_orch_args(args_spec: list[dict]):
+def _build_argspec_orch_args(args_spec: list[dict[str, Any]]) -> list[Any]:
     """Rebuild ordered args from a recorded spec (see ``runner._build_args_spec``).
 
     Host tensors are reloaded from disk with real data (so data-as-control
@@ -58,7 +59,7 @@ def _build_argspec_orch_args(args_spec: list[dict]):
     The tensors/scalars stay unmaterialized until ``_execute_on_device`` has
     selected their owning Worker.
     """
-    coerced: list = []
+    coerced: list[Any] = []
     for entry in args_spec:
         kind = entry["kind"]
         if kind == "tensor_file":
@@ -74,7 +75,7 @@ def _build_argspec_orch_args(args_spec: list[dict]):
     return coerced
 
 
-def _build_golden_orch_args(golden_path: Path):
+def _build_golden_orch_args(golden_path: Path) -> list[Any]:
     """Regenerate ordered args from ``golden.py``'s ``generate_inputs``."""
     from .device_runner import build_orch_args_from_inputs  # noqa: PLC0415
     from .runner import _load_golden_module  # noqa: PLC0415
@@ -107,7 +108,16 @@ def main(argv: list[str]) -> int:
     dfx_dir = Path(spec["dfx_dir"])
     level = int(spec.get("level", 2))
 
-    chip_callable, runtime_name, runtime_config = _compile_and_assemble(work_dir, platform)
+    if "prebuilt" in spec:
+        from pypto.jit._artifact_manifest import BuildKind  # noqa: PLC0415
+
+        from ._prebuilt import load_prebuilt  # noqa: PLC0415
+
+        chip_callable, runtime_name, runtime_config = load_prebuilt(
+            Path(spec["prebuilt"]), platform, BuildKind.SINGLE_CHIP
+        )["."]
+    else:
+        chip_callable, runtime_name, runtime_config = _compile_and_assemble(work_dir, platform)
     enable_sdma = bool(runtime_config.get("enable_sdma", False))
 
     if spec["mode"] == "golden":
@@ -124,9 +134,14 @@ def main(argv: list[str]) -> int:
     if aicpu_thread_num is None:
         aicpu_thread_num = runtime_config.get("aicpu_thread_num")
 
+    from pypto._target import _parse_platform  # noqa: PLC0415
+
     from .runner import RunConfig  # noqa: PLC0415
 
-    config = RunConfig(platform=platform, **spec.get("ring_overrides", {}))
+    backend_type, execution_mode = _parse_platform(platform)
+    config = RunConfig(
+        backend_type=backend_type, execution_mode=execution_mode, **spec.get("ring_overrides", {})
+    )
 
     dfx_dir.mkdir(parents=True, exist_ok=True)
     _execute_on_device(
@@ -138,6 +153,7 @@ def main(argv: list[str]) -> int:
         level=level,
         aicpu_thread_num=aicpu_thread_num,
         enable_sdma=enable_sdma,
+        host_tensor_indices=runtime_config.get("host_tensor_indices", ()),
         output_prefix=str(dfx_dir),
         enable_dep_gen=True,
         config=config,

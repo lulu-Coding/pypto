@@ -65,7 +65,9 @@ def _validate_chunk(chunk_rows: int, chunk_cols: int, op_name: str) -> None:
     dims must be non-negative Python ints (``0`` meaning "full extent").
     """
     for name, value in (("chunk_rows", chunk_rows), ("chunk_cols", chunk_cols)):
-        if not isinstance(value, int) or isinstance(value, bool):
+        # bool is an int subclass, so True/False must not pose as a static dim;
+        # the isinstance pair is a mistyped-input guard (the annotation is the contract).
+        if not isinstance(value, int) or isinstance(value, bool):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise TypeError(f"{op_name} {name} must be an int (static), got {type(value).__name__}")
         if value < 0:
             raise ValueError(f"{op_name} {name} must be non-negative (0 = full), got {value}")
@@ -429,7 +431,7 @@ def put(
             ``Add`` requires an fp32/bf16/fp16/int32/int16/int8 destination —
             TPUT lands its chunks through the same store pipe as ``pl.store``,
             so the hardware atomic-add dtypes apply. A bf16 destination is
-            further Ascend910B (A2/A3) only; on Ascend950 use an fp32 window
+            further Ascend910 (A2/A3) only; on Ascend950 use an fp32 window
             and cast after the reduction.
         chunk_rows: Optional VEC staging-tile row extent (keyword-only,
             ``0`` = full). Sizes the staging tile to a sub-tile of the flattened
@@ -671,7 +673,7 @@ def allreduce(
     counts do not read or store past the end.
 
     See ``docs/en/dev/distributed_ops.md`` and
-    ``docs/en/dev/passes/13-lower_composite_ops.md`` for the mesh partial-valid /
+    ``docs/en/dev/passes/14-lower_composite_ops.md`` for the mesh partial-valid /
     symbolic-extent target constraints (unchanged by this PR).
 
     **Barrier protocol (self-clearing credit barrier):** every call's
@@ -735,7 +737,12 @@ def allreduce(
         The rebound :class:`pld.DistributedTensor` view of ``target`` —
         identical shape / dtype / window-buffer binding, post-reduce content.
     """
-    if not isinstance(core_num, int) or isinstance(core_num, bool):
+    # bool is an int subclass and must not pose as a core count; the isinstance
+    # pair is a mistyped-input guard (the annotation is the contract).
+    if (
+        not isinstance(core_num, int)  # pyright: ignore[reportUnnecessaryIsInstance]
+        or isinstance(core_num, bool)
+    ):
         raise TypeError(
             "pld.tensor.allreduce core_num must be a positive compile-time int, "
             f"got {type(core_num).__name__}"
@@ -991,7 +998,7 @@ def all_to_all_v(
     send_counts: Tensor | DistributedTensor,
     recv_counts: DistributedTensor,
     *,
-    core_num: int = 1,
+    core_num: IntLike = 1,
 ) -> DistributedTensor:
     """All-to-all: variable-size personalized exchange (push-based, window-as-result).
 
@@ -1038,16 +1045,40 @@ def all_to_all_v(
        masks by ``recv_counts`` afterwards will propagate NaN into
        otherwise-valid rows.  Mask first, then compute.
 
-    During the same push, each rank also publishes
-    ``clamp(send_counts[dest], 0, MAX_RECV)`` into peer ``dest``'s
-    ``recv_counts[my_rank, 0]`` via ``pld.system.notify`` (Set). After the
-    barrier, ``recv_counts[src, 0]`` tells this rank how many rows ``src``
-    sent — which is now also exactly how many were transferred — so use that
-    count to know where to stop reading. This is the MPI_Alltoallv recvcounts
-    side.
+    The recvcounts side is a peer-to-peer pull on the builtin rails: each rank
+    stages its own ``send_counts`` vector into its window, and after Barrier A
+    the kernel reads the ONE word it needs from every peer's window —
+    ``recv_counts[src, 0] = clamp(send_counts_of[src][my_rank], 0, MAX_RECV)``
+    — with a single non-cacheable scalar read (no bulk transfer, so the
+    ``[NR]`` INT32 vector is all the buffer needs). The exchange is gated by a
+    TWO-ROUND credit barrier: Barrier A certifies every rank staged its counts
+    AND finished consuming the previous invocation's receive window; Barrier B
+    certifies every peer read this rank's counts and pushed its payload, so
+    returning — and restaging counts for the next call — is safe. The InCore
+    composite rail atomically resets its own receive counts and announces
+    readiness to all peers. It then waits for each non-self destination before
+    publishing a positive ``clamp(send_counts[dest], 0, MAX_RECV)`` into that
+    destination's ``recv_counts[my_rank, 0]`` via ``pld.system.notify``
+    (AtomicAdd) and pushing payload; it need not wait for every destination
+    before starting a send. Zero-row destinations retain the receiver's reset
+    count without a publication or payload transfer. A final completion barrier
+    follows. Atomic updates prevent adjacent count cells from
+    clobbering each other through whole-cache-line write-back. Either way,
+    after the call ``recv_counts[src, 0]`` tells this rank
+    how many rows ``src`` sent — which is also exactly how many were
+    transferred — so use that count to know where to stop reading. This is the
+    MPI_Alltoallv recvcounts side. A second call on the same windows must be
+    ordered after the first call's local consumer: the receive window is
+    overwritten in place.
 
-    The barrier ``signal`` is self-clearing (restored to zero after each call)
-    and safe to reuse inside a ``for``/``while`` loop.
+    The barrier ``signal`` uses self-clearing credits: each call adds
+    +1 per round to every peer's slot (wait thresholds 1, then 2) and subtracts
+    2 per local slot at the end — never a reset, and never "wait for 1 twice" —
+    so back-to-back calls on the same buffer stay ordered. Zero-initialise it
+    once and do not reset it. InCore calls inside ``for``/``while`` loops are
+    supported when every rank executes the same collective sequence. HOST
+    orchestrators reject such loops because loop-carried comm-domain window
+    lifetime management is not modeled.
 
     Args:
         input: Flat 2D Tensor or DistributedTensor [NR*MAX_RECV, SIZE] with
@@ -1059,18 +1090,27 @@ def all_to_all_v(
         send_counts: INT32 [NR] or [NR, 1] rows-per-destination counts (Input).
             A plain :class:`pl.Tensor` or a window-bound
             :class:`pld.DistributedTensor` (e.g. counts published by a
-            preceding exchange).
+            preceding exchange). On the builtin rails it must be window-bound:
+            peers read this rank's ``[my_rank]`` word with one scalar
+            (non-cacheable) read, so the ``[NR]`` INT32 vector is all the
+            buffer needs.
         recv_counts: :class:`pld.DistributedTensor` INT32 [NR, 1] — after the
             call, ``recv_counts[src, 0]`` holds how many rows ``src`` actually
             sent here, and how many were transferred — the count is clamped
             to ``[0, MAX_RECV]``, so a negative input publishes ``0`` (InOut).
-        core_num: Requested AIV block limit for the managed CHIP/L2 rail.
-            Called from a CHIP :class:`pl.FunctionType.Orchestration` function,
-            the call lowers to one local builtin AIV task
-            (``LowerL2TensorCollectives``); the first version accepts only
-            ``core_num=1``.  Called from an InCore function, the composite rail
-            expands the exchange into point-to-point primitives and requires
-            ``core_num=1``.
+        core_num: Requested AIV block *limit* ``L`` for the managed CHIP/L2 or
+            HOST rail — a maximum, not a promise: the admitted block count
+            ``B`` is computed at the entry (``CalAllToAllVBlocks``) and may be
+            less than ``L``. Accepts a compile-time :class:`int` or a runtime
+            :class:`pld.Scalar`/:class:`ir.Expr` (``Scalar[INDEX]``) — a
+            dynamic value is type-checked but not evaluated at compile time.
+            Called from an InCore function, the composite rail expands the
+            exchange into point-to-point primitives and requires
+            ``core_num=1`` (compile-time only).  On the HOST and managed CHIP
+            builtin rails, payload dtype is ``FP32`` or ``INT8`` (INT8 is the
+            RFC #2521 A1 canonical benchmark dtype); other dtypes are rejected
+            there.  The InCore composite rail accepts matching input/target
+            payload dtypes and does not apply that FP32/INT8 allowlist.
 
     Returns:
         The ``target`` :class:`pld.DistributedTensor` with received chunks.
@@ -1083,8 +1123,9 @@ def all_to_all_v(
     )
     input_expr = _unwrap(input)
     counts_expr = _unwrap(send_counts)
+    core_num_expr = _unwrap(core_num)
     call = _ir_tensor.all_to_all_v(
-        input_expr, target_expr, signal_expr, counts_expr, recv_expr, core_num=core_num
+        input_expr, target_expr, signal_expr, counts_expr, recv_expr, core_num_expr
     )
     return DistributedTensor(expr=call)
 

@@ -393,8 +393,8 @@ class TestFlattenTileNdTo2DUnchanged:
             ) -> pl.Tensor[[32, 64], pl.FP32]:
                 x_tile: pl.Tile[[32, 64], pl.FP32] = pl.load(x, [0, 0], [32, 64])
                 y_tile: pl.Tile[[32, 64], pl.FP32] = pl.tile.add(x_tile, x_tile)
-                out_0: pl.Tensor[[32, 64], pl.FP32] = pl.store(y_tile, [0, 0], out_0)
-                return out_0
+                out_store: pl.Tensor[[32, 64], pl.FP32] = pl.store(y_tile, [0, 0], out_0)
+                return out_store
 
             @pl.function
             def main(self, x: pl.Tensor[[32, 64], pl.FP32]) -> pl.Tensor[[32, 64], pl.FP32]:
@@ -1183,6 +1183,262 @@ class TestFlattenTileNdTo2DReshapedStore:
 
 
 # ----------------------------------------------------------------------------
+# Collapsed 2D tile feeding a rank>2 tile.store: the partition window must stay
+# inside the tensor
+# ----------------------------------------------------------------------------
+
+
+def _store_partition_window(program: ir.Program, func_name: str) -> list:
+    """The ``shapes`` partition operand FlattenTileNdTo2D injects on ``tile.store``.
+
+    Returned as plain ints where the dim is a constant, and as the Expr itself
+    where it is not, so a test can assert on either.
+    """
+    func = program.get_function(func_name)
+    assert func is not None, f"no function {func_name!r} in the rewritten program"
+
+    found: list[ir.Call] = []
+
+    def walk(node) -> None:
+        if node is None:
+            return
+        if isinstance(node, ir.Call):
+            if node.op.name == _OP_TILE_STORE:
+                found.append(node)
+            for arg in node.args:
+                walk(arg)
+        elif isinstance(node, ir.SeqStmts):
+            for stmt in node.stmts:
+                walk(stmt)
+        elif isinstance(node, ir.AssignStmt):
+            walk(node.value)
+        elif isinstance(node, ir.EvalStmt):
+            walk(node.expr)
+
+    walk(func.body)
+    assert len(found) == 1, f"expected exactly one tile.store, found {len(found)}"
+    store = found[0]
+    assert len(store.args) > 3, "FlattenTileNdTo2D injected no shapes operand"
+    elements = cast(ir.MakeTuple, store.args[3]).elements
+    return [d.value if isinstance(d, ir.ConstInt) else d for d in elements]
+
+
+def _collapsed_store_into_dynamic_cols(last_dim) -> ir.Program:
+    """``load [2, 3, 8] -> reshape [6, 8] -> store`` into a ``[2, 3, last_dim]`` tensor.
+
+    The collapse is detected on the static leading axis (6 rows over an extent
+    of 3), so the window has to be derived even though the innermost tensor dim
+    is symbolic. Built via IRBuilder because a hand-made dynamic Var does not
+    survive the ``@pl.program`` print/parse roundtrip.
+    """
+    span = ir.Span.unknown()
+    in_type = ir.TensorType(_shape_exprs([2, 3, 8]), DataType.FP32)
+    out_type = ir.TensorType(_shape_exprs([2, 3, last_dim]), DataType.FP32)
+
+    ib = IRBuilder()
+    with ib.function("collapsed_incore", type=ir.FunctionType.InCore) as f:
+        x = f.param("x", in_type)
+        out_p = f.param("out", out_type, direction=ir.ParamDirection.Out)
+        f.return_type(out_type)
+        x_tile = ib.let("x_tile", tile_ops.load(x, [0, 0, 0], [2, 3, 8], span=span))
+        flat = ib.let("flat", tile_ops.reshape(x_tile, [6, 8], span=span))
+        out_r = ib.let("out_0", tile_ops.store(flat, [0, 0, 0], out_p, span=span))
+        ib.return_stmt(out_r)
+    return ir.Program([f.get_result()], "test_collapsed_dyn_cols", span)
+
+
+class TestFlattenTileNdTo2DCollapsedStore:
+    """A 2D tile whose rows are a COLLAPSE of several leading tensor dims.
+
+    ``tensor.gather`` lowering reduces a ``[2, 3, 8]`` result to a ``[6, 8]``
+    tile before this pass runs, so ``tile.store`` sees a 2D tile against a
+    rank-3 tensor. Padding the front with 1s and appending the tile's dims —
+    the rule that is right when each tile dim IS the tensor dim it lands on —
+    would emit ``shapes=[1, 6, 8]``, asking for 6 of a dim whose extent is 3.
+
+    That window is not a sub-box of the tensor. It addresses the right bytes
+    only when the outer stride happens to be contiguous, and PTOAS >= 0.61
+    rejects it outright:
+
+        error: 'pto.partition_view' op size at dim 1 (6) exceeds static
+               source dim (3)
+
+    The window must instead distribute the tile's rows over the leading tensor
+    dims: ``[2, 3, 8]``.
+
+    The distribution is not free to pick any in-bounds box. A flattened store
+    writes ``rows`` CONSECUTIVE row-major positions, so an axis the row count
+    consumes must be consumed whole and start at 0. Stores where that does not
+    hold have no window at all and are rejected, rather than retargeted onto a
+    box that fits but covers different elements.
+    """
+
+    def test_collapsed_2d_tile_store_distributes_rows_over_leading_dims(self):
+        """`tile.reshape([6, 8]) -> tile.store([2, 3, 8] tensor)` keeps the window in bounds."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[2, 3, 8], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[2, 3, 8], pl.FP32]],
+            ) -> pl.Tensor[[2, 3, 8], pl.FP32]:
+                x_tile: pl.Tile[[2, 3, 8], pl.FP32] = pl.load(x, [0, 0, 0], [2, 3, 8])
+                y_tile: pl.Tile[[2, 3, 8], pl.FP32] = pl.tile.exp(x_tile)
+                flat: pl.Tile[[6, 8], pl.FP32] = pl.tile.reshape(y_tile, [6, 8])
+                out_0: pl.Tensor[[2, 3, 8], pl.FP32] = pl.tile.store(flat, [0, 0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[2, 3, 8], pl.FP32]) -> pl.Tensor[[2, 3, 8], pl.FP32]:
+                out_0: pl.Tensor[[2, 3, 8], pl.FP32] = pl.create_tensor([2, 3, 8], dtype=pl.FP32)
+                y: pl.Tensor[[2, 3, 8], pl.FP32] = self.main_incore_0(x, out_0)
+                return y
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[2, 3, 8], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[2, 3, 8], pl.FP32]],
+            ) -> pl.Tensor[[2, 3, 8], pl.FP32]:
+                x_tile: pl.Tile[[6, 8], pl.FP32] = pl.tile.load(x, [0, 0, 0], [2, 3, 8], [2, 3, 8])
+                y_tile = pl.tile.exp(x_tile)
+                # Already 2D, so the pass inserts no flattening reshape of its own.
+                flat = pl.tile.reshape(y_tile, [6, 8])
+                # NOT [1, 6, 8]: the tile's 6 rows are dims 0 and 1 of the tensor.
+                out_0_1 = pl.tile.store(flat, [0, 0, 0], out_0, [2, 3, 8])
+                return out_0_1
+
+            @pl.function
+            def main(self, x: pl.Tensor[[2, 3, 8], pl.FP32]) -> pl.Tensor[[2, 3, 8], pl.FP32]:
+                out_0 = pl.create_tensor([2, 3, 8], dtype=pl.FP32)
+                y = self.main_incore_0(x, out_0)
+                return y
+
+        After = passes.flatten_tile_nd_to_2d()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_partial_innermost_leading_dim_keeps_the_outer_dims_at_one(self):
+        """3 rows over a ``[4, 3, 8]`` tensor become ``[1, 3, 8]``.
+
+        The row count fits inside the innermost leading axis, so it lands there
+        whole and the outer axis stays 1. Nothing is redistributed outward.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[3, 8], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[4, 3, 8], pl.FP32]],
+            ) -> pl.Tensor[[4, 3, 8], pl.FP32]:
+                x_tile: pl.Tile[[3, 8], pl.FP32] = pl.load(x, [0, 0], [3, 8])
+                out_0: pl.Tensor[[4, 3, 8], pl.FP32] = pl.tile.store(x_tile, [0, 0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[3, 8], pl.FP32]) -> pl.Tensor[[4, 3, 8], pl.FP32]:
+                out_0: pl.Tensor[[4, 3, 8], pl.FP32] = pl.create_tensor([4, 3, 8], dtype=pl.FP32)
+                y: pl.Tensor[[4, 3, 8], pl.FP32] = self.main_incore_0(x, out_0)
+                return y
+
+        After = passes.flatten_tile_nd_to_2d()(Before)
+        stores = [line for line in pypto.ir.python_print(After).splitlines() if "pl.tile.store" in line]
+        assert len(stores) == 1, stores
+        assert "[1, 3, 8]" in stores[0], stores[0]
+
+    def test_row_count_that_is_not_a_whole_number_of_axes_is_rejected(self):
+        """A ``[12, 8]`` tile over ``[2, 2, 4, 8]`` has no window at all.
+
+        ``[2, 2, 3, 8]`` is in bounds and multiplies back to 12 rows, so a
+        purely arithmetic factorisation would accept it — but it covers flat
+        positions ``{0,1,2, 4,5,6, 8,9,10, 12,13,14}`` while the store means the
+        consecutive run ``{0..11}``. Writing the wrong elements silently is
+        worse than refusing, so the pass refuses.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[12, 8], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[2, 2, 4, 8], pl.FP32]],
+            ) -> pl.Tensor[[2, 2, 4, 8], pl.FP32]:
+                x_tile: pl.Tile[[12, 8], pl.FP32] = pl.load(x, [0, 0], [12, 8])
+                out_0: pl.Tensor[[2, 2, 4, 8], pl.FP32] = pl.tile.store(x_tile, [0, 0, 0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[12, 8], pl.FP32]) -> pl.Tensor[[2, 2, 4, 8], pl.FP32]:
+                out_0: pl.Tensor[[2, 2, 4, 8], pl.FP32] = pl.create_tensor([2, 2, 4, 8], dtype=pl.FP32)
+                y: pl.Tensor[[2, 2, 4, 8], pl.FP32] = self.main_incore_0(x, out_0)
+                return y
+
+        with pytest.raises(ValueError, match=r"must fill axis 1 \(extent 2\) a whole number of times"):
+            passes.flatten_tile_nd_to_2d()(Before)
+
+    def test_nonzero_offset_on_a_fully_consumed_axis_is_rejected(self):
+        """A ``[6, 8]`` tile at ``[0, 2, 0]`` into ``[4, 4, 8]`` has no window.
+
+        6 rows do not fill axis 1 (extent 4) a whole number of times, so the
+        run it means — ``(0,2), (0,3), (1,0), (1,1), (1,2), (1,3)`` — is not a
+        box. ``[3, 2, 8]`` fits and is in bounds, but it covers
+        ``(0,2), (0,3), (1,2), (1,3), (2,2), (2,3)`` instead.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[6, 8], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[4, 4, 8], pl.FP32]],
+            ) -> pl.Tensor[[4, 4, 8], pl.FP32]:
+                x_tile: pl.Tile[[6, 8], pl.FP32] = pl.load(x, [0, 0], [6, 8])
+                out_0: pl.Tensor[[4, 4, 8], pl.FP32] = pl.tile.store(x_tile, [0, 2, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[6, 8], pl.FP32]) -> pl.Tensor[[4, 4, 8], pl.FP32]:
+                out_0: pl.Tensor[[4, 4, 8], pl.FP32] = pl.create_tensor([4, 4, 8], dtype=pl.FP32)
+                y: pl.Tensor[[4, 4, 8], pl.FP32] = self.main_incore_0(x, out_0)
+                return y
+
+        with pytest.raises(ValueError, match=r"must fill axis 1 \(extent 4\) a whole number of times"):
+            passes.flatten_tile_nd_to_2d()(Before)
+
+    def test_valid_tail_block_smaller_than_the_physical_tile_is_not_rejected(self):
+        """Physical ``[1, 16, 512]`` with valid ``[1, 10, 512]`` into ``[1, 10, 512]``.
+
+        Only the valid rows are transferred — ``tile.store`` codegen sizes the
+        partition from the tile's valid_shape — so the window is ``[1, 10, 512]``
+        and the store is legal. Deriving it from the PHYSICAL 16 rows instead
+        asks for 16 rows of an axis whose extent is 10, and ``16 % 10 != 0``
+        then rejects a store the hardware performs correctly.
+        """
+        before = _incore_cast_chain(shapes=[1, 16, 512], valid=[1, 10, 512], tensor_shape=[1, 10, 512])
+        after = passes.flatten_tile_nd_to_2d()(before)
+        assert _store_partition_window(after, "cast_incore") == [1, 10, 512]
+
+    def test_dynamic_innermost_tensor_dim_does_not_block_the_window(self):
+        """A ``[6, 8]`` tile into ``[2, 3, D]``: the rows decompose over 2 x 3 whatever D is.
+
+        The innermost axis carries the tile's columns and takes no part in the
+        row decomposition, so demanding a static extent there rejects a store
+        that has a perfectly good window, ``[2, 3, 8]``. The column bound is
+        only checkable when both sides are static, and here D is not.
+        """
+        before = _collapsed_store_into_dynamic_cols(_dyn("D"))
+        after = passes.flatten_tile_nd_to_2d()(before)
+        assert _store_partition_window(after, "collapsed_incore") == [2, 3, 8]
+
+
+# ----------------------------------------------------------------------------
 # User-written ND tile.assemble: the offset must be flattened with the tiles
 # ----------------------------------------------------------------------------
 
@@ -1311,8 +1567,8 @@ class TestFlattenTileNdTo2DAssemble:
                 page: pl.Tile[[8, 16], pl.FP32] = pl.tile.full([8, 16], dtype=pl.FP32, value=1.0)
                 acc: pl.Tile[[32, 16], pl.FP32] = pl.tile.create([32, 16], dtype=pl.FP32)
                 acc2: pl.Tile[[32, 16], pl.FP32] = pl.tile.assemble(acc, page, [16, 0])
-                out_0: pl.Tensor[[32, 16], pl.FP32] = pl.store(acc2, [0, 0], out_0)
-                return out_0
+                out_store: pl.Tensor[[32, 16], pl.FP32] = pl.store(acc2, [0, 0], out_0)
+                return out_store
 
             @pl.function
             def main(self, x: pl.Tensor[[32, 16], pl.FP32]) -> pl.Tensor[[32, 16], pl.FP32]:
@@ -3915,6 +4171,83 @@ class TestFlattenTileNdTo2DStandaloneTranspose:
             for stmt in body.stmts
             if isinstance(stmt, ir.AssignStmt) and isinstance(stmt.value, ir.Call)
         ]
+
+    @pytest.mark.parametrize(
+        "shape, dtype, message",
+        [
+            ([1, 0, 8], DataType.FP32, "must be positive"),
+            ([1, 8, 0], DataType.FP32, "must be positive"),
+            ([1, -1, 8], DataType.FP32, "must be positive"),
+            ([1, 8, -1], DataType.FP32, "must be positive"),
+            ([1, 16, 8], DataType.INT64, "requires a 1-, 2-, or 4-byte element type"),
+            ([1, (1 << 63) - 1, 1], DataType.FP32, "overflow.*scratch row alignment"),
+            ([1, 1, 1 << 59], DataType.FP32, "overflow.*scratch page elements"),
+            ([1 << 59, 1, 1], DataType.FP32, "overflow.*scratch pool rows"),
+            ([1, 1, 1 << 57], DataType.FP32, "overflow.*scratch pool bytes"),
+        ],
+    )
+    def test_nd_transpose_rejects_invalid_workspace(self, shape, dtype, message):
+        """Reject invalid or overflowing workspaces before unrolling the batches."""
+        ib = IRBuilder()
+        with ib.function("main_incore_0", type=ir.FunctionType.InCore) as f:
+            source = f.param("x", ir.TileType(shape, dtype))
+            result = ib.let("result", tile_ops.transpose(source, 1, 2))
+            f.return_type(result.type)
+            ib.return_stmt(result)
+        before = ir.Program([f.get_result()], "invalid_transpose_workspace", ir.Span.unknown())
+
+        with pytest.raises(ValueError, match=message):
+            passes.flatten_tile_nd_to_2d()(before)
+
+    @pytest.mark.parametrize(
+        "dtype, rows, cols, scratch_page_rows",
+        [
+            (DataType.FP32, 24, 8, 32),
+            (DataType.FP32, 8, 8, 16),
+            (DataType.FP32, 16, 8, 16),
+            (DataType.FP32, 24, 24, 32),
+            (DataType.FP16, 16, 16, 32),
+            (DataType.FP16, 32, 16, 64),
+            (DataType.FP16, 32, 32, 32),
+            (DataType.INT8, 48, 32, 64),
+        ],
+    )
+    def test_nd_transpose_scratch_pages_cover_isa_workspace(self, dtype, rows, cols, scratch_page_rows):
+        """Keep source-shaped views while reserving non-overlapping ISA workspaces."""
+        batches = 4
+        Before = _build_before_nd(
+            [("x", [batches, rows, cols])],
+            [batches, cols, rows],
+            dtype,
+            lambda _ib, tiles: tile_ops.transpose(tiles[0], 1, 2),
+        )
+        After = passes.flatten_tile_nd_to_2d()(Before)
+        func = After.get_function("main_incore_0")
+        assert func is not None
+        definitions = {
+            stmt.var.unique_id: stmt.value
+            for stmt in cast(ir.SeqStmts, func.body).stmts
+            if isinstance(stmt, ir.AssignStmt) and isinstance(stmt.value, ir.Call)
+        }
+        transposes = [call for call in definitions.values() if call.op.name == _OP_TILE_TRANSPOSE]
+        assert len(transposes) == batches
+        pool_id = None
+        for batch, transpose in enumerate(transposes):
+            source = cast(ir.TileType, transpose.args[0].type)
+            scratch = cast(ir.Var, transpose.args[3])
+            assert cast(ir.TileType, scratch.type).shape == source.shape == [rows, cols]
+            assert cast(ir.TileType, transpose.type).shape == [cols, rows]
+            scratch_slice = definitions[scratch.unique_id]
+            assert scratch_slice.op.name == _OP_TILE_SLICE
+            assert _const_int_values(cast(ir.MakeTuple, scratch_slice.args[1]).elements) == [rows, cols]
+            assert _const_int_values(cast(ir.MakeTuple, scratch_slice.args[2]).elements) == [
+                batch * scratch_page_rows,
+                0,
+            ]
+            pool = cast(ir.Var, scratch_slice.args[0])
+            assert pool_id is None or pool.unique_id == pool_id
+            pool_id = pool.unique_id
+            assert cast(ir.TileType, pool.type).shape == [batches * scratch_page_rows, cols]
 
     def test_nd_transpose_unrolls_to_2d_transposes(self):
         """``transpose([2,3,8], 1, 2) -> [2,8,3]`` unrolls into 2 per-batch 2D transposes.

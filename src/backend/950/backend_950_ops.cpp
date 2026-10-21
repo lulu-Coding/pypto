@@ -25,6 +25,8 @@
  *     });
  *
  * static const bool kOpsRegistered = [] {
+ *   RegisterSelectOps(Backend950::Instance(), BackendType::Ascend950);
+ *   RegisterCastOps(Backend950::Instance(), BackendType::Ascend950);
  *   RegisterPTOOps(Backend950::Instance(), {"tile.matmul"});
  *   return true;
  * }();
@@ -32,12 +34,15 @@
  */
 
 #include "pypto/backend/950/backend_950.h"
+#include "pypto/backend/common/backend.h"
 #include "pypto/backend/common/pto_ops_common.h"
 
 namespace pypto {
 namespace backend {
 
 static const bool kOpsRegistered = [] {
+  RegisterSelectOps(Backend950::Instance(), BackendType::Ascend950);
+  RegisterCastOps(Backend950::Instance(), BackendType::Ascend950);
   RegisterPTOOps(Backend950::Instance());
   return true;
 }();

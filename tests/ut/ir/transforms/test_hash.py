@@ -353,6 +353,7 @@ _SHARED_WINDOW_BUFFER = ir.WindowBuffer(
 # checked against two independently-built values.
 _TYPE_FACTORIES: dict[str, Callable[[], ir.Type]] = {
     "UnknownType": lambda: ir.UnknownType(),
+    "VoidType": lambda: ir.VoidType(),
     "ScalarType": lambda: ir.ScalarType(DataType.FP32),
     "TensorType": lambda: ir.TensorType([64, 128], DataType.FP32),
     "TensorType_view": lambda: ir.TensorType(
@@ -381,6 +382,19 @@ _TYPE_FACTORIES: dict[str, Callable[[], ir.Type]] = {
             start_offset=ir.ConstInt(0, DataType.INDEX, _span()),
         ),
     ),
+    "BufferType": lambda: ir.BufferType([64, 128], DataType.FP16, ir.Mem.Vec),
+    "BufferType_descriptor": lambda: ir.BufferType(
+        [64, 128],
+        DataType.FP16,
+        ir.Mem.Acc,
+        valid_shape=[-1, 64],
+        blayout=ir.TileLayout.col_major,
+        slayout=ir.TileLayout.row_major,
+        fractal=1024,
+        pad=ir.PadValue.zero,
+        compact=ir.CompactMode.normal,
+    ),
+    "MultiBufferType": lambda: ir.MultiBufferType(ir.BufferType([64, 128], DataType.FP16, ir.Mem.Vec), 2),
     "ArrayType": lambda: ir.ArrayType(DataType.INT32, 16),
     "TupleType": lambda: ir.TupleType([ir.ScalarType(DataType.INT64), ir.ArrayType(DataType.INT32, 8)]),
     "PtrType": lambda: ir.PtrType(),
@@ -449,7 +463,7 @@ class TestHashTypeLadderParity:
         assert not missing, (
             f"Type classes with no structural_hash coverage: {sorted(missing)}. "
             "Add a factory to _TYPE_FACTORIES, and a matching branch to "
-            "HashType in src/ir/transforms/structural_hash.cpp."
+            "DispatchType in src/ir/transforms/structural_comparison.cpp."
         )
 
     def test_array_type_is_usable_as_a_dict_key(self):
@@ -462,6 +476,56 @@ class TestHashTypeLadderParity:
 
     def test_array_type_dtype_participates_in_the_hash(self):
         assert hash(ir.ArrayType(DataType.INT32, 16)) != hash(ir.ArrayType(DataType.INT64, 16))
+
+    def test_void_hashes_apart_from_unknown(self):
+        assert not ir.structural_equal(ir.VoidType(), ir.UnknownType())
+        assert hash(ir.VoidType()) != hash(ir.UnknownType())
+
+    @pytest.mark.parametrize(
+        "make_changed",
+        [
+            pytest.param(lambda: ir.BufferType([32, 128], DataType.FP16, ir.Mem.Vec), id="shape"),
+            pytest.param(lambda: ir.BufferType([64, 128], DataType.FP32, ir.Mem.Vec), id="dtype"),
+            pytest.param(lambda: ir.BufferType([64, 128], DataType.FP16, ir.Mem.Mat), id="memory_space"),
+            pytest.param(
+                lambda: ir.BufferType([64, 128], DataType.FP16, ir.Mem.Vec, valid_shape=[-1, 128]),
+                id="valid_shape",
+            ),
+            pytest.param(
+                lambda: ir.BufferType([64, 128], DataType.FP16, ir.Mem.Vec, blayout=ir.TileLayout.col_major),
+                id="blayout",
+            ),
+            pytest.param(
+                lambda: ir.BufferType([64, 128], DataType.FP16, ir.Mem.Vec, slayout=ir.TileLayout.row_major),
+                id="slayout",
+            ),
+            pytest.param(
+                lambda: ir.BufferType([64, 128], DataType.FP16, ir.Mem.Vec, fractal=1024), id="fractal"
+            ),
+            pytest.param(
+                lambda: ir.BufferType([64, 128], DataType.FP16, ir.Mem.Vec, pad=ir.PadValue.zero), id="pad"
+            ),
+            pytest.param(
+                lambda: ir.BufferType([64, 128], DataType.FP16, ir.Mem.Vec, compact=ir.CompactMode.normal),
+                id="compact",
+            ),
+        ],
+    )
+    def test_buffer_descriptor_fields_participate_in_the_hash(
+        self, make_changed: Callable[[], ir.BufferType]
+    ):
+        plain = _TYPE_FACTORIES["BufferType"]()
+        changed = make_changed()
+        assert not ir.structural_equal(plain, changed)
+        assert hash(plain) != hash(changed)
+
+    def test_multi_buffer_element_and_slot_count_participate_in_the_hash(self):
+        plain = _TYPE_FACTORIES["MultiBufferType"]()
+        changed_element = ir.MultiBufferType(ir.BufferType([32, 128], DataType.FP16, ir.Mem.Vec), 2)
+        changed_count = ir.MultiBufferType(ir.BufferType([64, 128], DataType.FP16, ir.Mem.Vec), 3)
+        for changed in (changed_element, changed_count):
+            assert not ir.structural_equal(plain, changed)
+            assert hash(plain) != hash(changed)
 
     def test_distributed_tensor_type_hashes_apart_from_plain_tensor_type(self):
         """The two kinds are distinguished only by ``ObjectKind``.
@@ -510,13 +574,8 @@ class TestHashTypeLadderParity:
             rhs, enable_auto_mapping=True
         )
 
-    def test_auto_mapped_window_buffers_of_different_size_hash_together(self):
-        """Regression: differing buffer fields must not split the hash.
-
-        Under auto-mapping these two types are ``structural_equal`` (EqualVar
-        maps the buffers), so they must hash alike even though the buffers
-        differ in size and staging flags.
-        """
+    def test_auto_mapping_preserves_window_buffer_fields(self):
+        """Mapping storage identities must still compare sizes and staging flags."""
         first = ir.DistributedTensorType(
             _dims(64),
             DataType.FP32,
@@ -533,8 +592,8 @@ class TestHashTypeLadderParity:
                 _span(),
             ),
         )
-        assert ir.structural_equal(first, second, enable_auto_mapping=True)
-        assert ir.structural_hash(first, enable_auto_mapping=True) == ir.structural_hash(
+        assert not ir.structural_equal(first, second, enable_auto_mapping=True)
+        assert ir.structural_hash(first, enable_auto_mapping=True) != ir.structural_hash(
             second, enable_auto_mapping=True
         )
 
@@ -621,6 +680,60 @@ class TestHashTypeLadderParity:
         assert isinstance(ir.structural_hash(param_type), int)
         assert isinstance(hash(param_type), int)
         assert isinstance(ir.structural_hash(Mod), int)
+
+
+@pytest.mark.parametrize("reuse", [False, True])
+@pytest.mark.parametrize("ordinary_first", [False, True])
+def test_loop_var_dtype_remains_exact_with_shared_constants(reuse, ordinary_first):
+    span = ir.Span.unknown()
+
+    def build(dtype):
+        i = ir.Var("i", ir.ScalarType(dtype), span)
+        one = ir.ConstInt(1, dtype, span)
+        ordinary = ir.EvalStmt(one, span)
+        loop = ir.ForStmt(
+            i,
+            ir.ConstInt(0, dtype, span),
+            one,
+            one if reuse else ir.ConstInt(1, dtype, span),
+            [],
+            ir.EvalStmt(i, span),
+            [],
+            span,
+        )
+        return ir.SeqStmts([ordinary, loop] if ordinary_first else [loop, ordinary], span)
+
+    lhs, rhs = build(DataType.INDEX), build(DataType.INT64)
+    assert not ir.structural_equal(lhs, rhs)
+    assert ir.structural_hash(lhs) != ir.structural_hash(rhs)
+
+
+@pytest.mark.parametrize("type_kind", ["tensor", "tuple"])
+@pytest.mark.parametrize("auto_mapping", [False, True])
+def test_repeated_variable_with_large_type(type_kind, auto_mapping):
+    """Repeated uses preserve identity and share the complete variable hash."""
+    span = ir.Span.unknown()
+    size = 1024
+    scalar = ir.ScalarType(DataType.INT64)
+    if type_kind == "tensor":
+        shape = [ir.ConstInt(i + 1, DataType.INDEX, span) for i in range(size)]
+        type_ = ir.TensorType(shape, DataType.FP32)
+    else:
+        type_ = ir.TupleType([ir.TupleType([scalar, scalar])] * size)
+    variable = ir.Var("value", type_, span)
+    renamed = ir.Var("renamed", type_, span) if auto_mapping else variable
+    left = ir.SeqStmts([ir.EvalStmt(variable, span) for _ in range(size)], span)
+    right = ir.SeqStmts([ir.EvalStmt(renamed, span) for _ in range(size)], span)
+    assert ir.structural_equal(left, right, enable_auto_mapping=auto_mapping)
+    assert ir.structural_hash(left, enable_auto_mapping=auto_mapping) == ir.structural_hash(
+        right, enable_auto_mapping=auto_mapping
+    )
+    other = ir.Var("other", type_, span)
+    distinct = ir.SeqStmts([*left.stmts[:-1], ir.EvalStmt(other, span)], span)
+    assert not ir.structural_equal(left, distinct, enable_auto_mapping=auto_mapping)
+    assert ir.structural_hash(left, enable_auto_mapping=auto_mapping) != ir.structural_hash(
+        distinct, enable_auto_mapping=auto_mapping
+    )
 
 
 if __name__ == "__main__":

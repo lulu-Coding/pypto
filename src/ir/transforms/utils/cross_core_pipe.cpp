@@ -22,12 +22,15 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/backend/common/backend_handler.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
+#include "pypto/ir/kind_traits.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
+#include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/utils/core_affinity.h"
 #include "pypto/ir/transforms/utils/core_side_ops.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
@@ -40,6 +43,65 @@ namespace cross_core_pipe {
 namespace {
 
 const auto& FlattenBody = transform_utils::FlattenToStmts;
+
+struct ConsumerFifo {
+  std::vector<const Var*> pops;
+  size_t next_free = 0;
+};
+
+// Inspect the finalized FIFO schedule, not merely the number of live values:
+// the emitted tfree has no tile operand and releases the oldest slot. Nested
+// scopes must preserve their incoming FIFO ownership; otherwise reject the
+// unsupported schedule rather than silently releasing an enclosing tile.
+// Checkpoint/rewind avoids copying live queues at each nesting level: O(N).
+int RequiredConsumerDepth(const std::vector<StmtPtr>& stmts, core_affinity::CoreSide side,
+                          ConsumerFifo& fifo) {
+  int peak = static_cast<int>(fifo.pops.size() - fifo.next_free);
+  auto visit_body = [&](const StmtPtr& body) {
+    const size_t entry_tail = fifo.pops.size();
+    const size_t entry_head = fifo.next_free;
+    const int body_peak = RequiredConsumerDepth(FlattenBody(body), side, fifo);
+    const bool unchanged = fifo.next_free == entry_head && fifo.pops.size() == entry_tail;
+    const bool empty_on_both_sides = entry_head == entry_tail && fifo.next_free == fifo.pops.size();
+    CHECK_SPAN(unchanged || empty_on_both_sides, body->span_)
+        << "Automatic cross-core pipe does not support FIFO ownership escaping a control-flow body; "
+           "place/consume and release each gathered tile within its scope.";
+    fifo.pops.resize(entry_tail);
+    fifo.next_free = entry_head;
+    peak = std::max(peak, body_peak);
+  };
+  for (const auto& stmt : stmts) {
+    auto assign = std::dynamic_pointer_cast<const AssignStmt>(stmt);
+    auto eval = std::dynamic_pointer_cast<const EvalStmt>(stmt);
+    auto call = assign ? std::dynamic_pointer_cast<const Call>(assign->value_)
+                       : (eval ? std::dynamic_pointer_cast<const Call>(eval->expr_) : nullptr);
+    if (call && call->op_) {
+      if (call->op_->name_ == core_side_ops::TPopOp(side)) {
+        INTERNAL_CHECK_SPAN(assign, stmt->span_) << "Internal error: tpop must bind a tile";
+        fifo.pops.push_back(assign->var_.get());
+        peak = std::max(peak, static_cast<int>(fifo.pops.size() - fifo.next_free));
+      } else if (call->op_->name_ == core_side_ops::TFreeOp(side)) {
+        auto tile = call->args_.empty() ? nullptr : AsVarLike(call->args_[0]);
+        CHECK_SPAN(tile && fifo.next_free < fifo.pops.size() && fifo.pops[fifo.next_free] == tile.get(),
+                   stmt->span_)
+            << "Automatic cross-core pipe requires FIFO release order; a retained earlier tile "
+               "must be consumed before a later gathered tile is released.";
+        ++fifo.next_free;
+      }
+    }
+    if (auto loop = std::dynamic_pointer_cast<const ForStmt>(stmt)) {
+      visit_body(loop->body_);
+    } else if (auto loop = std::dynamic_pointer_cast<const WhileStmt>(stmt)) {
+      visit_body(loop->body_);
+    } else if (auto branch = std::dynamic_pointer_cast<const IfStmt>(stmt)) {
+      visit_body(branch->then_body_);
+      if (branch->else_body_) {
+        visit_body(*branch->else_body_);
+      }
+    }
+  }
+  return peak;
+}
 
 }  // namespace
 
@@ -176,15 +238,18 @@ CallPtr CreateImportPeerBuffer(const std::string& buffer_name, const std::string
 
 CallPtr CreateInitializePipe(core_affinity::CoreSide side, int dir_mask, int slot_size_bytes,
                              const ExprPtr& c2v_consumer_buf, const ExprPtr& v2c_consumer_buf, int slot_num,
-                             const Span& span) {
+                             std::optional<int> local_slot_num, const Span& span) {
   INTERNAL_CHECK_SPAN(slot_size_bytes >= 0 && slot_size_bytes <= std::numeric_limits<int>::max(), span)
       << "Cross-core slot_size out of range: " << slot_size_bytes;
   INTERNAL_CHECK_SPAN(slot_num > 0, span) << "Cross-core slot_num must be positive: " << slot_num;
-  // Always emitted: the reserved buffer is sized for exactly this depth, so leaving the clause off
-  // would let PTOAS index its own implicit ring depth past the end of that buffer.
+  // Always emit the transport depth so GM sizing and peer ring indexing agree.
+  // The optional local depth separately describes the on-chip reserve.
   std::vector<std::pair<std::string, std::any>> kwargs = {{"dir_mask", std::any(dir_mask)},
                                                           {"slot_size", std::any(slot_size_bytes)},
                                                           {"slot_num", std::any(slot_num)}};
+  if (local_slot_num.has_value()) {
+    kwargs.emplace_back("local_slot_num", local_slot_num.value());
+  }
   const std::string op_name = core_side_ops::InitializePipeOp(side);
   return CreateSystemOpCall(op_name, {c2v_consumer_buf, v2c_consumer_buf}, kwargs, span);
 }
@@ -269,7 +334,8 @@ CrossCorePipeMetadata CollectDominatingPipeSetupMetadata(const std::vector<StmtP
 AutomaticPipeSetup BuildAutomaticPipeSetup(const std::string& func_name, const std::string& aic_name,
                                            const std::string& aiv_name, const std::vector<StmtPtr>& aic_stmts,
                                            const std::vector<StmtPtr>& aiv_stmts,
-                                           std::optional<int> slot_num_override, const Span& span) {
+                                           std::optional<int> slot_num_override,
+                                           std::optional<int> local_slot_num_override, const Span& span) {
   CrossCorePipeMetadata aic_metadata;
   CollectCrossCorePipeMetadata(aic_stmts, aic_metadata);
   CrossCorePipeMetadata aiv_metadata;
@@ -286,22 +352,47 @@ AutomaticPipeSetup BuildAutomaticPipeSetup(const std::string& func_name, const s
     return {};
   }
 
-  // Ring depth: pl.cross_core_slot(slot_num=N) override, else kDefaultAutoPipeSlotNum. The reserved
-  // buffer and the emitted initialize_pipe slot_num attribute both use this value, and the attribute
-  // is always emitted — so the buffer and the depth PTOAS indexes stay consistent on a3 (local
-  // footprint = slot_num when local_slot_num is omitted) and a5 (footprint = slot_num).
+  // Always emit the transport depth, avoiding PTOAS's different implicit default.
+  // Local storage follows it unless the supporting backend receives an explicit
+  // local depth. GM allocation continues to consume only the transport signature.
   if (slot_num_override.has_value()) {
     INTERNAL_CHECK_SPAN(slot_num_override.value() > 0, span)
         << "Cross-core slot_num override must be positive: " << slot_num_override.value();
   }
   const int effective_slot_num = slot_num_override.value_or(kDefaultAutoPipeSlotNum);
+  if (local_slot_num_override.has_value()) {
+    // Keep allocation and both peer initializers in agreement. Merely shrinking
+    // reserve_buffer would leave PTOAS indexing at the full transport depth.
+    CHECK_SPAN(PassContext::Current()->GetBackendHandler()->SupportsLocalPipeDepth(), span)
+        << "pl.cross_core_slot(local_slot_num=...) is only supported on A2/A3; "
+           "omit local_slot_num on A5";
+    CHECK_SPAN(*local_slot_num_override > 0 && *local_slot_num_override <= effective_slot_num, span)
+        << "Cross-core local_slot_num (" << *local_slot_num_override << ") must be positive and <= slot_num ("
+        << effective_slot_num << ")";
+  }
+  const int local_depth = local_slot_num_override.value_or(effective_slot_num);
+  ConsumerFifo aic_fifo;
+  ConsumerFifo aiv_fifo;
+  const int required_slot_num =
+      std::max(RequiredConsumerDepth(aic_stmts, core_affinity::CoreSide::AIC, aic_fifo),
+               RequiredConsumerDepth(aiv_stmts, core_affinity::CoreSide::AIV, aiv_fifo));
+  CHECK_SPAN(effective_slot_num >= required_slot_num, span)
+      << "Automatic cross-core pipe slot_num=" << effective_slot_num << " is insufficient for "
+      << required_slot_num
+      << " simultaneously retained popped tiles; set cross_core_slot(slot_num=" << required_slot_num
+      << ") or place/consume each gathered tile before gathering the next.";
+  CHECK_SPAN(local_depth >= required_slot_num, span)
+      << "Automatic cross-core pipe local_slot_num=" << local_depth << " is insufficient for "
+      << required_slot_num
+      << " simultaneously retained popped tiles; increase local_slot_num or place/consume "
+         "each gathered tile before gathering the next.";
   // Bound-check the slot size before multiplying so an oversized inferred size
   // can't overflow the int64 buffer_size computation.
   const int64_t slot_size_i64 = common_slot_size.value();
   INTERNAL_CHECK_SPAN(slot_size_i64 >= 0 && slot_size_i64 <= std::numeric_limits<int>::max(), span)
       << "Cross-core slot_size out of range: " << slot_size_i64;
   const int slot_size_bytes = static_cast<int>(slot_size_i64);
-  const int64_t buffer_size = slot_size_i64 * effective_slot_num;
+  const int64_t buffer_size = slot_size_i64 * local_depth;
   AutomaticPipeSetup setup;
 
   std::shared_ptr<Var> aic_v2c_reserve_var;
@@ -341,14 +432,14 @@ AutomaticPipeSetup BuildAutomaticPipeSetup(const std::string& func_name, const s
   const ExprPtr aiv_c2v_arg = aiv_c2v_reserve_var ? var_as_expr(aiv_c2v_reserve_var) : ExprPtr(zero_i32());
   const ExprPtr aiv_v2c_arg = aiv_v2c_import_var ? var_as_expr(aiv_v2c_import_var) : ExprPtr(zero_i32());
 
-  setup.aic_stmts.push_back(
-      std::make_shared<EvalStmt>(CreateInitializePipe(core_affinity::CoreSide::AIC, dir_mask, slot_size_bytes,
-                                                      aic_c2v_arg, aic_v2c_arg, effective_slot_num, span),
-                                 span));
-  setup.aiv_stmts.push_back(
-      std::make_shared<EvalStmt>(CreateInitializePipe(core_affinity::CoreSide::AIV, dir_mask, slot_size_bytes,
-                                                      aiv_c2v_arg, aiv_v2c_arg, effective_slot_num, span),
-                                 span));
+  setup.aic_stmts.push_back(std::make_shared<EvalStmt>(
+      CreateInitializePipe(core_affinity::CoreSide::AIC, dir_mask, slot_size_bytes, aic_c2v_arg, aic_v2c_arg,
+                           effective_slot_num, local_slot_num_override, span),
+      span));
+  setup.aiv_stmts.push_back(std::make_shared<EvalStmt>(
+      CreateInitializePipe(core_affinity::CoreSide::AIV, dir_mask, slot_size_bytes, aiv_c2v_arg, aiv_v2c_arg,
+                           effective_slot_num, local_slot_num_override, span),
+      span));
 
   return setup;
 }

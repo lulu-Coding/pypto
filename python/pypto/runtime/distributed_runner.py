@@ -28,9 +28,9 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
-import numpy as np  # pyright: ignore[reportMissingImports]
+import numpy as np
 import torch
 
 from .device_tensor import DeviceTensor, StackedDeviceTensor
@@ -49,7 +49,7 @@ if TYPE_CHECKING:
 # simpler Tensor → torch.Tensor conversion
 # ---------------------------------------------------------------------------
 
-_DTYPE_MAP: dict[str, tuple[type, torch.dtype]] = {
+_DTYPE_MAP: dict[str, tuple[type[ctypes._CData], torch.dtype]] = {
     "FLOAT32": (ctypes.c_float, torch.float32),
     "FLOAT16": (ctypes.c_uint8, torch.float16),
     "BFLOAT16": (ctypes.c_uint8, torch.bfloat16),
@@ -88,9 +88,9 @@ class _DispatchFrame:
 
     slot_id: int
     in_use: bool = False
-    tensors: dict[str, Any] = field(default_factory=dict)
-    keepalive: list[Any] = field(default_factory=list)
-    cleanup: list[Callable[[], None]] = field(default_factory=list)
+    tensors: dict[str, Any] = field(default_factory=dict[str, Any])
+    keepalive: list[Any] = field(default_factory=list[Any])
+    cleanup: list[Callable[[], None]] = field(default_factory=list[Callable[[], None]])
     handle: DistributedRunHandle | None = None
 
 
@@ -258,7 +258,9 @@ class _RetainedDomainLease:
         return False
 
 
-def _tensor_from_continuous(ct) -> torch.Tensor:
+# Reached only through function-scope lazy imports (pyright's unused analysis
+# discounts cross-module references to private symbols).
+def _tensor_from_continuous(ct: Any) -> torch.Tensor:  # pyright: ignore[reportUnusedFunction]
     """Convert a mapped wire arg (or legacy chip tensor) to torch, zero-copy.
 
     Current simpler Python SubWorkers receive ``MappedArg`` objects and expose
@@ -275,7 +277,7 @@ def _tensor_from_continuous(ct) -> torch.Tensor:
     dtype_str = str(ct.dtype)
     dtype_key = dtype_str.rsplit(".", 1)[-1]
     if dtype_key.isdecimal():
-        from simpler.task_interface import DataType  # pyright: ignore[reportMissingImports]  # noqa: PLC0415
+        from simpler.task_interface import DataType  # noqa: PLC0415
 
         dtype_key = DataType(int(dtype_key)).name
     try:
@@ -309,7 +311,8 @@ def _tensor_from_continuous(ct) -> torch.Tensor:
         )
 
     arr = np.ctypeslib.as_array(ctypes.cast(ct.data, ctypes.POINTER(c_type)), shape=(n_c_elements,))
-    t = torch.from_numpy(arr)
+    # torch's stubs leave from_numpy's ndarray item-type parameter unresolved.
+    t = torch.from_numpy(arr)  # pyright: ignore[reportUnknownMemberType]
     if t.dtype != torch_dtype:
         # view(dtype) reinterprets the bytes without copying — preserves shared memory.
         t = t.view(torch_dtype)
@@ -324,7 +327,8 @@ def _load_generated_module(path: Path) -> Any:
         raise RuntimeError(f"Cannot load generated module from {path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
-    spec.loader.exec_module(module)
+    # Read source directly: a published artifact must never acquire __pycache__.
+    exec(compile(path.read_bytes(), str(path), "exec"), module.__dict__)
     # Generated modules live only in ``sys.modules`` — there is no
     # ``_pypto_generated`` package on disk to re-import them by name. The
     # runtime cloudpickles every registered callable to derive its hashid
@@ -339,12 +343,30 @@ def _load_generated_module(path: Path) -> Any:
     # either, so there is nothing to protect — skip the registration. The
     # import is local so plain ``import pypto`` never requires cloudpickle.
     try:
-        import cloudpickle  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+        import cloudpickle  # noqa: PLC0415
 
         cloudpickle.register_pickle_by_value(module)
     except ImportError:
         pass
     return module
+
+
+def _run_directory(compiled: Any) -> Path:
+    from ._artifact_runtime import runtime_output_directory  # noqa: PLC0415
+
+    return runtime_output_directory(compiled)
+
+
+def _collect_program_swimlane(compiled: Any) -> None:
+    artifact_fields = cast("dict[str, Any]", vars(compiled))
+    if artifact_fields.get("_artifact_runtime") is None:
+        _collect_l3_swimlane(compiled.output_dir, compiled.platform)
+    else:
+        _collect_l3_swimlane(
+            artifact_fields["_artifact_runtime"].directory,
+            compiled.platform,
+            run_directory=_run_directory(compiled),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +375,41 @@ def _load_generated_module(path: Path) -> Any:
 # both paths run identical, expensive setup (_compile_and_assemble, module load,
 # Worker construction + registration) without duplicating it.
 # ---------------------------------------------------------------------------
+
+
+class _ChipCallables(dict[str, Any]):
+    """Chip callables (or registered handles) with their tensor transfer contracts."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.host_tensor_indices: dict[str, frozenset[int]] = {}
+
+    def add(self, name: str, value: Any, config: dict[str, Any]) -> None:
+        self[name] = value
+        self.host_tensor_indices[name] = frozenset(config.get("host_tensor_indices", ()))
+
+
+def add_chip_tensor_arg(
+    args: Any,
+    worker: Any,
+    tensor: Any,
+    tag: Any,
+    callables: dict[str, Any],
+    name: str,
+    index: int,
+) -> None:
+    """Pack a chip argument using the callee's emitted host-control contract."""
+    from .tensor_arg import make_tensor_arg  # noqa: PLC0415
+
+    host_slots = callables.host_tensor_indices.get(name, ()) if isinstance(callables, _ChipCallables) else ()
+    if index in host_slots:
+        from simpler.buffer import TensorTransfer  # noqa: PLC0415
+
+        if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu":
+            raise ValueError(f"Chip {name!r} host control tensor slot {index} requires a CPU tensor")
+        args.add_tensor(make_tensor_arg(worker, tensor), tag, transfer=TensorTransfer.NONE)
+    else:
+        args.add_tensor(make_tensor_arg(worker, tensor), tag)
 
 
 def _assemble_chip_callables(
@@ -366,7 +423,18 @@ def _assemble_chip_callables(
     it works identically for a freshly-compiled program and one reconstructed via
     :meth:`DistributedCompiledProgram.from_dir` (the ``runtime_dir`` replay path).
     """
-    chip_callables: dict[str, Any] = {}
+    artifact_runtime = vars(compiled).get("_artifact_runtime")
+    if artifact_runtime is not None:
+        chips = artifact_runtime.load()
+        callables = _ChipCallables()
+        for name, (chip_callable, _, config) in chips.items():
+            callables.add(name, chip_callable, config)
+        return (
+            callables,
+            next(iter(chips.values()))[1],
+            any(bool(value[2].get("enable_sdma", False)) for value in chips.values()),
+        )
+    chip_callables = _ChipCallables()
     runtime_name: str | None = None
     enable_sdma = False
     next_levels_dir = compiled.output_dir / "next_levels"
@@ -382,7 +450,7 @@ def _assemble_chip_callables(
             chip_callable, chip_runtime, chip_runtime_config = _compile_and_assemble(
                 chip_dir, compiled.platform
             )
-            chip_callables[chip_dir.name] = chip_callable
+            chip_callables.add(chip_dir.name, chip_callable, chip_runtime_config)
             enable_sdma = enable_sdma or bool(chip_runtime_config.get("enable_sdma", False))
             if runtime_name is None:
                 runtime_name = chip_runtime
@@ -461,7 +529,7 @@ def _call_alloc_intermediates(alloc_fn: Any, tensors: dict[str, Any], world_size
     signature mismatch and silently retried.
     """
     try:
-        params = inspect.signature(alloc_fn).parameters
+        params = dict(inspect.signature(alloc_fn).parameters)
     except (TypeError, ValueError):  # builtin / C callable with no introspectable signature
         params = {}
     takes_world_size = "world_size" in params or any(
@@ -514,7 +582,7 @@ def _construct_worker(
             f"got {startup_timeout_s!r}"
         )
 
-    from simpler.worker import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+    from simpler.worker import (  # noqa: PLC0415
         Worker,
     )
 
@@ -575,7 +643,11 @@ def _register_callables(
     # ``Any`` here and threaded straight back into ``submit_sub`` /
     # ``submit_next_level``, which accept the handle.
     sub_ids: dict[str, Any] = {name: w.register(fn) for name, fn in sub_worker_fns.items()}
-    chip_cids: dict[str, Any] = {name: w.register(cc) for name, cc in chip_callables.items()}
+    chip_cids = _ChipCallables()
+    for name, cc in chip_callables.items():
+        chip_cids[name] = w.register(cc)
+    if isinstance(chip_callables, _ChipCallables):
+        chip_cids.host_tensor_indices = chip_callables.host_tensor_indices.copy()
     return sub_ids, chip_cids
 
 
@@ -700,8 +772,8 @@ def _make_call_config(
     Raises:
         ValueError: a DFX flag is enabled but *dfx_base* is ``None``.
     """
-    from simpler.task_interface import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
-        CallConfig,  # pyright: ignore[reportAttributeAccessIssue]
+    from simpler.task_interface import (  # noqa: PLC0415
+        CallConfig,
     )
 
     call_config = CallConfig()
@@ -751,9 +823,14 @@ def _run_l3_swimlane_two_pass(
 
     ``run_pass`` owns the execution lifecycle: the one-shot path creates a
     fresh Worker for each call, while a prepared ``DistributedWorker`` reuses
-    its existing Worker and waits on a submitted run handle. Both paths
-    reset their per-card dispatch counters, so matching graph/timing dispatches
-    land in the same ``rank{r}/d{k}`` directory.
+    its existing Worker and waits on a submitted run handle.
+
+    The two passes are two runs, and the ChipWorker child numbers its capture
+    directories per process — so the graph pass's ``deps.json`` and the timing
+    pass's records land in *different* ``rank{r}/d{k}`` directories.
+    :func:`_collect_l3_swimlane` pairs them back up from the child's identity
+    sidecars; without that pairing the converter sees no task graph and renders
+    a swimlane with no dependency edges.
 
     Both calls execute the program. As with the existing one-shot L3 protocol,
     mutable arguments are not snapshotted or restored between passes.
@@ -810,6 +887,18 @@ _DISPATCH_DIR_GLOB = "d[0-9]*"
 # ``next_levels/<program>`` — so naming a dispatch's tasks needs this marker
 # (issue #2169).
 _DISPATCH_PROGRAM_FILE = "dispatch_program.json"
+
+# Written by the ChipWorker child into every capture directory it creates. The
+# child numbers captures per *process* (``local_capture_index``), not per run, so
+# the swimlane two-pass files its graph capture and its timing capture under
+# different ``d{k}`` directories. This sidecar is what pairs them back together
+# (:func:`_pair_graph_capture`); it is absent on an older runtime, which numbered
+# both passes alike and needs no pairing.
+_DISPATCH_IDENTITY_FILE = "dispatch_identity.json"
+
+# The dep_gen pass's task graph. The converter needs it for dependency edges and
+# defaults to the one beside the records — which the two-pass split apart.
+_DEPS_JSON_FILE = "deps.json"
 
 
 def _dfx_rank_label(worker: int) -> str:
@@ -895,7 +984,10 @@ def _record_dispatch_program(orch: Any, callable_id: Any, disp_dir: Path) -> Non
         )
 
 
-def _submit_chip(orch: Any, callable_id: Any, task_args: Any, config: Any, worker: int | None) -> Any:
+# Called from generated host_orch.py code (pyright cannot see those references).
+def _submit_chip(  # pyright: ignore[reportUnusedFunction]
+    orch: Any, callable_id: Any, task_args: Any, config: Any, worker: int | None
+) -> Any:
     """``orch.submit_next_level`` that stamps each dispatch's DFX directory.
 
     The runtime path helpers root every diagnostic artifact at a fixed filename
@@ -911,11 +1003,13 @@ def _submit_chip(orch: Any, callable_id: Any, task_args: Any, config: Any, worke
     offline post-pass — and forwards ``config`` untouched.
 
     ``k`` comes from a per-card counter on ``orch`` reset at the top of every
-    run (see :func:`_reset_dfx_dispatch_state`), so the numbering is
-    deterministic, matches across the swimlane two-pass, and tracks the child's
-    own counter. The dispatched program is stamped into that directory by
-    :func:`_record_dispatch_program`, so the offline post-pass can label the
-    records with the right program's kernel names.
+    run (see :func:`_reset_dfx_dispatch_state`), so it is this run's dispatch
+    ordinal. The child's own counter spans the whole process, so the two
+    numberings agree only on a worker's first run: the marker
+    :func:`_record_dispatch_program` stamps here therefore lands on the first
+    run's capture directory — the graph pass of a swimlane two-pass — and
+    :func:`_collect_l3_swimlane` reads it back through the capture pairing
+    rather than expecting it beside the records.
 
     When DFX is off (``output_prefix`` unset) the call is forwarded unchanged.
 
@@ -932,7 +1026,7 @@ def _submit_chip(orch: Any, callable_id: Any, task_args: Any, config: Any, worke
     if idx_map is None:
         # Defensive: a caller that bypassed ``orch_fn`` (no reset) still gets
         # per-card isolation, just without a guaranteed two-pass match.
-        idx_map = orch._dfx_dispatch_idx = {}
+        idx_map = orch._dfx_dispatch_idx = cast("dict[str, int]", {})
     rank_label = _dfx_rank_label(worker)
     k = idx_map.get(rank_label, 0)
     idx_map[rank_label] = k + 1
@@ -943,10 +1037,10 @@ def _submit_chip(orch: Any, callable_id: Any, task_args: Any, config: Any, worke
 def _clear_dfx_dispatch_dirs(dfx_base: Path) -> None:
     """Remove stale ``rank*/d{k}`` dispatch dirs before a fresh DFX run.
 
-    The per-card dispatch counter resets to ``d0`` at the start of every run, so
-    a prepared :class:`DistributedWorker` reusing one ``output_dir`` across
-    dispatches would otherwise leave higher-numbered ``d{k}`` dirs from an
-    earlier, larger run on disk. ``_collect_l3_swimlane`` globs ``d[0-9]*``, so
+    A prepared :class:`DistributedWorker` reusing one ``output_dir`` across runs
+    would otherwise leave ``d{k}`` dirs from an earlier, larger run on disk,
+    whether the child restarted its capture numbering or carried it forward.
+    ``_collect_l3_swimlane`` globs ``d[0-9]*``, so
     those stale dirs would be re-converted as if they belonged to the current
     run. Clearing them once, before the first dispatch of a DFX run, scopes the
     artifacts (and their post-processing) to exactly this run. Called only when
@@ -981,7 +1075,208 @@ def _read_dispatch_program(disp_dir: Path) -> str | None:
     return str(program)
 
 
-def _write_dispatch_name_map(disp_dir: Path, chip_dir: Path, cache: dict[str, dict[str, str]]) -> Path | None:
+def _read_dispatch_identity(disp_dir: Path) -> dict[str, Any] | None:
+    """The child's identity sidecar for this capture, or ``None`` if unusable.
+
+    Absent on a runtime that predates the sidecar, and best-effort like every
+    other marker here: an unreadable one costs the graph/timing pairing, never
+    the run.
+    """
+    try:
+        identity = json.loads((disp_dir / _DISPATCH_IDENTITY_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return cast("dict[str, Any]", identity) if isinstance(identity, dict) else None
+
+
+def _pair_rank_captures(rank_dir: Path) -> dict[Path, Path]:
+    """Map each of this card's timing captures to the capture holding its task graph.
+
+    The two swimlane passes are two runs, and the child numbers captures per
+    process — so the ``deps.json`` the converter needs for dependency edges sits
+    in a *different* ``d{k}`` than the records. The identity sidecars say which
+    run each capture came from and which callable it ran, which is enough to pair
+    them *only* when both passes issued the same dispatches: ``run_id`` differs
+    across passes, and ``local_capture_index`` counts captures per process, so
+    nothing in a single sidecar identifies a dispatch across runs on its own.
+
+    So pair whole runs, not individual captures. A timing run pairs with a graph
+    run when their ordered ``callable_digest`` sequences are identical; the
+    dispatches then correspond position by position. When the sequences differ in
+    length or order the run pair is rejected outright: the passes do not restore
+    mutable arguments between them (see :func:`_run_l3_swimlane_two_pass`), so a
+    dispatch count that depends on data can genuinely differ, and a graph pass of
+    ``[A, A]`` against a timing pass of ``[A]`` would otherwise hand the
+    surviving dispatch the *first* ``A``'s edges — plausible and wrong. The
+    nearest earlier graph run wins, since its graph describes the state this
+    timing run started from.
+
+    A card whose captures carry no sidecar at all (an older runtime) pairs only
+    when exactly one capture holds the graph and exactly one holds records:
+    anything else cannot be told apart, and reusing one graph for several timing
+    captures would attach the same edges to different dispatches.
+
+    Captures that already hold both files need no pairing and are left out.
+    """
+    from .runner import _CHIP_SWIMLANE_RECORDS_NAME  # noqa: PLC0415
+
+    captures = {
+        d: _read_dispatch_identity(d) for d in sorted(rank_dir.glob(_DISPATCH_DIR_GLOB)) if d.is_dir()
+    }
+    graph_dirs = [d for d in captures if (d / _DEPS_JSON_FILE).exists()]
+    timing_dirs = [
+        d
+        for d in captures
+        if (d / _CHIP_SWIMLANE_RECORDS_NAME).exists() and not (d / _DEPS_JSON_FILE).exists()
+    ]
+    if not graph_dirs or not timing_dirs:
+        return {}
+
+    if all(identity is None for identity in captures.values()):
+        # Older runtime: one graph and one set of records on the card is the only
+        # shape with a single possible answer.
+        if len(graph_dirs) == 1 and len(timing_dirs) == 1:
+            return {timing_dirs[0]: graph_dirs[0]}
+        return {}
+
+    runs = _captures_by_run(captures)
+    graph_runs = {
+        run_id: sequence for run_id, sequence in runs.items() if all(d in graph_dirs for d, _ in sequence)
+    }
+    pairs: dict[Path, Path] = {}
+    for run_id, sequence in runs.items():
+        if not all(d in timing_dirs for d, _ in sequence):
+            continue
+        digests = [identity.get("callable_digest") for _, identity in sequence]
+        candidates = [
+            other_id
+            for other_id, other in graph_runs.items()
+            if [identity.get("callable_digest") for _, identity in other] == digests
+        ]
+        earlier = [other_id for other_id in candidates if other_id < run_id]
+        graph_run = max(earlier) if earlier else (min(candidates) if candidates else None)
+        if graph_run is None:
+            continue
+        for (timing_dir, _), (graph_dir, _) in zip(sequence, graph_runs[graph_run]):
+            pairs[timing_dir] = graph_dir
+    return pairs
+
+
+_CaptureRuns = dict[int, list[tuple[Path, dict[str, Any]]]]
+
+
+def _captures_by_run(captures: dict[Path, dict[str, Any] | None]) -> _CaptureRuns:
+    """Group a card's captures by ``run_id``, each run ordered by capture index.
+
+    A capture missing either field cannot be placed in a pass's sequence, and a
+    run holding one is dropped whole: a sequence with a hole cannot be compared
+    against another pass's, and comparing it anyway is how the wrong dispatch
+    gets paired.
+    """
+    runs: _CaptureRuns = {}
+    incomplete: set[int] = set()
+    for capture, identity in captures.items():
+        if identity is None:
+            continue
+        run_id = identity.get("run_id")
+        if run_id is None:
+            continue
+        if identity.get("local_capture_index") is None:
+            incomplete.add(run_id)
+            continue
+        runs.setdefault(run_id, []).append((capture, identity))
+    for run_id in incomplete:
+        runs.pop(run_id, None)
+    return {
+        run_id: sorted(sequence, key=lambda entry: entry[1]["local_capture_index"])
+        for run_id, sequence in runs.items()
+    }
+
+
+def _consolidate_two_pass_captures(rank_dir: Path, pairs: dict[Path, Path]) -> None:
+    """Fold each timing capture into the graph capture of the same dispatch.
+
+    A swimlane capture runs the dispatch twice and the child files each run
+    separately, so one dispatch ends up spread over two ``d{k}`` directories: the
+    task graph in one, the records in the other. Every consumer of these
+    artifacts — the converter, ``simpler_setup.tools.critical_path``, the
+    toolkit's viewers, this project's analysis scripts — looks for one dispatch's
+    files *together*, so the split does not merely cost dependency edges in the
+    merged trace: a tool that selects directories by "has ``deps.json`` and a
+    name map" matches neither half.
+
+    Fold forward, into the graph capture. The graph pass runs first, so its
+    captures carry the lower indices — for a card dispatching ``N`` times they
+    are ``d0..d(N-1)``, the dispatch ordinals themselves, while the timing pass's
+    ``dN..d(2N-1)`` are only that offset repeated. Keeping the first of each pair
+    therefore restores both halves of the layout every consumer expects: one
+    directory per dispatch, named by the dispatch.
+
+    Only paired captures are touched (see :func:`_pair_rank_captures`), only
+    after both passes have finished, and only where the pairing is one-to-one.
+    The timing capture's own identity sidecar is kept beside the graph pass's
+    under a distinct name rather than overwriting it — the two describe different
+    runs and both are evidence. Best-effort: a capture that cannot be folded is
+    left exactly as it was, and its records are still converted where they lie.
+    """
+    import collections  # noqa: PLC0415
+    import shutil  # noqa: PLC0415
+
+    # Several timed captures can share one graph pass — a benchmark loop repeats
+    # the timing run against the graph it captured once. Folding them all into
+    # that one directory would have them overwrite each other, so only a pair
+    # that owns its graph capture is folded; the rest keep their own directories
+    # and are converted against the shared graph by path.
+    fold_counts = collections.Counter(pairs.values())
+    for timing_dir, graph_dir in pairs.items():
+        if fold_counts[graph_dir] != 1:
+            continue
+        try:
+            for artifact in sorted(timing_dir.iterdir()):
+                if artifact.name == _DISPATCH_IDENTITY_FILE:
+                    target = graph_dir / "dispatch_identity.timing.json"
+                else:
+                    target = graph_dir / artifact.name
+                if target.exists():
+                    continue
+                shutil.move(str(artifact), str(target))
+            timing_dir.rmdir()
+        except OSError as e:
+            print(
+                f"Could not fold {rank_dir.name}/{timing_dir.name} into "
+                f"{rank_dir.name}/{graph_dir.name} ({type(e).__name__}: {e}); the dispatch's "
+                "artifacts stay split across both directories."
+            )
+
+
+def _resolve_capture_graph(
+    rank_dir: Path, disp_dir: Path, pairs: dict[Path, Path]
+) -> tuple[Path | None, Path | None]:
+    """The ``deps.json`` to convert *disp_dir* with, and the capture it came from.
+
+    Returns ``(None, None)`` when the task graph already sits beside the records —
+    the converter's own default, and what :func:`_consolidate_two_pass_captures`
+    normally arranges — and when no capture could be paired, which is reported
+    here because the resulting swimlane silently loses every dependency edge.
+    The graph capture is returned alongside the path: it also carries the
+    dispatch's program marker (see :func:`_submit_chip`).
+    """
+    if (disp_dir / _DEPS_JSON_FILE).exists():
+        return None, None
+    graph_dir = pairs.get(disp_dir)
+    if graph_dir is None:
+        print(
+            f"No task graph paired with {rank_dir.name}/{disp_dir.name}; its swimlane renders task "
+            "timings without dependency edges (the dep_gen pass writes "
+            f"{_DEPS_JSON_FILE} into its own capture directory)."
+        )
+        return None, None
+    return graph_dir / _DEPS_JSON_FILE, graph_dir
+
+
+def _write_dispatch_name_map(
+    disp_dir: Path, chip_dir: Path, cache: dict[str, dict[str, str]], *, prebuilt: bool = False
+) -> Path | None:
     """Write *disp_dir*'s ``name_map.json`` from *chip_dir*'s ``kernel_config.py``.
 
     The map is the one the L2 path synthesises (:func:`~pypto.runtime.runner._write_name_map`),
@@ -1001,11 +1296,16 @@ def _write_dispatch_name_map(disp_dir: Path, chip_dir: Path, cache: dict[str, di
         table: dict[str, str] = {}
         if kc.exists():
             try:
-                from simpler_setup.tools.swimlane_converter import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
-                    load_kernel_config,
-                )
+                if prebuilt:
+                    from ._prebuilt import kernel_name_map  # noqa: PLC0415
 
-                table = load_kernel_config(str(kc))
+                    table = kernel_name_map(chip_dir)
+                else:
+                    from simpler_setup.tools.swimlane_converter import (  # noqa: PLC0415
+                        load_kernel_config,
+                    )
+
+                    table = load_kernel_config(str(kc))
             except Exception as e:  # noqa: BLE001 - best-effort label resolution, never fatal
                 print(
                     f"Skipping L3 swimlane name_map for {program} ({type(e).__name__}: {e}); "
@@ -1023,13 +1323,15 @@ def _write_dispatch_name_map(disp_dir: Path, chip_dir: Path, cache: dict[str, di
     return name_map_path
 
 
-def _collect_l3_swimlane(output_dir: Path, platform: str) -> None:
+def _collect_l3_swimlane(output_dir: Path, platform: str, *, run_directory: Path | None = None) -> None:
     """Convert each dispatch's swimlane records into a ``merged_swimlane_*.json``.
 
     The runtime writes ``rank{r}/d{k}/deps.json`` in the graph pass and
-    ``rank{r}/d{k}/chip_swimlane_records.json`` in the clean timing pass
-    (the directory is namespaced by card *and* the card's k-th dispatch, and
-    both passes restart that numbering). Globbing ``rank*`` — rather
+    ``rank{r}/d{k}/chip_swimlane_records.json`` in the clean timing pass. The
+    directory is namespaced by card *and* by the child's own capture counter,
+    which spans the process rather than restarting per run — so those two files
+    belong to one dispatch but sit in two directories, and
+    :func:`_pair_rank_captures` is what joins them. Globbing ``rank*`` — rather
     than iterating a rank count — picks up
     whichever cards actually ran, so a comm-less / single-card L3 program (which never
     creates ``rank{0..n}``) still has its records converted. This best-effort
@@ -1075,7 +1377,7 @@ def _collect_l3_swimlane(output_dir: Path, platform: str) -> None:
     # ``_write_dispatch_name_map`` so each config is loaded once per run.
     name_map_cache: dict[str, dict[str, str]] = {}
 
-    dfx_base = output_dir / "dfx_outputs"
+    dfx_base = (output_dir if run_directory is None else run_directory) / "dfx_outputs"
     # See the docstring for why we glob rather than iterate a rank count.
     # 3.10-safe dir filter (``glob`` directory filtering is only reliable on 3.11+).
     rank_dirs = sorted(d for d in dfx_base.glob(_RANK_DIR_GLOB) if d.is_dir())
@@ -1083,6 +1385,12 @@ def _collect_l3_swimlane(output_dir: Path, platform: str) -> None:
         # One card may have run several dispatches: ``<rank>/d0``, ``d1``, ...
         # Match only ``d`` + digits (the names the runtime emits) so an
         # unrelated diagnostic dir under rank_dir is never picked up.
+        # One pairing per card: which graph capture belongs to which timing
+        # capture is a property of the two passes' dispatch sequences, not of a
+        # directory on its own. Fold the pairs back together before listing the
+        # directories, so what follows sees one directory per dispatch.
+        pairs = _pair_rank_captures(rank_dir)
+        _consolidate_two_pass_captures(rank_dir, pairs)
         dispatch_dirs = sorted(d for d in rank_dir.glob(_DISPATCH_DIR_GLOB) if d.is_dir())
         for disp_dir in dispatch_dirs:
             records = disp_dir / _CHIP_SWIMLANE_RECORDS_NAME
@@ -1101,7 +1409,10 @@ def _collect_l3_swimlane(output_dir: Path, platform: str) -> None:
                 # between ``--func-names``, ``-k`` and the sibling turns out to be.
                 for stale in disp_dir.glob("name_map*.json"):
                     stale.unlink(missing_ok=True)
+                deps_json, graph_dir = _resolve_capture_graph(rank_dir, disp_dir, pairs)
                 program = _read_dispatch_program(disp_dir)
+                if program is None and graph_dir is not None:
+                    program = _read_dispatch_program(graph_dir)
                 if program is None and len(chip_dirs) == 1:
                     # One L2 program in the build: no ambiguity to resolve, so an
                     # unmarked dispatch (e.g. artifacts from an older run) can
@@ -1124,8 +1435,16 @@ def _collect_l3_swimlane(output_dir: Path, platform: str) -> None:
                     # ``name_map`` passed as ``func_names`` takes precedence —
                     # both must name the program that ran this dispatch.
                     work_dir = chip_dirs[program]
-                    name_map_path = _write_dispatch_name_map(disp_dir, work_dir, name_map_cache)
-                _generate_swimlane(work_dir, disp_dir, records, func_names=name_map_path)
+                    if run_directory is None:
+                        name_map_path = _write_dispatch_name_map(disp_dir, work_dir, name_map_cache)
+                    else:
+                        name_map_path = _write_dispatch_name_map(
+                            disp_dir, work_dir, name_map_cache, prebuilt=True
+                        )
+                if run_directory is not None:
+                    # Never pass immutable Python sources to the converter's bytecode loader.
+                    work_dir = run_directory
+                _generate_swimlane(work_dir, disp_dir, records, func_names=name_map_path, deps_json=deps_json)
             except Exception as e:  # noqa: BLE001 - best-effort post-pass, never fatal
                 print(
                     f"Skipping L3 swimlane conversion for {disp_dir.name} of {rank_dir.name} "
@@ -1141,7 +1460,7 @@ def _is_simpler_tensor(arg: Any) -> bool:
     """
     try:
         from .task_interface import (  # noqa: PLC0415
-            Tensor,  # pyright: ignore[reportAttributeAccessIssue]
+            Tensor,
         )
     except ImportError:
         return False
@@ -1162,7 +1481,7 @@ def _make_dispatch_orchestration(
     # binds ``pld.system.world_size()`` to this kwarg uniformly across comm
     # and comm-less paths.
 
-    def orch_fn(orch, _unused_args, _unused_cfg):
+    def orch_fn(orch: Any, _unused_args: Any, _unused_cfg: Any) -> None:
         # Reset the per-card DFX dispatch counter at the start of every run so
         # a card's dispatches are numbered ``d0, d1, ...`` fresh each pass.
         # Two-pass swimlane reissues the same dispatch order, so pass 1
@@ -1239,7 +1558,9 @@ def _dispatch(
     native_handle.result()
 
 
-def _execute_distributed(
+# Reached only through function-scope lazy imports (pyright's unused analysis
+# discounts cross-module references to private symbols).
+def _execute_distributed(  # pyright: ignore[reportUnusedFunction]
     compiled: DistributedCompiledProgram,
     coerced_args: Sequence[torch.Tensor | DeviceTensor | StackedDeviceTensor],
     config: RunConfig | None = None,
@@ -1355,7 +1676,7 @@ def _execute_distributed(
             if w is not None:
                 _close_local_worker(w)
 
-    dfx_base = output_dir / "dfx_outputs"
+    dfx_base = _run_directory(compiled) / "dfx_outputs"
     swimlane = config is not None and config.enable_chip_swimlane > 0
 
     # Scope DFX artifacts to this run: drop any stale ``rank*/d{k}`` dirs from an
@@ -1374,20 +1695,20 @@ def _execute_distributed(
 
     # Offline post-pass (reads the per-dispatch deps.json + records on disk).
     if swimlane:
-        _collect_l3_swimlane(output_dir, compiled.platform)
+        _collect_program_swimlane(compiled)
 
 
 _EXECUTE_DISTRIBUTED_COMPILED_DEPRECATION = (
     "pypto.runtime.execute_distributed_compiled is deprecated; reconstruct the "
     "artifact and call it: ir.DistributedCompiledProgram.from_dir(output_dir, "
-    "platform=...)(*args, config=...). The directory-driven function will be "
+    "backend_type=..., execution_mode=...)(*args, config=...). The directory-driven function will be "
     "removed in a future release."
 )
 
 
 def execute_distributed_compiled(
     output_dir: str | Path,
-    args: Sequence[torch.Tensor | DeviceTensor | StackedDeviceTensor | ctypes._SimpleCData],
+    args: Sequence[torch.Tensor | DeviceTensor | StackedDeviceTensor | ctypes._SimpleCData[Any]],
     config: RunConfig | None = None,
     *,
     platform: str | None = None,
@@ -1411,7 +1732,12 @@ def execute_distributed_compiled(
         execute_distributed_compiled(work_dir, args, config=cfg, platform="a2a3")
 
         # after
-        ir.DistributedCompiledProgram.from_dir(work_dir, platform="a2a3")(*args, config=cfg)
+        from pypto.backend import BackendType
+        from pypto.runtime import ExecutionMode
+
+        ir.DistributedCompiledProgram.from_dir(
+            work_dir, backend_type=BackendType.Ascend910, execution_mode=ExecutionMode.ONBOARD,
+        )(*args, config=cfg)
 
     Emits a :class:`DeprecationWarning`; behaviour is unchanged.
 
@@ -1724,7 +2050,7 @@ class DistributedWorker(Worker):
             prewarm_cc = self._states[primary]["call_config"]
             if config is not None:
                 prewarm_cc = _make_call_config(
-                    primary._distributed_config, config, dfx_base=primary.output_dir / "dfx_outputs"
+                    primary._distributed_config, config, dfx_base=_run_directory(primary) / "dfx_outputs"
                 )
             self._w.init(prewarm_config=prewarm_cc)
 
@@ -1836,12 +2162,12 @@ class DistributedWorker(Worker):
 
     def _accepted_native_handles(self) -> set[Any] | None:
         """Snapshot Simpler's accepted set for interruption recovery."""
-        handles = getattr(self._w, "_accepted_run_handles", None)
+        handles: Any = getattr(self._w, "_accepted_run_handles", None)
         lifecycle_cv = getattr(self._w, "_hierarchical_start_cv", None)
         if not isinstance(handles, set) or lifecycle_cv is None:
             return None
         with lifecycle_cv:
-            return set(handles)
+            return set(cast("set[Any]", handles))
 
     def _recover_accepted_native_handle(self, before: set[Any] | None) -> Any | None:
         """Recover the sole handle accepted while one serialized submit ran."""
@@ -1905,7 +2231,7 @@ class DistributedWorker(Worker):
         if not self._persistent:
             return
         live_domains = getattr(self._w, "_live_domains", None)
-        missing = []
+        missing: list[str] = []
         if not isinstance(live_domains, dict):
             missing.append("_live_domains")
         if not hasattr(self._w, "_building_run_resources"):
@@ -2005,6 +2331,8 @@ class DistributedWorker(Worker):
             raise RuntimeError(
                 "persistent distributed execution requires Simpler's active per-run CommDomain journal"
             )
+        live_domains = cast("dict[str, Any]", live_domains)
+        run_live_domains = cast("dict[str, Any]", run_live_domains)
         with domain_lock:
             if bool(getattr(resources, "retired", False)):
                 raise RuntimeError("persistent CommDomain cannot be retained from an already-retired run")
@@ -2208,9 +2536,9 @@ class DistributedWorker(Worker):
     def malloc(self, nbytes: int, *, worker_id: int = 0) -> int:
         """Allocate ``nbytes`` on chip *worker_id*; returns a device pointer."""
         self._require_open("malloc")
-        if not isinstance(nbytes, int) or nbytes <= 0:
+        if type(nbytes) is not int or nbytes <= 0:
             raise ValueError(f"nbytes must be a positive int, got {nbytes!r}")
-        from simpler.task_interface import DataType  # pyright: ignore[reportMissingImports]  # noqa: PLC0415
+        from simpler.task_interface import DataType  # noqa: PLC0415
 
         handle = self._w.alloc_child_tensor(worker_id, (nbytes,), DataType.UINT8)
         try:
@@ -2331,7 +2659,7 @@ class DistributedWorker(Worker):
         for entry in listed:
             is_marked = isinstance(entry, ReadOnlyHostTensor)
             tensor = entry.tensor if is_marked else entry
-            if not isinstance(tensor, torch.Tensor):
+            if not isinstance(tensor, torch.Tensor):  # pyright: ignore[reportUnnecessaryIsInstance] -- mistyped-input guard
                 raise TypeError(
                     "DistributedWorker inherited_host_tensors entries must be torch.Tensor or "
                     f"ReadOnlyHostTensor objects, got {type(entry).__name__}."
@@ -2366,7 +2694,7 @@ class DistributedWorker(Worker):
         :class:`ReadOnlyHostTensor` keeps READ — which is what lets the ABI refuse a D2H into a
         mapping that would fault on the store.
         """
-        from simpler.buffer import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+        from simpler.buffer import (  # noqa: PLC0415
             AccessMode,
             BackendKind,
             mint_owner_instance_id,
@@ -2439,11 +2767,11 @@ class DistributedWorker(Worker):
         """H2D copy: ``nbytes`` from ``src_host_ptr + src_offset`` to ``dst_dev_ptr + dst_offset``."""
         self._require_open("copy_to")
         dst = self._device_buffer(dst_dev_ptr, worker_id, "copy_to")
-        if not isinstance(dst_offset, int) or dst_offset < 0:
+        if type(dst_offset) is not int or dst_offset < 0:
             raise ValueError(f"dst_offset must be a non-negative int, got {dst_offset!r}")
-        if not isinstance(src_offset, int) or src_offset < 0:
+        if type(src_offset) is not int or src_offset < 0:
             raise ValueError(f"src_offset must be a non-negative int, got {src_offset!r}")
-        if not isinstance(nbytes, int) or nbytes <= 0:
+        if type(nbytes) is not int or nbytes <= 0:
             raise ValueError(f"nbytes must be a positive int, got {nbytes!r}")
 
         allocation_nbytes = int(dst.nbytes)
@@ -2485,11 +2813,11 @@ class DistributedWorker(Worker):
         """D2H copy: ``nbytes`` from ``src_dev_ptr + src_offset`` to ``dst_host_ptr + dst_offset``."""
         self._require_open("copy_from")
         src = self._device_buffer(src_dev_ptr, worker_id, "copy_from")
-        if not isinstance(dst_offset, int) or dst_offset < 0:
+        if type(dst_offset) is not int or dst_offset < 0:
             raise ValueError(f"dst_offset must be a non-negative int, got {dst_offset!r}")
-        if not isinstance(src_offset, int) or src_offset < 0:
+        if type(src_offset) is not int or src_offset < 0:
             raise ValueError(f"src_offset must be a non-negative int, got {src_offset!r}")
-        if not isinstance(nbytes, int) or nbytes <= 0:
+        if type(nbytes) is not int or nbytes <= 0:
             raise ValueError(f"nbytes must be a positive int, got {nbytes!r}")
 
         allocation_nbytes = int(src.nbytes)
@@ -2589,7 +2917,7 @@ class DistributedWorker(Worker):
             via :meth:`free_stacked_tensor`.
         """
         self._require_open("alloc_stacked_tensor")
-        if not isinstance(host, torch.Tensor):
+        if not isinstance(host, torch.Tensor):  # pyright: ignore[reportUnnecessaryIsInstance] -- mistyped-input guard
             raise TypeError(
                 f"alloc_stacked_tensor(host=...) expects a torch.Tensor, got {type(host).__name__}"
             )
@@ -2705,11 +3033,11 @@ class DistributedWorker(Worker):
                 through a runtime-owned shared Buffer before copying into it.
         """
         self._require_open("copy_stacked_from")
-        if not isinstance(stacked, StackedDeviceTensor):
+        if type(stacked) is not StackedDeviceTensor:
             raise TypeError(
                 f"copy_stacked_from(stacked=...) expects a StackedDeviceTensor, got {type(stacked).__name__}"
             )
-        if not isinstance(host, torch.Tensor):
+        if not isinstance(host, torch.Tensor):  # pyright: ignore[reportUnnecessaryIsInstance] -- mistyped-input guard
             raise TypeError(f"copy_stacked_from(host=...) expects a torch.Tensor, got {type(host).__name__}")
         if tuple(host.shape) != stacked.full_shape:
             raise ValueError(
@@ -2865,7 +3193,7 @@ class DistributedWorker(Worker):
                         frame.keepalive,
                     ),
                 )
-                _collect_l3_swimlane(compiled.output_dir, compiled.platform)
+                _collect_program_swimlane(compiled)
                 self._release_unpublished_dispatch_frame(frame)
                 return DistributedRunHandle._completed(self)
 
@@ -2873,7 +3201,7 @@ class DistributedWorker(Worker):
             if config is not None and config.enable_chip_swimlane > 0:
 
                 def collect_swimlane() -> None:
-                    _collect_l3_swimlane(compiled.output_dir, compiled.platform)
+                    _collect_program_swimlane(compiled)
 
                 postprocess = collect_swimlane
             handle = DistributedRunHandle(self, None, frame, dispatch_id, postprocess)
@@ -2901,7 +3229,7 @@ class DistributedWorker(Worker):
         if config is None:
             return _make_call_config(compiled._distributed_config), None, False
 
-        dfx_base = compiled.output_dir / "dfx_outputs"
+        dfx_base = _run_directory(compiled) / "dfx_outputs"
         two_pass_swimlane = config.enable_chip_swimlane > 0 and not compiled.platform.endswith("sim")
         call_config = None
         if not two_pass_swimlane:

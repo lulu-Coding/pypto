@@ -14,6 +14,7 @@ matching IR builder in :mod:`pypto.ir.op.distributed.tile_ops`.
 """
 
 from collections.abc import Sequence
+from typing import TypeGuard
 
 from pypto.ir.op.distributed import tile_ops as _ir_tile
 from pypto.language.typing import IntLike, Tile
@@ -25,7 +26,7 @@ from ..typing.distributed_tensor import DistributedTensor
 from ._utils import _normalize_intlike, _unwrap
 
 
-def _is_region_arg(x: object) -> bool:
+def _is_region_arg(x: object) -> TypeGuard[Sequence[IntLike]]:
     """True if a positional arg in the ``stage2`` slot is actually a region tuple.
 
     The printer emits ``pld.tile.put`` / ``pld.tile.get`` region args
@@ -104,7 +105,11 @@ def remote_load(
     return Tile(expr=call)
 
 
-def _remote_load_with_physical_tail_padding(
+# Reparse target for the printer's ``pld.tile._remote_load_with_physical_tail_padding``
+# spelling (python_printer.cpp emits it when a remote_load carries physical tail
+# padding); the parser resolves printed ``pld.tile.*`` names by attribute lookup,
+# which pyright's unused analysis cannot see.
+def _remote_load_with_physical_tail_padding(  # pyright: ignore[reportUnusedFunction]
     target: DistributedTensor,
     peer: IntLike,
     offsets: Sequence[IntLike],
@@ -177,7 +182,7 @@ def remote_store(
         atomic: :class:`pld.AtomicType` selecting plain-store
             (``AtomicType.None_``, the default) vs atomic-add combine semantics
             on the peer's region (keyword-only). ``AtomicType.Add`` into a bf16
-            window requires the Ascend910B (A2/A3) profile, the same restriction
+            window requires the Ascend910 (A2/A3) profile, the same restriction
             :func:`pl.tile.store` carries.
 
     Returns:
@@ -203,7 +208,7 @@ def put(
     peer: IntLike,
     src: DistributedTensor | Tensor,
     stage: Tile,
-    stage2: Tile | None = None,
+    stage2: Tile | Sequence[IntLike] | None = None,
     dst_offsets: Sequence[IntLike] | None = None,
     src_offsets: Sequence[IntLike] | None = None,
     shape: Sequence[IntLike] | None = None,
@@ -262,7 +267,7 @@ def get(
     peer: IntLike,
     src: DistributedTensor,
     stage: Tile,
-    stage2: Tile | None = None,
+    stage2: Tile | Sequence[IntLike] | None = None,
     dst_offsets: Sequence[IntLike] | None = None,
     src_offsets: Sequence[IntLike] | None = None,
     shape: Sequence[IntLike] | None = None,

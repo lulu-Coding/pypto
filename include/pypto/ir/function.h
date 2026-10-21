@@ -66,6 +66,23 @@ enum class FunctionType : uint8_t {
   Graph = 8           ///< Recordable/replayable orchestration fragment
 };
 
+/** @brief Function body representation, independent of its execution context. */
+enum class FunctionIRStage : uint8_t {
+  Functional = 0,  ///< Tensor/Tile value semantics (default)
+  Buffer = 1,      ///< Explicit storage handles and destination writes
+};
+
+/** @brief Convert the function body representation to a diagnostic name. */
+inline std::string FunctionIRStageToString(FunctionIRStage stage) {
+  switch (stage) {
+    case FunctionIRStage::Functional:
+      return "Functional";
+    case FunctionIRStage::Buffer:
+      return "Buffer";
+  }
+  throw pypto::TypeError("Unknown FunctionIRStage");
+}
+
 /**
  * @brief Hierarchy level in the Linqu machine model
  *
@@ -413,6 +430,11 @@ inline ParamDirection StringToParamDirection(const std::string& str) {
  */
 inline constexpr const char* kAttrSpmdUnwrapped = "spmd_unwrapped";
 
+// Immutable whole-kernel selection written by SelectBufferIRFunctions before
+// storage legalization. Read by storage passes, verifiers and final lowering;
+// retained through serialization. Absence denotes a low-level pass pipeline.
+inline constexpr const char* kAttrBufferIrSelected = "buffer_ir_selected";
+
 /**
  * @brief Reserved Function attr key marking an AIV kernel that runs on BOTH
  * vector sub-lanes of a mixed kernel.
@@ -442,27 +464,15 @@ inline constexpr const char* kAttrDualAivDispatch = "dual_aiv_dispatch";
  * ``LowerAutoVectorSplit`` (pass 23) on the functions it lowers. Read by
  * ``SplitVectorKernel`` (pass 26, to stamp ``dual_aiv_dispatch`` without
  * re-halving an already-lowered body), ``MemoryReuse`` (pass 36 — it gates the
- * Ascend910B ``tile.load`` + ``tpop_from_aic`` in-place hazard guard) and
+ * Ascend910 ``tile.load`` + ``tpop_from_aic`` in-place hazard guard) and
  * ``VerifyAivSplit`` (provenance for the boundary-op checks). Never stripped.
  *
  * ``MemoryReuse`` keys on this marker rather than on ``Function::GetSplitMode``
  * precisely because a multi-mode region function has no single function-level
- * mode once pass 23 has lowered and erased the per-region ones — dropping the
+ * mode after region consumption in ExpandMixedKernel — dropping the
  * marker there silently disables a hardware-correctness guard.
  */
 inline constexpr const char* kAttrSplitAiv = "split_aiv";
-
-/**
- * @brief Reserved Function attr key recording that ``pl.split_aiv`` regions were
- * already transpose-hazard-checked per region.
- *
- * Value type: ``bool``. Written by ``LowerAutoVectorSplit`` (pass 23), which
- * validates each region against its own unambiguous mode. Read by
- * ``ExpandMixedKernel`` (pass 24) to skip its single-function-mode transpose
- * check, which would otherwise mis-check a multi-mode function against whichever
- * mode happened to be stamped function-level. Never stripped.
- */
-inline constexpr const char* kAttrSplitAivRegionValidated = "split_aiv_region_validated";
 
 /**
  * @brief Reserved Function attr key naming a hand-written external C++ kernel
@@ -551,12 +561,13 @@ class Function : public IRNode {
    * @param requires_runtime_binding True for SubWorkers declared with an
    *        abstract (`...`) body — the implementation is supplied at runtime
    *        rather than captured at compile time (default: false)
+   * @param ir_stage Body representation (default: Functional)
    */
   Function(std::string name, std::vector<VarPtr> params, std::vector<ParamDirection> param_directions,
            std::vector<TypePtr> return_types, StmtPtr body, Span span,
            FunctionType type = FunctionType::Opaque, std::optional<Level> level = std::nullopt,
            std::optional<Role> role = std::nullopt, std::vector<std::pair<std::string, std::any>> attrs = {},
-           bool requires_runtime_binding = false)
+           bool requires_runtime_binding = false, FunctionIRStage ir_stage = FunctionIRStage::Functional)
       : IRNode(std::move(span)),
         name_(std::move(name)),
         params_(std::move(params)),
@@ -567,7 +578,13 @@ class Function : public IRNode {
         level_(level),
         role_(role),
         attrs_(std::move(attrs)),
-        requires_runtime_binding_(requires_runtime_binding) {
+        requires_runtime_binding_(requires_runtime_binding),
+        ir_stage_(ir_stage) {
+    CHECK_SPAN(ir_stage_ == FunctionIRStage::Functional || ir_stage_ == FunctionIRStage::Buffer, span_)
+        << "Invalid FunctionIRStage value: " << static_cast<int>(ir_stage_);
+    for (const auto& return_type : return_types_) {
+      detail::CheckValueType(return_type, span_, "Function return type; use an empty return_types list");
+    }
     CHECK(params_.size() == param_directions_.size())
         << "params and param_directions must have same size, got " << params_.size() << " vs "
         << param_directions_.size();
@@ -603,7 +620,7 @@ class Function : public IRNode {
   /**
    * @brief Get field descriptors for reflection-based visitation
    *
-   * @return Tuple of field descriptors (params as DEF field, func_type, level, role, attrs,
+   * @return Tuple of field descriptors (params as DEF field, func_type, ir_stage, level, role, attrs,
    *         return_types and body as USUAL fields, name as an IGNORE field)
    */
   static constexpr auto GetFieldDescriptors() {
@@ -613,6 +630,7 @@ class Function : public IRNode {
             reflection::DefField(&Function::params_, "params"),
             reflection::UsualField(&Function::param_directions_, "param_directions"),
             reflection::UsualField(&Function::func_type_, "func_type"),
+            reflection::UsualField(&Function::ir_stage_, "ir_stage"),
             reflection::UsualField(&Function::level_, "level"),
             reflection::UsualField(&Function::role_, "role"),
             reflection::UsualField(&Function::attrs_, "attrs"),
@@ -629,10 +647,11 @@ class Function : public IRNode {
   std::optional<Role> role_;                             // Function role (nullopt = default per level)
   std::vector<std::pair<std::string, std::any>> attrs_;  // Function-level attributes (key-value metadata)
   bool requires_runtime_binding_ = false;  // SubWorker with abstract (`...`) body: impl bound at runtime
-  std::vector<VarPtr> params_;             // Parameter variables
-  std::vector<ParamDirection> param_directions_;  // Parameter directions (same length as params_)
-  std::vector<TypePtr> return_types_;             // Return types
-  StmtPtr body_;                                  // Function body statement
+  FunctionIRStage ir_stage_ = FunctionIRStage::Functional;  // Body representation, not execution context
+  std::vector<VarPtr> params_;                              // Parameter variables
+  std::vector<ParamDirection> param_directions_;            // Parameter directions (same length as params_)
+  std::vector<TypePtr> return_types_;                       // Return types
+  StmtPtr body_;                                            // Function body statement
 
   /**
    * @brief Get a typed attribute value

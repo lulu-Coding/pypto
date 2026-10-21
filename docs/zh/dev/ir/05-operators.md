@@ -1,5 +1,9 @@
 # 算子系统
 
+> **旧 Python 接口示例：** 本页为兼容现有用法保留 `platform=` 调用，
+> 这些调用会发出 `DeprecationWarning`；新代码应使用 `backend_type` 和
+> `execution_mode`。参见[目标映射](../08-entry-points.md#迁移旧-platform-示例)。
+
 类型 (Type) 安全的算子定义，支持自动类型推导，按模块化分类组织（TensorOp、TileOp、SyncOp、CrossCoreOp）。
 
 ## 算子分类
@@ -8,11 +12,111 @@
 | ---- | ---- | ---- | -------- |
 | **TensorOp** | TensorType | 支持广播的 N 维张量 (Tensor) 操作 | `src/ir/op/tensor_ops/` |
 | **TileOp** | TileType | 硬件优化的 Tile 操作 | `src/ir/op/tile_ops/` |
+| **BufferOp** | BufferType, VoidType | 内部显式存储与目标写入 | `src/ir/op/buffer_ops/` |
 | **SyncOp** | UnknownType（屏障）；ScalarType（task / 启动形状查询） | 流水线屏障、同步、TaskId 与 SPMD 启动形状查询 | `src/ir/op/sync_ops/` |
 | **CrossCoreOp** | UnknownType/TileType | AIC↔AIV 跨核通信 | `src/ir/op/sync_ops/cross_core.cpp` |
 | **PrefetchOp** | 不透明句柄 (opaque handle) | GM→L2 异步预取 | `src/ir/op/prefetch/prefetch_async.cpp` |
 
 **主要特性**：流式 API、自动类型推导、kwargs 元数据、NumPy 风格广播、类型提升、动态维度（`kDynamicDim`）
+
+内部 Buffer 阶段的 GM 与加法算子不提供公开 DSL 包装：
+
+| 算子 | 位置操作数 | 结果 |
+| ---- | ---------- | ---- |
+| `buffer.load` | GM tensor、offsets tuple、valid extents tuple、目标 buffer | Void |
+| `buffer.store` | 源 buffer、offsets tuple、valid extents tuple、GM tensor | Void |
+| `buffer.add` | lhs buffer、rhs buffer、目标 buffer | Void |
+| `buffer.copy` | 源 buffer、目标 buffer（Vec 到 Vec，或 Mat 到 Left/Right） | Void |
+| `buffer.extract` | 源 buffer、行偏移、列偏移、目标 buffer | Void |
+| `buffer.matmul` | Left buffer、Right buffer、Acc 目标 | Void |
+| `buffer.matmul_acc` | Left buffer、Right buffer、被读写的 Acc buffer | Void |
+
+这些算子分别声明数据/元数据效应。形状、dtype、valid 状态和别名要求见
+[Buffer 契约](02-types.md#buffer-算子契约)。
+
+内部 `buffer.get_block_idx`、`buffer.get_block_num` 和 `buffer.get_subblock_idx`
+是无参数的 Buffer 阶段查询，返回 INDEX 标量（`BufferResultBehavior.Value`），没有执行期内存访问。
+它们读取既有运行时传入的 SPMD kernel 参数，由对应 Tile 查询转换产生，不提供公开 DSL 接口。
+
+### 类型化 Buffer 逐元素配方
+
+`backend/common/buffer_elementwise_recipes` 是逻辑到 Buffer 转换、显式操作数约束及
+原生助记符共用的生产表。`LowerTileToBuffer` 选择类型化配方 (typed recipe) 并创建
+实际的 Buffer 调用。直接 PTO 发射读取同一张表，不重建 Tile IR、不调用旧回调，
+也不选择存储位置。此表独立于旧后端回调注册。
+
+| 逻辑算子 | Buffer 算子 | 原生指令 | 输入 |
+| -------- | ----------- | -------- | ---- |
+| `tile.add` | `buffer.add` | `pto.tadd` | 2 |
+| `tile.mul` | `buffer.mul` | `pto.tmul` | 2 |
+| `tile.sub` | `buffer.sub` | `pto.tsub` | 2 |
+| `tile.div` | `buffer.div` | `pto.tdiv` | 2 |
+| `tile.maximum` | `buffer.maximum` | `pto.tmax` | 2 |
+| `tile.minimum` | `buffer.minimum` | `pto.tmin` | 2 |
+| `tile.abs` | `buffer.abs` | `pto.tabs` | 1 |
+| `tile.exp` | `buffer.exp` | `pto.texp` | 1 |
+| `tile.sqrt` | `buffer.sqrt` | `pto.tsqrt` | 1 |
+| `tile.neg` | `buffer.neg` | `pto.tneg` | 1 |
+| `tile.relu` | `buffer.relu` | `pto.trelu` | 1 |
+| `tile.log` | `buffer.log` | `pto.tlog` | 1 |
+| `tile.recip` | `buffer.recip` | `pto.trecip` | 1 |
+| `tile.adds` | `buffer.adds` | `pto.tadds` | buffer, scalar |
+| `tile.subs` | `buffer.subs` | `pto.tsubs` | buffer, scalar |
+| `tile.muls` | `buffer.muls` | `pto.tmuls` | buffer, scalar |
+| `tile.divs` | `buffer.divs` | `pto.tdivs` | buffer, scalar |
+| `tile.maximums` | `buffer.maximums` | `pto.tmaxs` | buffer, scalar |
+| `tile.minimums` | `buffer.minimums` | `pto.tmins` | buffer, scalar |
+| `tile.lrelu` | `buffer.lrelu` | `pto.tlrelu` | buffer, scalar |
+| `tile.full` | `buffer.full` | `pto.texpands` | scalar |
+
+每个调用以最终操作数表示目标，并返回 `Void`。源读取数据和元数据；目标写入
+有效数据区域并读取元数据。这不保证整个分配已初始化。所有 buffer 操作数必须具有
+相同的物理描述符；广播和部分合并语义由独立配方处理。这些算子仅供编译器内部
+使用，不新增公开 DSL 函数。
+
+除 `add`、`mul` 外的配方要求 FP32、1 或 2 维、静态 valid 范围、
+稠密行主序 Vec 存储、`none_box`、fractal 512，并且没有 padding 或 compact 模式。
+其 dtype 约束不会继承原生描述符格式化器的 FP16 支持。`add`/`mul` 要求
+FP16/FP32/INT32 操作数。自动转换及普通 GM 传输支持静态二维
+FP16/BF16/FP32/INT32 描述符；BF16 算术需要独立的原生配方。
+Ascend910 与 Ascend950 都使用这些契约。
+
+公开 `tile.full` 包装器同时接受数值字面量和已解析的标量常量，位置参数与关键字参数
+得到一致结果。浮点目标的整数占位常量使用 `ConstFloat`；显式指定类型的常量保留
+原始 dtype，直到降低阶段转换。Python 打印器将 `tile.full` 填充常量输出为
+`pl.const(value, dtype)`，使打印后重新解析仍保留填充值自身的 dtype，而不依赖 tile
+的 dtype。运行时填充值仍不支持。
+
+在 Buffer call 边界，标量操作数必须匹配目标元素 dtype，且不具有内存效果。
+降低阶段在构造该 call 之前转换受支持的源标量表达式，为有符号整数、
+INDEX、FP16、BF16 和 FP32 插入显式 `Cast`；INDEX 先转换为 INT64。
+其他标量源类型仍不支持。`tile.full(shape, dtype=..., value=...)` 的 shape/dtype
+用于选择目标，随后生成 `buffer.full(value_f32, destination)`。代码生成不修复标量类型：
+
+```python
+# Logical input: result = tile.adds(value, count_i32)
+scalar_f32 = ir.Cast(count_i32, DataType.FP32, span)
+# Buffer IR diagnostic notation; the internal op has no public DSL wrapper.
+buffer.adds(value_buffer, scalar_f32, result_buffer)  # -> Void
+```
+
+`div`、`log`、`recip` 保留可选布尔 kwarg `high_precision`。配方选择相应的原生
+精度属性，false 使用原生默认值，不隐式引入 workspace、复制或分配。`recip`
+要求源与目标存储不重叠，构造时拒绝两个位置使用同一句柄。`BufferIR` 验证对
+表中每个配方检查不同句柄的已分配范围：拒绝部分重叠，仅支持精确原地执行的
+配方可接受完全相同的窗口。独立的无地址分配不重叠；未知存储来源或位置需要
+后续配方。常量标量地址定义通过记忆化及整数位宽检查求值。直接发射消费此已
+验证约束，不执行分配或别名分析。
+
+表中配方接受 valid extent 为静态或运行时（`-1`）的稠密描述符；原生指令读取每个句柄
+当前的 valid 元数据，执行时各操作数的元数据必须一致。
+
+整数/位运算、`rsqrt` 及其可选 workspace、部分合并、广播、归约、
+随机生成和其他布局仍属于独立迁移工作。公开 API
+`backend.get_buffer_elementwise_recipe_names()` 从实际生产表返回排序的独立快照。
+列出的名称仅代表上述受限配方，不代表逻辑算子的全部形式。测试覆盖公开流水线
+转换、二进制往返、BufferIR 验证、显式目标身份和原生编译；这些验证不替代设备
+数值验收。
 
 ## 类型系统
 
@@ -50,119 +154,8 @@ auto dynamic_dim = make_int(kDynamicDim);
 
 ### 参数效应（Argument effects）
 
-> 消费这些声明的整条链见
-> [参数方向推导](08-param-directions.md)。
-
-原地更新某个参数的算子必须显式声明。方向推导（direction inference）、依赖分析
-（dependency analysis）和参数方向验证器都向注册表询问同一个问题——*这次调用是否
-写入该参数所指的缓冲区？*——而从未回答过的算子会被读成纯消费者：
-
-```text
-tile.mscatter 写 output_tensor，却从未声明
-  → 它写入的参数方向停留在 In
-  → 不会对读取它的 kernel 发出 RAW 边
-  → 调度器可以先运行读方
-  → 读到陈旧数据，或等待一个无人写入的信号而死锁
-```
-
-| 效应 | 含义 | 示例 |
-| ---- | ---- | ---- |
-| `ArgEffect::Read` | 只读，从不写入。未声明参数的默认值 | `tile.store` 的源 tile |
-| `ArgEffect::Write` | 覆盖写，写前不读 | `tile.store` 的 `output_tensor`、`pld.tile.get` 的 `dst` |
-| `ArgEffect::ReadWrite` | 既读*又*写 | `tile.matmul_acc` 的累加器、原子 store 的目的操作数 |
-
-**部分覆盖仍然是 `Write`。** 只写入子区域的 store 不会读取未触及的其余部分——没有
-任何数据流*进*内核——所以其目的操作数是纯写。把它声明成 `ReadWrite` 并非无害的保守
-近似：这会让外层参数变成 `InOut`，从而触发 host→device 搬运，并且在跨 rank 场景下
-为两个写入不相交行的 rank 凭空造出一条依赖。
-
-目的操作数是否被读取按**算子**判定，而非按家族：gather / exchange 的目的窗口只被推入、
-从不被 load，因此是 `Write`；而 reduce 的目的窗口会把运行值 load 回来，因此是 `ReadWrite`。
-
-**`ReadWrite` 留给真正会读取该槽位的算子**：累加器（`out += x` 会读取运行中的和）、
-原子 store/assemble，或那些未触及位置会流入 SSA 结果的 destination-passing 算子
-（`tile.scatter`、`array.update_element`）。
-
-**由 kwarg 决定的效应。** 当答案取决于某个 kwarg 时，传入 resolver 而非常量。kwarg 不
-仅能决定*怎么*写，还能决定某个实参*是否*被写：`tile.mgather` 的第三个操作数在 Mat elem
-模式下是被写的 GM scratch，在 Mat row 模式下则是只读的 `valid_shape`。另外两处是 store
-家族的 `atomic` kwarg，以及 `pld.system.notify` 的 `op` kwarg——后者默认是 atomic-add，
-因此未加标注的 notify 会读取它累加的槽位：
-
-```cpp
-REGISTER_OP("tile.store")
-    // ... arguments, memory spec ...
-    .set_arg_effect(2,
-                    [](const std::vector<std::pair<std::string, std::any>>& kwargs) {
-                      return GetIntKwarg(kwargs, "atomic", static_cast<int>(AtomicType::kNone)) ==
-                                     static_cast<int>(AtomicType::kNone)
-                                 ? ArgEffect::Write
-                                 : ArgEffect::ReadWrite;
-                    })
-    .set_write_channel(WriteChannel::Dma)
-```
-
-**"已声明为只读"不等于"未分类"。** `HasDeclaredArgEffects()` 区分"有人判定该算子不
-写入任何参数"（`no_arg_writes()`，例如 `pld.system.wait`）与"还没有人看过这个算子"。
-需要答案的分析因而可以拒绝猜测，而不是把未分类的写者默认成只读。
-
-**强制约束。** `OpRegistry::ValidateArgEffects()` 在 import 时运行，拒绝两种形态，
-一次性列出所有违规算子和修复方式，而不是等到首次使用才失败：
-
-- 声明了 `set_output_reuses_input(N)`（其 SSA 结果*就是*第 N 个参数的缓冲区，因此会
-  通过它写入），却没有专门对第 N 个参数作出裁决。要求的是"做出分类"而非某个特定答案：
-  原地槽位是元数据的算子可以声明为只读。
-- 声明了写通路却不通过任何参数写入。通路描述的是"怎么写"，因此没有写的通路要么是多余
-  声明，要么是漏了声明。
-
-第二条比看上去重要。`set_write_channel()` 会顺带创建效应 spec，因此"spec 存在"不能
-等同于"有人做过判断"——否则一个声明了通路却忘了 `set_arg_effect` 的算子会通过第一条
-检查，而它原地更新的那个参数仍然默认为 `Read`。`no_arg_writes()` 显式记录"对所有参数
-的裁决"，且与 `set_arg_effect` 同时使用会被判为自相矛盾而拒绝。
-
-`set_write_channel` 记录写入走的是 MTE3/DMA 通路还是标量 D-cache 通路。PyPTO 无法为
-同一个 GM tensor 排序这两者，因此会拒绝在同一缓冲区上混用两者的函数；有了通路声明，
-该诊断可以查询注册表而不必再列一遍算子清单。
-
-只为写入确实走这两条通路之一的算子声明它，其余一律留空——留空会把该算子排除在该诊断
-之外，而当两条通路都无法描述它时，这正是它该待的位置：
-
-- `pld.system.notify` 发出的是 `pto.comm.tnotify`，一条独立的 comm 指令。声明任一通路
-  都会让该诊断拒绝合法程序。
-- `system.set_ffts` 是把 workspace *指针*交给 FFTS 单元，而非搬运数据；该区域由硬件按
-  自己的节奏写入，没有任何依赖边能建模它。它声明 `no_arg_writes()`。
-- 复合集合通信通过不同机制更新数据窗口与 signal，单个算子级通路无法同时描述两者。
-  按参数记录通路可以做到，但目前没有任何用例需要这种区分，而一个错误的单一答案比没有
-  答案更糟。
-
-**`set_core_affinity` 与 `set_no_duplicate`** —— 两个正交的维度，选错会对 ISA
-做出错误的断言：
-
-- `set_core_affinity(...)` 回答算子在*哪个*核上运行。只有当硬件确实把算子限制在
-  某一侧时才声明。未声明时，`ClassifyCallAffinity` 从调用本身推导放置位置
-  （先看 memory spec，再看第一个 tile 参数的内存空间），最终回退到 `SHARED`。
-- `set_no_duplicate()` 回答算子是否允许在*第二个*核上运行。`ExpandMixedKernel` 会把
-  `SHARED` 语句复制到 AIC 和 AIV 两条通路上；当这份副本会改变程序语义时，标记该算子。
-
-`pld.system.notify` 是典型例子，而其风险在于**从错误的通路上提前释放**，而非不幂等：
-AIC 上的那份副本可能在 AIV 通路的 TPUT 尚未把该信号所释放的数据落盘之前就发布信号，
-于是对端 rank 读到过期数据。正因如此该标记是无条件的 —— 尽管只有原子加会重复计数，
-`NotifyOp::kSet` 触发的竞态与原子加完全相同。
-
-兄弟算子 `pld.system.wait` **不标记**，且是有意为之：TWAIT 会*阻塞*，它出现在 cube
-通路上是有实际作用的。把它钉在向量通路上，会让 matmul 越过它本应等待的对端数据。
-请把该标记读作「不得在第二个核上运行」，而不是「不幂等」。
-
-读取该维度的查询是 `IsNoDuplicate()`。它唯一的消费者是 `LowerAutoVectorSplit`
-（pass 23）的 `pl.split_aiv` 区域放置标记：该 pass 恰好把区域内的 no-duplicate 调用
-钉在 AIV 通路上。没有任何 verifier 在这个维度上做拒绝。
-
-被 `set_core_affinity(...)` 固定在单条通路上的算子本来就不会被复制，因此无需该标记。
-这个标记正是为核无关（core-agnostic）的算子准备的 —— 对它们而言，没有任何 affinity
-取值能表达「两个核都能跑，但不能两个核都跑」。请注意这是关于**核**的断言，而不是关于
-总执行次数的断言：在 `dual_aiv_dispatch` 下，AIV 函数体仍然会在两条 AIV sub-lane 上都
-运行，因此把算子挡在 cube 通路之外并不意味着它只执行一次。那一部分属于作者的职责，
-文档见[作用域 → pl.split_aiv](../../user/language/04-scopes.md)。
+参数访问声明、写通道及核放置/复制契约见[算子效应](10-operator-effects.md)。
+Buffer 阶段效应见 [Buffer 契约](02-types.md#buffer-算子契约)。
 
 **类型推导签名：**
 
@@ -229,7 +222,17 @@ REGISTER_OP("tensor.matmul")
     .f_deduce_type(DeduceMatMul);
 ```
 
-对于二维 `tile.matmul`，物理装箱后的 K 维必须一致。PTO 从 lhs 的有效 K 推导收缩范围，
+对于两个普通二维 tensor，`tensor.matmul` 保留物理输出 shape `[lhs M, rhs N]`，并推导
+`valid_shape=[lhs valid M, rhs valid N]`。两者采用 `a_trans`/`b_trans` 指定的相同轴映射。
+输入省略有效形状时使用完整 shape；全有效结果仍规范化为无 view 的类型。有效 M/N 可以是
+符号表达式，推导会保留表达式。输出拥有新存储，不继承输入的 stride、布局或 padding 元数据。
+
+例如物理 `[32,128]`、有效 `[17,128]` 与物理 `[128,32]`、有效 `[128,24]` 相乘，得到
+物理 `[32,32]`、有效 `[17,24]`，可以直接 assemble 到 `[17,24]` 目标，无需
+`pl.set_validshape`。这只是元数据推导，不新增 padding、清零或 K padding 硬件支持。
+一维、batched、distributed-window 和 `tensor.matmul_acc` 的类型推导保持不变。
+
+对于上述二维 tensor 形式以及 `tile.matmul`，物理装箱后的 K 维必须一致。PTO 从 lhs 的有效 K 推导收缩范围，
 因此该范围可以小于 rhs 的有效 K，但必须被后者包含。`tile.matmul_acc` 同样要求物理
 M/N/K 装箱严格兼容，同时允许累加器的有效 M/N 矩形以及 rhs 的有效 K 包含 PTO 根据
 lhs M/K 与 rhs N 实际计算的较小矩形。
@@ -286,7 +289,7 @@ init 操作数。由于 `matmul_acc` 是原地操作（`set_output_reuses_input(
 
 「字面量」涵盖常量谓词到达 emitter 时的**两种**形态：DSL 写法 `init_cond=True`/
 `False` 到达时是 BOOL 类型的 `ConstInt`，而被更早的 pass 折叠过的谓词到达时是
-`ConstBool` —— 当 [`LowerPipelineLoops`](../passes/31-lower_pipeline_loops.md)
+`ConstBool` —— 当 [`LowerPipelineLoops`](../passes/32-lower_pipeline_loops.md)
 复制 K-loop *且*外层循环被消除、每个副本的索引成为字面量时，生成的 `ko == 0` 正是
 这种形态。两者都会直接选定一个分支；若 emitter 只折叠其中一种，未覆盖到的每个 K
 block 都会发出双倍 MAD。
@@ -345,10 +348,10 @@ dtype。PyPTO 在 Ascend950 上通过 `matmul_mx` 算子族支持 host-prequant 
 
 | IR / DSL | 说明 |
 | -------- | ---- |
-| `tile.load` 读取 `pl.Tensor[..., pl.MX_A_ZZ \| pl.MX_B_NN]` | 源 TensorLayout 携带 MX scale GM layout。dtype 为 FP8E8M0 或 UINT8，必须指定 `target_memory=Mat`，且不支持 strided source。 |
+| `tile.load` 读取 `pl.Tensor[..., pl.MX_A_ZZ \| pl.MX_B_NN]` | 源 TensorLayout 携带 MX scale GM layout。dtype 为 FP8E8M0，且不支持 strided source。公开 `pl.load` 在省略 target 时默认为 `Mat`；原始 IR 必须携带 `target_memory=Mat`。 |
 | `tile.move(..., target_memory=LeftScale/RightScale)` | Mat→Scale move；硬件 layout 固定为左侧 row/row/32、右侧 col/col/32，源 Mat tile 与 layout override 必须完全匹配。 |
 | `tile.create(..., target_memory=LeftScale/RightScale)` | 不支持；应先把 MX scale 数据加载到 Mat，再 move 到 scale 内存。 |
-| `tile.matmul_mx` / `pl.matmul_mx` | `Left, LeftScale, Right, RightScale → Acc`；进入算子的两块 data operand 必须都是 `FP8E4M3FN`，scale 为 `FP8E8M0`。支持的 FP4 输入形式仅为左侧 FP4×右侧 FP8，且必须先显式写 `pl.cast(fp4, pl.FP8E4M3FN)`；原生 FP4×FP4 与反向 FP8×FP4 会被拒绝。Physical M/K/N、valid K 与 scale-group 数均以 cast 后进入算子的 FP8 tile extent 为准，不使用 packed x2 carrier shape。Physical `M % 16 == 0`、`K % 64 == 0`、`N % 32 == 0`；valid K 必须满足 `ceil(validK/32) == ceil(physicalK/32)`。对齐与 scale-group 数值检查仅作用于常量维；符号维跳过数值校验，回退到声明的 scale tile 几何（后续仍由 PTOAS 验证）。 |
+| `tile.matmul_mx` / `pl.matmul_mx` | `Left, LeftScale, Right, RightScale → Acc`；操作数位置驱动自动放置，包括为 `quant_mx` scale 生成 Vec→Mat→LeftScale/RightScale staging。进入算子的两块 data operand 必须都是 `FP8E4M3FN`，scale 为 `FP8E8M0`；`lhs_scale` 与 `rhs_scale` 必须是不同的 tile。支持的 FP4 输入形式仅为左侧 FP4×右侧 FP8，且必须先显式写 `pl.cast(fp4, pl.FP8E4M3FN)`；原生 FP4×FP4 与反向 FP8×FP4 会被拒绝。Physical M/K/N、valid K 与 scale-group 数均以 cast 后进入算子的 FP8 tile extent 为准，不使用 packed x2 carrier shape。Physical `M % 16 == 0`、`K % 64 == 0`、`N % 32 == 0`；valid K 必须满足 `ceil(validK/32) == ceil(physicalK/32)`。对齐与 scale-group 数值检查仅作用于常量维；符号维跳过数值校验，回退到声明的 scale tile 几何（后续仍由 PTOAS 验证）。 |
 | `tile.matmul_mx_acc` / `pl.matmul_mx_acc` | `Acc, Left, LeftScale, Right, RightScale → Acc`；通过 `set_output_reuses_input(0)` 原地执行；accumulator 的 physical/valid M、N 必须与 matmul 输出一致。 |
 | `tile.matmul_mx_bias` / `pl.matmul_mx_bias` | `Left, LeftScale, Right, RightScale, Bias → Acc`；bias 为 `[1, N]` FP32。 |
 | `tile.tget_scale_addr` | 编译器生成的 A5 绑定，接受 `LeftScale↔Left` 或 `RightScale↔Right`；对 `dst_scale` 原地 DPS。用户只编写 `matmul_mx` 算子族。 |
@@ -389,7 +392,7 @@ A5 会把左侧显式 FP4→FP8 tile cast 展开为 FP4→BF16→FP32→FP8E4M3F
 | shape-matched Mat→Scale `tmov` | flat `[1,G]` 须先 `treshape` 到 `[M,K/32]`（或 B 侧 shape） |
 | 顺序 | PyPTO 按源序发 Mat→scaling `tmov`；PTOAS `PTOA5NormalizeTMovPass` 把 `tget_scale_addr` 重排到它前面（ISA bind-before-fill） |
 | `#pto.layout` / mx load | `mx_a_zz` / `mx_b_nn` / …；codegen 发射逻辑 rank-2 `make_tensor_view`（PTOAS v0.60 InferPTOLayout / EmitC 映射物理 pack） |
-| 本阶段覆盖 | `pto.tmatmul.mx` / `.acc` / `.bias` + `pto.tget_scale_addr`；`pto.tquant.mx` 见 [LowerCompositeOps](../passes/13-lower_composite_ops.md) |
+| 本阶段覆盖 | `pto.tmatmul.mx` / `.acc` / `.bias` + `pto.tget_scale_addr`；`pto.tquant.mx` 见 [LowerCompositeOps](../passes/14-lower_composite_ops.md) |
 
 ### 仅 Tile 的 GEMV 家族（A2/A3）
 
@@ -537,200 +540,10 @@ INT32 + INT64 → INT64  (larger size)
 UINT32 + INT32 → INT32 (signed precedence)
 ```
 
-## TensorOp：N 维张量操作
+## Tensor 与 Tile 算子
 
-**用途**：支持完整广播的通用 N 维张量
-**类型**：`TensorType`（任意维度）
-**位置**：`src/ir/op/tensor_ops/`
-**Python API**：`from pypto.ir.op import tensor`
-
-**操作：** `tensor.add/sub/mul/div`（逐元素，支持完整 N 维广播），`tensor.maximum/minimum`（逐元素 max/min；rhs 可为 tensor 或 scalar — `ConvertTensorToTileOps` 根据 rhs 类型分发到 `tile.maximum/minimum` 或 `tile.maximums/minimums`），`tensor.set_validshape`（更新 valid_shape 元数据，不搬移数据；也可通过 `pl.set_validshape` 使用），`tensor.sort32` / `tensor.mrgsort_format1` / `tensor.mrgsort_format2`（排序；分别对应 `tile.sort32` / `tile.mrgsort` 的 tensor 层接口，由 `ConvertTensorToTileOps` 转换为 tile 操作），`tensor.gather`（按维索引；MVP 仅支持 2D 输入 + `dim=-1`，由 `ConvertTensorToTileOps` 按后端分策略下降 —— A5（Ascend950）将末维 gather 展开为对扁平元素偏移 `flat[i, j] = i * src_cols + index[i, j]` 的单次整块 `tile.gather`，并在此之前把带 stride 的 tile 源（如 `tile.slice` 视图）物化为连续 tile，使扁平索引能正确寻址；A2A3（Ascend910B）保留 legacy 的按行 `tile.gather` 循环，此时每个单行切片内的列索引即等于扁平索引），`tensor.gather_mask`（掩码模式选择；对应 `tile.gather_mask`，支持可选同位宽 `output_dtype`；见[掩码模式](#掩码模式)），`tensor.scatter`（按列散布；`tensor.gather` 的按列逆操作，MVP 仅支持 2D 输入 + `dim=-1` —— `out[b, index[b, k]] = src[b, k]`，`index` 与 `src` 同形状 —— 由 `ConvertTensorToTileOps` 下降到 `tile.scatter`），`tensor.scatter_mask`（按掩码模式散布；对应 `tile.scatter_mask`，将紧凑 `input` 按掩码扩展到 `dst` 的对应列 —— 见[掩码模式](#掩码模式)），`tensor.ci` / `tensor.arange`（生成连续整数序列，下层降到 `tile.ci`；同时通过 `pl.arange` 暴露在顶层 namespace），`tensor.and/ands/or/ors/xor/xors/not/shl/shls/shr/shrs`（仅整数的位运算与移位。此处列出的是注册的 *IR* 名称；其中名字本身是 Python 关键字的三个，其 Python 拼写带尾部下划线 —— `tensor.and_`、`tensor.or_`、`tensor.not_` —— printer 也按该形式输出，以保证 IR 能往返为合法 Python；对应同名 `tile.*` 操作。张量-张量形式的两个操作数形状必须相同 —— 硬件没有 `tile.row_expand_and`，因此广播在类型推导阶段即被拒绝，而不是延迟到 pass 中失败。`tensor.not` 仅支持 int16/uint16，与 `tile.not`/TNOT 一致。移位保持 lhs 的元素类型；`and`/`or`/`xor` 要求操作数使用相同的 8/16/32 位 dtype，scalar 形式使用 tile 下沉要求的同位宽 signless `iN` 编码。`ConvertTensorToTileOps` 将其中九个 1:1 下降，并为 `tensor.xor`/`tensor.xors` 合成 `pto.txor` 所需的临时操作数，使 tensor 层调用者无需提供 `tmp`）
-
-`tensor.view` 是只修改元数据的零拷贝 shape/layout 重新解释操作。它注册为 `TensorOp`，并在 `ConvertTensorToTileOps` 中作为 passthrough 处理；PTO in-core codegen 会将其降级为基于原始 base pointer 的 `pto.make_tensor_view`。目标 rank 至少为 1（DN 至少为 2）。编排层通常仅支持 ND shape 重新解释，且不能同时改变 layout；FP8E8M0 dynamic scale storage 还允许在 packed ND 与 `MX_A_ZZ` 或 `MX_B_NN` 之间建立元素数相同的 shaped alias，编排层保留同一个 runtime tensor，不调用 `reshape`。对部分有效的源张量进行 shape 重新解释时，仅支持把 packed ND 的 leading dimensions 折叠为 2D，或把连续前缀线性折叠为 `[1, product(shape)]`；两种形式都必须显式提供目标 `valid_shape`，并会保留源张量类型及其底层元数据。
-
-对于普通 `TensorType` 操作数，已支持的 Tensor-scalar 算术算子（`adds`、
-`subs`、`muls`、`divs`、`fmods` 以及 scalar `maximum` 或 `minimum`）和
-位运算/移位算子（`ands`、`ors`、`shls` 和 `shrs`）会创建新存储，但不能
-把 padding 凭空变成有效数据。因此结果保留 Tensor 操作数的 effective
-`valid_shape`，同时丢弃源别名、layout、stride 与 padding 元数据。这与已有的
-Tile-scalar 规则一致，确保 ragged tail 经 Tensor-to-Tile 下降后仍保持窄有效区。
-Scalar 比较与 XOR（`cmp` 和 `xors`）仍不在此规则的支持范围内。
-
-对于普通 Tensor-tensor 算术算子（`add`、`sub`、`mul`、`div`、`fmod`、
-`maximum` 和 `minimum`），当两个操作数的物理 shape 相同，且其 effective
-`valid_shape` 可证明相等时，结果同样保留该有效区域。`and`、`or`、`shl` 和
-`shr` 也采用这条 exact-region 规则。它不需要映射广播轴，并与相应 Tile
-结果契约一致；结果仍是新存储，因此不会继承别名、layout、stride 或 padding
-元数据。比较、XOR、`part_*`、广播、不同有效区域，以及直接使用 distributed
-window 的操作数不在这条规则范围内，因为它们当前的下降或合并契约需要单独处理。
-
-`pl.reinterpret_view(data, dtype, *, shape=None)` 会根据输入分派到等价的 `pl.tensor` 或 `pl.tile` 算子，并保持返回类型种类不变。它是覆盖完全相同字节的零拷贝视图。通用路径支持有/无符号 8/16/32/64 位整数、FP16、BF16 与 FP32；MX 下降额外只允许 INT8↔FP8E4M3FN 和 UINT8↔FP8E8M0 两对等字节 alias。省略 `shape` 时，ND/row-major 缩放最后一轴，DN/col-major 按源/目标字节宽度比例缩放倒数第二轴。显式 shape 必须字节数相等；除非能证明它与自动推导 shape 等价，否则必须完全静态。部分有效的 `valid_shape` 只能使用与自动推导结果等价的 shape。零值/null padding 元数据会保留，依赖 dtype 的 max/min padding 则会清除。初始可执行路径支持 packed ND in-core tensor 及 packed、flat（`none_box`）row/col-major tile；DN tensor 可做类型推导但 Tensor-to-Tile 下降会拒绝，编排层 tensor 暂不支持。
-
-**示例：**
-
-```python
-from pypto.ir.op import tensor
-
-ib = IRBuilder()
-with ib.function("tensor_example") as f:
-    input_a = f.param("input_a", ir.TensorType([128, 64, 32], DataType.FP32))
-    input_b = f.param("input_b", ir.TensorType([128, 64, 32], DataType.FP32))
-    f.return_type(ir.TensorType([128, 64, 32], DataType.FP32))
-    result = ib.let("result", tensor.add(input_a, input_b))
-    ib.return_stmt(result)
-```
-
-## TileOp：硬件优化 Tile 操作
-
-**用途**：带有显式内存管理的硬件优化 Tile 操作
-**类型**：`TileType`（统一缓冲区中的 Tile）
-**位置**：`src/ir/op/tile_ops/`
-**Python API**：`from pypto.ir.op import tile`
-
-**设计**：使用 `TileType`（而非单独的 `BlockType`）以保持一致性。命名空间 `tile.*` + `TileType` 清楚地表示硬件优化的 Tile 操作。
-
-### 操作列表
-
-| 分类 | 操作 | 描述 |
-| ---- | ---- | ---- |
-| **内存** | `tile.get_block_idx` | 获取 block 索引（返回 UINT64 标量） |
-| - | `tile.load` | TensorType → TileType（DDR 到统一缓冲区） |
-| - | `tile.store` | TileType → TensorType（统一缓冲区到 DDR） |
-| - | `tile.move` | 在 memory space 之间搬移 tile（`target_memory`）—— 见 [tile.move 的结果 view](#tilemove-的结果-view) |
-| **逐元素** | `tile.add/sub/mul/div` | Tile-Tile 操作 |
-| - | `tile.adds/subs/muls/divs` | Tile-Scalar 操作。**常量**标量操作数会采用 tile 的元素 dtype（裸整数字面量否则会被解析为 `index`，而任何 `pto.t*s` 算子都不接受它）——但整数 tile 上的浮点字面量仍保持 FP32，以保留类型提升语义。显式的 `pl.const(v, dtype)` 属于用户的有意标注，与任何非常量表达式一样保持不变；非常量的 `index` 标量（循环变量、`pl.dim`）会被拒绝——需用 `pl.cast` 转换。`tensor.*s` 同理。 |
-| **一元** | `tile.sqrt` | 逐元素平方根 |
-| **量化** | `tile.tquant_mx` / `pl.quant_mx` | 仅 Ascend950 支持的 **MXFP8** block-32 动态量化，返回 `{FP8E4M3FN quant, FP8E8M0 scale}`；`dtype` 必须为 `FP8E4M3FN`。`group_axis` 对齐 PTOAS `grpAxis`（`1` = A 侧 `[M,K]`，`0` = B 侧 `[N,K]` 并转置）。公开 scale shape 为 `[M,K/32]` / `[K/32,N]`；要求完整有效区域和 `K % 64 == 0`（axis1 还要求 `M % 16 == 0`，axis0 还要求 `N % 32 == 0`）。[Pass 13](../passes/13-lower_composite_ops.md) 生成分组 TQUANT 和 X-to-ZZ TMOV。结果经 GM 分期喂给 `matmul_mx`。MXFP4 quant 暂缓。 |
-| **变换** | `tile.slice` | 提取子 tile，静态 shape，可选动态 valid_shape |
-| - | `tile.extract` | 从 `src` 在 `(index_row, index_col)` 处提取子 tile —— ISA TEXTRACT Variant 1（Mat→Left/Right，Acc→Mat）。结果 layout 取自 `target_memory` 的隐式 view；`Left`/`Right` 例外，使用 TEXTRACT 侧的 L0 格式（与 `tile.move` 的 TMOV 侧不同） |
-| - | `tile.reshape` | 重塑 tile 维度（元素总数须一致）。会把源的 `valid_shape` 带到结果上，且绝不扩大 —— 见[reshape 与有效区域（valid region）](#reshape-与有效区域valid-region) |
-| - | `tile.reinterpret_view` | 以不同 dtype 对完全相同的字节做零拷贝视图；可选 shape 默认按 layout 推导（仅支持紧密、非分形 tile） |
-| - | `tile.transpose` | 交换 tile 的两个轴 |
-| - | `tile.set_validshape` | 更新 valid_shape 元数据，不搬移数据 |
-| - | `tile.ci` | 生成连续整数序列（升序 start+k 或降序 start-k）；dtype ∈ {INT16, INT32}；最内维 != 1 |
-| - | `tile.tri` | 使用 INT32 diagonal offset 生成上三角或下三角 0/1 mask；支持可选的部分 `valid_shape`；映射为 `pto.ttri`。 |
-| **规约** | `tile.row_*` / `tile.col_*` | 方向特定的规约（`row_sum`/`row_max`/`row_min`/`row_prod` 折叠最后一轴；`col_*` 折叠第 0 轴）。不存在以 axis 参数化的规约算子 —— ISA 只提供方向特定的指令（`pto.trowsum`、`pto.tcolsum` 等） |
-| **聚集** | `tile.gatherb` | 按 32-byte 源块聚集。每个 UINT32 offset 选择一个块；每个 offset 列扩展为 `32 / sizeof(output_dtype)` 个输出元素，valid_shape 同比例扩展。`output_dtype` 默认等于源 dtype，也可选择另一种受支持的字节解释。offset 每行须包含正整数个 8-entry 组。切片源的字节地址必须能被证明为 32-byte 对齐；动态列偏移会被拒绝，而物理行跨度保持对齐时允许动态行偏移。映射为 `pto.tgatherb`。 |
-| - | `tile.mgather` | 从 GM tensor 聚集到新 Vec 或 Mat tile。Vec 输出使用 INT32 index tile（`[1,R]`，A5 也支持 `[R,1]`）；Mat 输出使用 ND-layout GM source 与 INT32 index tensor，并采用规范 NZ layout，物理行数按 16 对齐、列数按 `C0 = 32 / sizeof(dtype)` 对齐；可通过较小的二维 `valid_shape` 表达 padding tail。`coalesce="row"` 聚集整行；`"elem"` 按扁平元素索引聚集，且 Mat 输出要求同 dtype、连续 ND、元素数不少于物理输出的 GM `scratch` tensor。`gather_oob` 可选择 `undefined`、`clamp`、`wrap` 或 `zero`。payload dtype 支持 I8/U8/I16/U16/I32/U32/FP16/BF16/FP32，以及仅 A5 支持的 FP8E4M3FN/FP8E5M2/HF8。 |
-| **散布** | `tile.scatter` | 按行索引把 `src` 散布到 `dst`（`pto.tscatter` 索引形式；DPS：`dst` 为 in/out，结果别名为 `dst`）。`src` / `dst` dtype ∈ {I8, I16, I32, FP16, FP32, BF16}；`indexes` dtype ∈ {I16, I32}；元素宽度匹配规则：4 字节 dst ↔ INT32，2 字节 dst ↔ INT16，1 字节 dst ↔ INT16。 |
-| - | `tile.scatter_mask` | 按掩码模式把 `src` 行写入 `dst` 中由掩码选中的列（DPS：`dst` 为 in/out）。这是 PyPTO codegen 层形式，下降为 `pto.tscatter` 掩码发射 —— **并非**独立的 pto-isa 指令（与 `tile.gather_mask` 不同）。掩码语义见[掩码模式](#掩码模式)。 |
-
-当前暂不支持把 `quant_mx` 与 `matmul_mx` 放在同一个 InCore mixed task 中。
-请拆成 AIV 量化 kernel 与 AIC 矩阵乘 kernel，并通过 GM 暂存量化数据和
-FP8E8M0 scale。自动跨核传递 data 与 scale 的能力留待后续改动。
-
-`tile.reshape` 保持 dtype、元素总数以及源的有效区域（见下）；`tile.reinterpret_view(data, dtype, *, shape=None)` 改变 dtype，但要求前后总字节数完全相同。省略 `shape` 时，它会根据源/目标 dtype 字节宽度和 tile layout 缩放物理连续轴。在 PTOAS 内存规划下，无论 shape 是否变化，都会下降为保持别名关系的 PTO `treshape` 原语。
-
-### tile.move 的结果 view
-
-推导出的结果 `TileView` 按字段分别取值：
-
-| 字段 | 结果值的来源 |
-| ---- | ------------ |
-| `blayout` / `slayout` | 凡目标 space 自带 layout（`Mat`、`Acc`、`Left`、`Right`、`LeftScale`、`RightScale`），取**目标**的 implicit layout；扁平 space（`Vec`、`Bias` 等）则沿用源 tile 的 effective layout。两者都可由 `blayout` / `slayout` kwarg 覆盖 |
-| `fractal` | **目标** space 的分块（boxing）粒度：`Acc`（L0C，NZ 分形）为 1024，MX scale tile 为 32，其余为 512。唯一的窄化例外是承载字节型 MX scale 的 Vec→Vec 重排，此时保留源的 32-byte scale box |
-| `valid_shape` / `pad` | 从源带过来 |
-| `stride` / `start_offset` | 丢弃 —— 目标是稠密缓冲区 |
-
-layout 来自目标，因为它描述的是目标缓冲区如何分块，由
-`tile_view_semantics::GetImplicitTileLayout` 提供。`Right` 仍需就地覆盖：L0B 要求
-`blayout=row_major`，而 `[N, 1]` 形状的 implicit `blayout` 是 `col_major`。
-
-`tile.move` 自己把目标 `memory_space` 打到推导出的类型上（参见
-[类型](02-types.md#tiletype) 中的 `TileType` 契约），因此当结果 view 与目标 space 的
-implicit view 一致时会折叠为 `nullopt` —— 这与
-[`InferTileMemorySpace`](../passes/20-infer_tile_memory_space.md) 为重新定型的 tile
-刷新的 per-space implicit view 是同一套。
-
-`tile.move` 不支持原地执行：在同一 memory space 内，源和结果必须解析到不同地址。
-PyPTO 与 DSA-RP 规划器会落实该约束；如果显式 MemRef 绑定或手工构造的 IR 仍留下
-同地址 move，baked-address PTO codegen 会直接报错。
-
-### reshape 与有效区域（valid region）
-
-reshape 是零拷贝视图，无法凭空产生数据：`tensor.reshape` 与 `tile.reshape` 共用
-同一条规则，把源的 `valid_shape` 映射到目标 shape，且绝不扩大。有效区域只能表示为
-以原点为锚的矩形框，因此并非所有源区域都能在重新切分后保留：
-
-| 源区域 | 结果 |
-| ------ | ---- |
-| 完全有效 | `new_shape` —— 会被规范化掉，不产生 view，已有程序不受影响 |
-| 可证明为空 | 全零矩形框 |
-| 仅增删完全有效的单位轴 | 保留的轴按 1:1 映射，可精确保留任意矩形 |
-| 目标 shape 以同样方式切分缓冲区 | `new_shape` 中覆盖同一批元素的矩形框（若存在） |
-| 其他情况 | **拒绝** —— `valid_shape` 无法描述 reshape 后的区域 |
-
-最后一条规则把有效区域读作它填充的若干**连续段（run）**。相邻的源轴只要满足
-“低位轴完全有效”或“高位轴被钉死在单个坐标上”，就属于同一段；否则高位轴的
-stride 会残留在区域中并把它切开。每一段都是自身容量的一个扁平前缀，因此当
-`new_shape` 把自己的维度分成同样的段、且每段前缀都落在维度边界上时，区域即可
-精确映射。对于静态区域这条规则是**精确的**：当且仅当 `new_shape` 下存在某个矩形框
-表示完全相同的元素集合时才接受。
-
-因此 `[8, 16]` valid `[5, 16]` 是单段情形（80 个元素的扁平前缀），可映射为
-`[16, 8]` valid `[10, 8]` 或 `[128]` valid `[80]`，而 `[4, 32]` 会被拒绝 ——
-80 个元素不是整数行（每行 32）。`[2, 2, 2]` valid `[2, 1, 2]` 是两段情形
-`2 | 4` —— 扁平元素集合为 `{0, 1, 4, 5}`，根本不是前缀 —— `[2, 4]` 可以把它写成
-valid `[2, 2]`，而 `[8]` 没有每 4 个元素一次的维度边界，无法表示。
-`[8, 16]` valid `[8, 5]` 切分为 `8 | 16`，`[16, 8]` 无法按同样方式重新分组，因此
-被拒绝。`tensor.reshape` 可选的第三个 `valid_shape` 操作数只能*收窄*推导出的区域，
-不能声称拥有该区域之外的数据。
-
-符号化 extent 会削弱规则能证明的范围，但本身并不导致拒绝：**任何**一段都可以原样
-携带符号化的*有效* extent —— 只要它所在段的目标维度步长恰好等于该段的 trailing
-volume。因此 `[4, 2, 8]` valid `[v, 1, 8]` 即便切分为 `4 | 16` 两段，仍可映射为
-`[4, 16]` valid `[v, 8]`。必须是静态的是用来度量区域的*物理*几何：目标各维 extent、
-每段自由轴以下的各维 extent、符号化路径上自由轴本身（其维度必须可证明足够宽），
-以及区域切分为多段时每一段的容量。达不到这些条件时一律拒绝而不做猜测。
-
-**恒等** `tile.reshape`（目标形状与源形状相同）还会保留源的 layout 三元组
-（`blayout` / `slayout` / `fractal`）及其已解析的内存空间，而不是按形状重新推导 layout。
-重新推导得到的是与空间无关的扁平 layout；`NormalizeImplicitTileView` 只会为可折叠的
-view 兜底，而被收窄、带 pad 或声明了 `compact` 的 Acc 盒永远不可折叠——扁平 layout 于是
-被固化下来，其读者会把 L0C 当作普通 row-major 缓冲区来遍历（issue #2470）。
-
-**数据流：** `TensorType (DDR) → tile.load → TileType (Unified Buffer) → tile.{ops} → TileType → tile.store → TensorType (DDR)`
-
-### 掩码模式
-
-`*.gather_mask` / `*.scatter_mask` 使用编译期 `MaskPattern`（`pl.tile.MaskPattern`，整数取值 1–7，与硬件 `VREDUCEv2` 的 pattern mode 一致）按行标记列的一个子集（模式名**从右往左**读，最右位对应列 0）。同一标记集合驱动两个算子做**相反方向**的操作。**`gather_mask`** *选择并紧凑*：从宽输入中读取被标记的列，紧凑写入较窄输出的前若干列（`out_cols = cols / stride`）；这是真实的 pto-isa 指令（`pto.tgather` 掩码形式），A2/A3 **与 A5** 均支持。**`scatter_mask`** *放置并扩展*：把紧凑输入写入更宽 `dst` 的被标记列（`dst_cols = cols * stride`），未标记列保留 `dst` 原值（DPS）；这是 **PyPTO codegen 层形式，并非独立的 pto-isa 指令** —— 不存在 `pto.tscatter` 掩码指令（与 gather 不同）—— PyPTO 为 A2/A3 / CPU-sim 类下降路径发射它。例如对 `[a0 a1 a2 a3 a4 a5 a6 a7]`：gather `P0101 → [a0 a2 a4 a6]`；对 `[s0 s1 s2 s3]` 做 scatter `P0101 → [s0 · s1 · s2 · s3 ·]`（`·` 表示保留的 `dst`）。
-
-| 模式 | 整数 | 标记列 `c` 的条件 | 被标记的列 | 步长 |
-| ---- | ---- | ----------------- | ---------- | ---- |
-| `P0101` | 1 | `c % 2 == 0` | 0, 2, 4, … | 2 |
-| `P1010` | 2 | `c % 2 == 1` | 1, 3, 5, … | 2 |
-| `P0001` | 3 | `c % 4 == 0` | 0, 4, 8, … | 4 |
-| `P0010` | 4 | `c % 4 == 1` | 1, 5, 9, … | 4 |
-| `P0100` | 5 | `c % 4 == 2` | 2, 6, 10, … | 4 |
-| `P1000` | 6 | `c % 4 == 3` | 3, 7, 11, … | 4 |
-| `P1111` | 7 | 全选 | 全部 | 1 |
-
-最后一维须能被步长整除。`gather_mask` 另接受可选的同位宽 `output_dtype`（按位重解释，而非数值转换）。参考：gather 的选择语义见 `pto-isa` 的 `MaskSelect`（`include/pto/cpu/TGather.hpp`）；pypto 类型推导见 `src/ir/op/tile_ops/gather.cpp`（gather）/ `src/ir/op/tile_ops/scatter.cpp`（scatter）。
-
-### 使用示例
-
-```python
-from pypto.ir.op import tile
-
-ib = IRBuilder()
-with ib.function("tile_computation") as f:
-    input_a = f.param("input_a", ir.TensorType([128, 128], DataType.FP32))
-    input_b = f.param("input_b", ir.TensorType([128, 128], DataType.FP32))
-    output = f.param("output", ir.TensorType([128, 1], DataType.FP32))
-    f.return_type(ir.TensorType([128, 1], DataType.FP32))
-
-    # Load, compute, reduce, store
-    tile_a = ib.let("tile_a", tile.load(input_a, [0, 0], [32, 128]))
-    tile_b = ib.let("tile_b", tile.load(input_b, [0, 0], [32, 128]))
-    tile_mul = ib.let("tile_mul", tile.mul(tile_a, tile_b))
-    tile_sqrt = ib.let("tile_sqrt", tile.sqrt(tile_mul))
-    # row_sum 折叠最后一轴 -> [32, 1]。scratch tile 必须与输入 dtype 和 rank 相同，
-    # 且每一维都不小于输入的对应维度。
-    tmp_tile = ib.let("tmp_tile", tile.create([32, 128], DataType.FP32))
-    tile_sum = ib.let("tile_sum", tile.row_sum(tile_sqrt, tmp_tile))
-    result = ib.let("result", tile.store(tile_sum, [0, 0], output))
-    ib.return_stmt(result)
-```
+数据算子 API、扁平 gather、有效区域语义、Tile 布局与掩码模式，参见
+[Tensor 与 Tile 算子](05-tensor-tile-ops.md)。
 
 ## SyncOp：同步操作
 
@@ -749,10 +562,21 @@ with ib.function("tile_computation") as f:
 | `system.syncall` | 跨核全员屏障（`pto::SYNCALL`）。属性 `mode` 取 `"hard"`（FFTS，无 operand）或 `"soft"`（GM 轮询，带 operand） | `core_type`（`"aiv_only"` \| `"aic_only"` \| `"mix"`）、`mode`（`"hard"` \| `"soft"`） |
 | `system.sync_src` | 设置同步标志 | `set_pipe`, `wait_pipe`, `event_id` |
 | `system.sync_dst` | 等待同步标志 | `set_pipe`, `wait_pipe`, `event_id` |
+| `system.set_flag` / `system.wait_flag` | 显式核内流水线事件 | `src_pipe`、`dst_pipe`、静态 `event_id` 或一个动态 INDEX 操作数；可选 `core_type` |
 | `system.task_invalid` | `TaskId::invalid()` 哨兵——TaskId carry 的 "暂无 producer" 种子 | 无 |
 | `system.task_is_valid` | 测试某个 `TASK_ID` 值是否为有效（非哨兵）handle | 无；唯一位置参数是 TaskId Var |
 | `system.available_cluster_count` | 本次运行的 MIX cluster（= AIC）数，由设备读回。结果为 `Scalar[INT32]` | 无 |
 | `system.available_aiv_count` | 本次运行的独立 AIV 核数，由设备读回。结果为 `Scalar[INT32]` | 无 |
+
+显式 flag 调用的结果为 `UnknownType`，并作为 `EvalStmt(Call)` 保留。
+`src_pipe` 与 `dst_pipe` 必须是不同的具体 `PipeType` 值（不能是 `ALL`）。
+事件形式必须恰好选择一种：`[0, 7]` 内的常量 `event_id`，或一个运行时值也须在
+该范围内的 `ScalarType(INDEX)` 操作数。可选 `core_type` 是混合核放置所需的
+`"aic"` / `"aiv"` IR 元数据。代码生成对应 `pto.set_flag` / `pto.wait_flag`，
+动态 INDEX 操作数则生成 `_dyn` 形式。动态操作数即使被折叠为常量，仍作为操作数
+生成 `_dyn` 形式；IR 打印通过 `pl._dump.call` 保留这一表示。这些调用不表示跨核同步。
+`PipelineLoopValid` 验证器会在流水线调度前拒绝 `ForKind::Pipeline` 循环中的
+任一操作。即使关闭可选 IR 验证，调度 pass 也会拒绝这种放置方式；普通循环可以使用显式 flag。
 
 `system.syncall` 有两种 mode，由其 `mode` **IR 属性**选择；Python 接口则用 `pl.SyncAllMode` 成员表达（见下文）。**hard** 形态（属性 `"hard"`，默认）下沉为 FFTS 屏障，等待所选 `core_type` 的**全部**物理核到达；kernel 必须以满占用方式启动（每个物理核一个 block）**且带 `sync_start=True`**（使所有 block 同时驻留——非 sync_start 启动可能分波次派发 block 而使屏障死锁），否则屏障死锁（AICore 错误 507018）。**soft** 形态（属性 `"soft"`）轮询一段共享 GM workspace，因此可在**部分**占用下工作。`gm_workspace` 是共享、清零的 GM `INT32` tensor，至少包含 16 个元素（64 字节）。请将它作为 kernel 参数传入，使所有 block 共享同一缓冲；该缓冲必须独占一条 cache line，并在首次使用前清零。
 

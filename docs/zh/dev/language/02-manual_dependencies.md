@@ -118,6 +118,13 @@ runtime 的 `Arg::set_dependencies(ptr, count)` 直接接收调用者持有的�
 在 dep 全 invalid 时返回 invalid 且跳过 dummy submit，并可与自动
 `ExpandManualPhaseFence` barrier 共存。
 
+运行时分配的 `Out` 参数**不会**增加逻辑返回值。
+若 `kernel(x, scratch: Out[Tensor]) -> Tensor` 返回 `scratch`，
+则 `pl.submit(self.kernel, x)` 的扁平 IR 类型为 `Tuple[Tensor, Scalar[TASK_ID]]`。
+显式传入 `scratch` 只改变分配归属，不改变 tuple 长度。多个返回值保持 callee 的声明顺序，
+`TASK_ID` 位于最后；callee 未返回的调用方分配 Out 不产生返回槽位。
+手工构造的 `ir.Submit` 必须遵循与 parser 相同的契约。
+
 `pl.no_dep(arg)` 是 auto scope 原语；在 `pl.manual_scope` 内不起作用
 （整个 scope 已经退出自动跟踪了）。
 
@@ -287,4 +294,12 @@ phase `N` 的全部 `N_BRANCHES` 个 task，而非只等最后那个。
 
 - [语句与控制流](01-statements.md) —— 这些原语所依赖的作用域上下文管理器
 - [编排代码生成](../codegen/01-orchestration_codegen.md) —— 它们如何下降
-- [AutoDeriveTaskDependencies](../passes/42-auto_derive_task_dependencies.md) —— 消费这些信息的 pass
+- [AutoDeriveTaskDependencies](../passes/44-auto_derive_task_dependencies.md) —— 消费这些信息的 pass
+
+## 可能为空的 SPMD launch
+
+动态 `pl.spmd_submit` 的个数无法证明为正时，所有 Out/InOut buffer 都必须
+传入，包括没有返回的输出。编译器将每个输出与对应实参合并，并将 TaskId 与
+空路径的 `task_dummy` 合并；dummy 保留原有显式依赖。因此计算 launch 被跳过时，
+使用 `deps=[tid]` 的 consumer 仍保持顺序。参见
+[LegalizeSpmdLaunches](../passes/42-legalize_spmd_launches.md)。

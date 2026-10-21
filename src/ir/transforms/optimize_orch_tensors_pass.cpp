@@ -34,6 +34,7 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/transforms/utils/var_collectors.h"
@@ -78,6 +79,24 @@ std::vector<ExprPtr> ComputeRowMajorStrides(const std::vector<ExprPtr>& shape) {
     product *= dims[i - 1];
   }
   return strides;
+}
+
+/// Preserve assignment symmetry when input/output stride refinement rewrites
+/// a value. Tuple and projection constructors infer their types from operands;
+/// remapping the LHS makes subsequent uses follow those refined types too.
+AssignStmtPtr RetypeStrideRefinedAssignment(const AssignStmtPtr& original, const AssignStmtPtr& rewritten,
+                                            std::unordered_map<const Var*, VarPtr>& remap) {
+  const auto& value_type = rewritten->value_->GetType();
+  if (rewritten->value_.get() == original->value_.get() ||
+      structural_equal(rewritten->var_->GetType(), value_type) ||
+      !structural_equal(original->var_->GetType(), original->value_->GetType())) {
+    return rewritten;
+  }
+  auto fresh = std::make_shared<Var>(original->var_->name_hint_, value_type, original->var_->span_);
+  remap[original->var_.get()] = fresh;
+  auto assign = MutableCopy(rewritten);
+  assign->var_ = fresh;
+  return assign;
 }
 
 bool IsTensorTypedArg(const ExprPtr& arg) {
@@ -716,7 +735,8 @@ class IterArgReuseOptimizer {
     auto new_body = mutator.VisitStmt(func->body_);
 
     return std::make_shared<Function>(func->name_, new_params, new_directions, func->return_types_, new_body,
-                                      func->span_, func->func_type_, func->level_, func->role_, func->attrs_);
+                                      func->span_, func->func_type_, func->level_, func->role_, func->attrs_,
+                                      func->requires_runtime_binding_, func->ir_stage_);
   }
 
   // -- Mutation: IRMutator that rewrites orch call sites ---------------------
@@ -922,7 +942,7 @@ class AssembleParentStridesOptimizer {
    public:
     void AddSubstitution(const Var* old_ptr, const VarPtr& new_var) {
       subs_[old_ptr] = new_var;
-      new_param_ptrs_.insert(new_var.get());
+      refined_vars_.insert(new_var.get());
     }
 
    protected:
@@ -935,20 +955,20 @@ class AssembleParentStridesOptimizer {
     }
 
     StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
-      auto visited = IRMutator::VisitStmt_(op);
-      auto assign = As<AssignStmt>(visited);
-      if (!assign) return visited;
+      auto assign = RetypeStrideRefinedAssignment(op, As<AssignStmt>(IRMutator::VisitStmt_(op)), var_remap_);
+      if (assign->var_.get() != op->var_.get()) refined_vars_.insert(assign->var_.get());
 
       auto call = As<Call>(assign->value_);
       if (!call || !IsOp(call, "tile.store") || call->args_.size() < 3) return assign;
 
       auto out_var = AsVarLike(call->args_[2]);
-      if (!out_var || !new_param_ptrs_.count(out_var.get())) return assign;
+      if (!out_var || !refined_vars_.count(out_var.get())) return assign;
 
       auto out_type = out_var->GetType();
       auto new_call = std::make_shared<Call>(call->op_, call->args_, call->kwargs_, out_type, call->span_);
       auto new_var = std::make_shared<Var>(assign->var_->name_hint_, out_type, assign->var_->span_);
       var_remap_[op->var_.get()] = new_var;
+      refined_vars_.insert(new_var.get());
       auto result = MutableCopy(assign);
       result->var_ = new_var;
       result->value_ = new_call;
@@ -957,7 +977,7 @@ class AssembleParentStridesOptimizer {
 
    private:
     std::unordered_map<const Var*, VarPtr> subs_;
-    std::unordered_set<const Var*> new_param_ptrs_;
+    std::unordered_set<const Var*> refined_vars_;
     std::unordered_map<const Var*, VarPtr> var_remap_;
   };
 
@@ -995,7 +1015,13 @@ class AssembleParentStridesOptimizer {
         std::vector<ExprPtr> strides(full_strides.end() - static_cast<std::ptrdiff_t>(out_rank),
                                      full_strides.end());
 
-        TensorView view(std::move(strides), TensorLayout::ND);
+        // Materialising the parent's strides says nothing about byte order, so
+        // keep whatever layout the parameter already declared. Hard-coding ND
+        // silently retyped an NZ or MX parameter and left the call site's
+        // argument disagreeing with it.
+        const TensorLayout param_layout =
+            tensor_type->tensor_view_ ? tensor_type->tensor_view_->layout : TensorLayout::ND;
+        TensorView view(std::move(strides), param_layout);
         auto new_type = std::make_shared<TensorType>(tensor_type->shape_, tensor_type->dtype_,
                                                      tensor_type->memref_, std::move(view));
         auto new_param = std::make_shared<Var>(func->params_[opm.param_index]->name_hint_, new_type,
@@ -1017,7 +1043,7 @@ class AssembleParentStridesOptimizer {
 
       func = std::make_shared<Function>(func->name_, new_params, func->param_directions_, func->return_types_,
                                         new_body, func->span_, func->func_type_, func->level_, func->role_,
-                                        func->attrs_);
+                                        func->attrs_, func->requires_runtime_binding_, func->ir_stage_);
     }
   }
 };
@@ -1031,6 +1057,28 @@ class AssembleParentStridesOptimizer {
 // to use tile.store instead of tile.assemble, with the iter-arg initialized
 // from the Out param.
 // ============================================================================
+
+/// True when a `tile.assemble` / `tile.store` carries a FIXPIPE epilogue.
+///
+/// This rewrite turns an in-loop assemble into a store, which changes both the
+/// destination *class* (an on-chip tile becomes a GM tensor, and the legal
+/// scale-bearing dtype pairs are keyed on exactly that -- see
+/// `BackendHandler::FixpipeDest`) and the destination *dtype* (the accumulator
+/// tile's, versus the output tensor's, which is what
+/// `codegen::EncodeFixpipePreQuant` reads for the signedness field). Carrying
+/// the kwargs across unchanged would therefore re-target an epilogue validated
+/// for one writeback onto a different one, and re-deriving legality here would
+/// duplicate the backend tables inside an optimization.
+///
+/// So the pattern is declined instead. This costs a loop-fusion opportunity and
+/// nothing else; dropping the kwargs silently costs a ReLU or a dequantization
+/// scale, and `FixpipeEpilogueValid` cannot catch that afterwards because by
+/// then there is no epilogue left to reject.
+[[nodiscard]] inline bool HasFixpipeEpilogue(const CallPtr& call) {
+  if (!call) return false;
+  return GetOptionalDoubleKwarg(call->kwargs_, "pre_quant").has_value() ||
+         call->GetKwarg<bool>("pre_relu", false);
+}
 
 class AssembleLoopRewriter {
  public:
@@ -1139,6 +1187,8 @@ class AssembleLoopRewriter {
         if (!assign) continue;
         auto call = As<Call>(assign->value_);
         if (!call || !IsOp(call, "tile.assemble")) continue;
+        // Declined rather than rewritten -- see HasFixpipeEpilogue.
+        if (HasFixpipeEpilogue(call)) continue;
         if (call->args_.size() < 3) continue;
         const Var* arg0_raw = nullptr;
         if (auto v = As<Var>(call->args_[0])) arg0_raw = v.get();
@@ -1277,6 +1327,8 @@ class AssembleLoopRewriter {
       if (def_it == var_def.end()) continue;
       auto call = As<Call>(def_it->second->value_);
       if (!call || !IsOp(call, "tile.store")) continue;
+      // The rewrite deletes this store; an epilogue on it would go with it.
+      if (HasFixpipeEpilogue(call)) continue;
       if (call->args_.size() < 3) continue;
       auto out_tensor = As<Var>(call->args_[2]);
       if (!out_tensor || !out_var_to_param_idx.count(out_tensor.get())) continue;
@@ -1340,6 +1392,9 @@ class AssembleLoopRewriter {
           if (!assign) continue;
           auto call = As<Call>(assign->value_);
           if (!call || !IsOp(call, "tile.assemble")) continue;
+          // Must decline on exactly the same condition as the mutator above, or
+          // the store below would be marked dead for a loop that is never rewritten.
+          if (HasFixpipeEpilogue(call)) continue;
           if (call->args_.size() < 3) continue;
           const Var* arg0_raw = nullptr;
           if (auto v = As<Var>(call->args_[0])) arg0_raw = v.get();
@@ -1401,7 +1456,8 @@ class AssembleLoopRewriter {
 
     return std::make_shared<Function>(func->name_, func->params_, func->param_directions_,
                                       func->return_types_, new_body, func->span_, func->func_type_,
-                                      func->level_, func->role_, func->attrs_);
+                                      func->level_, func->role_, func->attrs_,
+                                      func->requires_runtime_binding_, func->ir_stage_);
   }
 };
 
@@ -1527,6 +1583,10 @@ class SliceInputStridesOptimizer {
       return op;
     }
 
+    StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
+      return RetypeStrideRefinedAssignment(op, As<AssignStmt>(IRMutator::VisitStmt_(op)), subs_);
+    }
+
    private:
     std::unordered_map<const Var*, VarPtr> subs_;
   };
@@ -1556,12 +1616,25 @@ class SliceInputStridesOptimizer {
         // Skip params that already have explicit strides
         if (tensor_type->tensor_view_.has_value() && !tensor_type->tensor_view_->stride.empty()) continue;
 
+        // NZ bytes are fractal-blocked, so the parent's logical row-major strides
+        // do not describe them. BlockNzTensorViews derives the real strides from
+        // the blocked shape and refuses an explicit one; stamping them here made
+        // it blame the user for a stride they never wrote.
+        const auto& param_view = tensor_type->tensor_view_;
+        if (param_view.has_value() && param_view->layout == TensorLayout::NZ) continue;
+
         size_t in_rank = tensor_type->shape_.size();
         if (in_rank > full_strides.size()) continue;
         std::vector<ExprPtr> strides(full_strides.end() - static_cast<std::ptrdiff_t>(in_rank),
                                      full_strides.end());
 
-        TensorView view(std::move(strides), TensorLayout::ND);
+        // Materialising the parent's strides says nothing about byte order, so
+        // keep whatever layout the parameter already declared. Hard-coding ND
+        // silently retyped an NZ or MX parameter and left the call site's
+        // argument disagreeing with it.
+        const TensorLayout param_layout =
+            tensor_type->tensor_view_ ? tensor_type->tensor_view_->layout : TensorLayout::ND;
+        TensorView view(std::move(strides), param_layout);
         auto new_type = std::make_shared<TensorType>(tensor_type->shape_, tensor_type->dtype_,
                                                      tensor_type->memref_, std::move(view));
         auto new_param = std::make_shared<Var>(func->params_[param_idx]->name_hint_, new_type,
@@ -1583,7 +1656,7 @@ class SliceInputStridesOptimizer {
 
       func = std::make_shared<Function>(func->name_, new_params, func->param_directions_, func->return_types_,
                                         new_body, func->span_, func->func_type_, func->level_, func->role_,
-                                        func->attrs_);
+                                        func->attrs_, func->requires_runtime_binding_, func->ir_stage_);
     }
   }
 };

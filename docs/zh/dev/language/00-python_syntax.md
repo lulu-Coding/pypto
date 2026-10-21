@@ -174,9 +174,9 @@ Python 变量上。`@pl.jit` 会在一个新的模块命名空间里重新解析
 不属于 Vec / Mat / Acc、valid shape 是运行期值,或某个槽位作为 phi 被带出 `if` / 循环。这些都
 会报出指明具体形态的错误,而不是静默回退,因为回退就等于把你声明的隔离抹掉。
 
-默认的 PyPTO 规划器不受影响:它烘焙地址,而在 `--pto-level=level3` 下 ptoas 不会折叠逐槽位的
-地址展开,区域形式反而会丢掉它赖以存在的槽位分析
-（[PTOAS#1106](https://github.com/hw-native-sys/PTOAS/issues/1106)）。
+默认的 PyPTO 规划器不受影响:它烘焙地址,沿用 `alloc_tile` 形式。`--pto-level=level3` 下的区域
+需要显式的基地址 `addr`,而 codegen 目前还不发射它;ptoas 自 0.55 起已支持这种形式
+（[PTOAS#1106](https://github.com/hw-native-sys/PTOAS/issues/1106),已关闭）。
 
 声明的名字自成命名空间——不会解析到恰好同名的 Python 变量。内存空间**必须**写（`TileType`
 始终要求 MemRef 与空间成对出现），且绑定到同一块分配的 tile 必须一致。未加注解的 tile 保持
@@ -188,7 +188,7 @@ Python 变量上。`@pl.jit` 会在一个新的模块命名空间里重新解析
 一块分配；希望编译器管理的层次则不加注解。
 
 在 `memory_planner=PTOAS` 下，编译器用的是**同一套**机制而非另一套：
-[`LowerPipelineToSlots`](../passes/30-lower_pipeline_to_slots.md) 会为合格 `pl.pipeline` 循环体中
+[`LowerPipelineToSlots`](../passes/31-lower_pipeline_to_slots.md) 会为合格 `pl.pipeline` 循环体中
 **顶层**的每个 `tile.load` 合成与上文完全一致的声明——`slots=F`、以 `iv % F` 索引——于是单份循环体
 轮转各个槽位而不被复制。你自己绑定过的 tile 不受影响；该 pass 未接手的循环仍走复制路径
 （上述拒绝规则对其依然成立）。
@@ -204,8 +204,8 @@ for stack, (out_outer,) in pl.pipeline(STACKS, stage=2, init_values=(out,)):
         pong: pl.Tile[[K, STEP], pl.BF16, l0b_pong, pl.Mem.Right] = ...
 ```
 
-参见 [InitMemRef](../passes/34-init_memref.md#声明式分配) 与
-[MemoryReuse](../passes/36-memory_reuse.md#声明式分配)。
+参见 [InitMemRef](../passes/35-init_memref.md#声明式分配) 与
+[MemoryReuse](../passes/37-memory_reuse.md#声明式分配)。
 
 ### Tile 视图 (TileView)
 

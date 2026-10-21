@@ -28,6 +28,7 @@
 #include "pypto/ir/program.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/visitor.h"
+#include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/op_predicates.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/transforms/utils/wrapper_call_utils.h"
@@ -58,8 +59,7 @@ ParamIndexMap IndexParams(const std::vector<VarPtr>& params) {
 
 // Per-body index: topmost ReturnStmt, per-var defining AssignStmt, loop-carry
 // edges (iter_arg / tensor return_var -> init value var), and optionally tensor
-// IfStmt merge edges. If merges are collected only for the scope outliner: the
-// general ReturnedParamIndices contract deliberately remains unchanged.
+// IfStmt merge edges. Return queries and scope outlining share branch consensus.
 class BodyIndexCollector : public IRVisitor {
  public:
   explicit BodyIndexCollector(bool collect_if_merges = false) : collect_if_merges_(collect_if_merges) {}
@@ -142,22 +142,55 @@ TraceContext& Ctx() {
 std::vector<std::optional<size_t>> ReturnedParamIndicesImpl(const FunctionPtr& func,
                                                             const ProgramPtr& program);
 
-// Trace a body var back to a param; nullptr when untraceable.
-const Var* TraceVar(const Var* var, const BodyIndexCollector& index, const ParamIndexMap& param_indices,
-                    const ProgramPtr& program, std::unordered_set<const Var*>& visited) {
+struct VarLineage {
+  const Var* root = nullptr;
+  TypePtr returned_type;
+};
+using VarRootMap = std::unordered_map<const Var*, VarLineage>;
+
+// Trace each body var once, caching both roots and failures across branch arms
+// and return values. A provisional empty lineage stops cycles without copying
+// the active path at every merge. Alias chains remain iterative.
+VarLineage TraceVar(const Var* var, const BodyIndexCollector& index, const ParamIndexMap& param_indices,
+                    const ProgramPtr& program, VarRootMap& memo) {
+  // Aliases and validated user calls forward their source type. Builtin
+  // writebacks retain their own final type, allowing intermediate narrowing
+  // followed by restoration without poisoning the cached storage lineage.
+  std::vector<std::pair<const Var*, bool>> path;
+  auto finish = [&](const Var* root, TypePtr returned_type = nullptr) {
+    VarLineage lineage{root, std::move(returned_type)};
+    for (auto it = path.rbegin(); it != path.rend(); ++it) {
+      if (!it->second) lineage.returned_type = it->first->GetType();
+      memo[it->first] = lineage;
+    }
+    return lineage;
+  };
   while (var) {
-    if (!visited.insert(var).second) return nullptr;
-    if (param_indices.count(var)) return var;
+    if (auto it = memo.find(var); it != memo.end()) {
+      return finish(it->second.root, it->second.returned_type);
+    }
+    memo.emplace(var, VarLineage{});
+    path.emplace_back(var, false);
+    if (param_indices.count(var)) return finish(var);
 
     if (auto merge_it = index.merge_srcs.find(var); merge_it != index.merge_srcs.end()) {
       const Var* root = nullptr;
+      TypePtr returned_type;
       for (const Var* source : merge_it->second) {
-        auto branch_visited = visited;
-        const Var* branch_root = TraceVar(source, index, param_indices, program, branch_visited);
-        if (!branch_root || (root && branch_root != root)) return nullptr;
-        root = branch_root;
+        auto branch = TraceVar(source, index, param_indices, program, memo);
+        if (!branch.root || (root && branch.root != root)) return finish(nullptr);
+        if (!root) {
+          returned_type = branch.returned_type;
+        } else if (!returned_type || !branch.returned_type ||
+                   !structural_equal(returned_type, branch.returned_type)) {
+          returned_type = nullptr;
+        }
+        root = branch.root;
       }
-      return root;
+      // Keep storage consensus through narrowed merges; an outer writeback may
+      // restore the final type. Inconsistent branch metadata stays unknown.
+      path.back().second = true;
+      return finish(root, std::move(returned_type));
     }
 
     if (auto carry_it = index.carry_src.find(var); carry_it != index.carry_src.end()) {
@@ -166,10 +199,11 @@ const Var* TraceVar(const Var* var, const BodyIndexCollector& index, const Param
     }
 
     auto def_it = index.var_def.find(var);
-    if (def_it == index.var_def.end()) return nullptr;
+    if (def_it == index.var_def.end()) return finish(nullptr);
     const auto& value = def_it->second->value_;
 
     if (auto rhs_var = AsVarLike(value)) {
+      path.back().second = true;
       var = rhs_var.get();
       continue;
     }
@@ -178,20 +212,21 @@ const Var* TraceVar(const Var* var, const BodyIndexCollector& index, const Param
       // Tuple destructuring of a user call: resolve via the callee's own
       // returned-param map, then continue from the corresponding arg var.
       auto tuple_var = AsVarLike(tuple_get->tuple_);
-      if (!tuple_var) return nullptr;
+      if (!tuple_var) return finish(nullptr);
       auto tuple_def = index.var_def.find(tuple_var.get());
-      if (tuple_def == index.var_def.end()) return nullptr;
+      if (tuple_def == index.var_def.end()) return finish(nullptr);
       auto call = AsCallOrSubmitView(tuple_def->second->value_);
-      if (!call || IsBuiltinOp(call->op_->name_)) return nullptr;
+      if (!call || IsBuiltinOp(call->op_->name_)) return finish(nullptr);
       auto callee = program ? program->GetFunction(call->op_->name_) : nullptr;
-      if (!callee) return nullptr;
+      if (!callee) return finish(nullptr);
       auto ret_map = ReturnedParamIndicesImpl(callee, program);
       size_t pos = static_cast<size_t>(tuple_get->index_);
-      if (tuple_get->index_ < 0 || pos >= ret_map.size() || !ret_map[pos]) return nullptr;
+      if (tuple_get->index_ < 0 || pos >= ret_map.size() || !ret_map[pos]) return finish(nullptr);
       size_t mapped = ret_map[pos].value();  // NOLINT(bugprone-unchecked-optional-access)
-      if (mapped >= call->args_.size()) return nullptr;
+      if (mapped >= call->args_.size()) return finish(nullptr);
       auto arg_var = AsVarLike(call->args_[mapped]);
-      if (!arg_var) return nullptr;
+      if (!arg_var) return finish(nullptr);
+      path.back().second = true;
       var = arg_var.get();
       continue;
     }
@@ -202,7 +237,7 @@ const Var* TraceVar(const Var* var, const BodyIndexCollector& index, const Param
       // the result inherits that argument's param lineage.
       if (auto aliased = op_predicates::BuiltinWritebackArgIndex(call->op_, call->args_.size())) {
         auto arg_var = AsVarLike(call->args_[*aliased]);
-        if (!arg_var) return nullptr;
+        if (!arg_var) return finish(nullptr);
         var = arg_var.get();
         continue;
       }
@@ -226,21 +261,22 @@ const Var* TraceVar(const Var* var, const BodyIndexCollector& index, const Param
       if (!IsBuiltinOp(op_name)) {
         // Single-result user call: continue from the arg the callee returns.
         auto callee = program ? program->GetFunction(op_name) : nullptr;
-        if (!callee) return nullptr;
+        if (!callee) return finish(nullptr);
         auto ret_map = ReturnedParamIndicesImpl(callee, program);
-        if (ret_map.size() != 1 || !ret_map[0]) return nullptr;
+        if (ret_map.size() != 1 || !ret_map[0]) return finish(nullptr);
         size_t mapped = ret_map[0].value();  // NOLINT(bugprone-unchecked-optional-access)
-        if (mapped >= call->args_.size()) return nullptr;
+        if (mapped >= call->args_.size()) return finish(nullptr);
         auto arg_var = AsVarLike(call->args_[mapped]);
-        if (!arg_var) return nullptr;
+        if (!arg_var) return finish(nullptr);
+        path.back().second = true;
         var = arg_var.get();
         continue;
       }
-      return nullptr;
+      return finish(nullptr);
     }
-    return nullptr;
+    return finish(nullptr);
   }
-  return nullptr;
+  return finish(nullptr);
 }
 
 std::vector<std::optional<size_t>> TraceExprsToParamIndices(const std::vector<ExprPtr>& exprs,
@@ -249,12 +285,15 @@ std::vector<std::optional<size_t>> TraceExprsToParamIndices(const std::vector<Ex
                                                             const ProgramPtr& program) {
   std::vector<std::optional<size_t>> result;
   result.reserve(exprs.size());
+  VarRootMap memo;
   for (const auto& expr : exprs) {
     std::optional<size_t> idx;
     if (auto var = AsVarLike(expr)) {
-      std::unordered_set<const Var*> visited;
-      if (const Var* root = TraceVar(var.get(), index, param_indices, program, visited)) {
-        auto param_it = param_indices.find(root);
+      auto lineage = TraceVar(var.get(), index, param_indices, program, memo);
+      if (lineage.root &&
+          (!AsTensorTypeLike(var->GetType()) ||
+           (lineage.returned_type && structural_equal(lineage.returned_type, lineage.root->GetType())))) {
+        auto param_it = param_indices.find(lineage.root);
         if (param_it != param_indices.end()) idx = param_it->second;
       }
     }
@@ -391,7 +430,8 @@ std::vector<std::optional<size_t>> ReturnedParamIndicesImpl(const FunctionPtr& f
     return result;
   };
 
-  BodyIndexCollector index;
+  // Graph boundary analyses do not propagate tensor roots through If merges yet.
+  BodyIndexCollector index(/*collect_if_merges=*/func->func_type_ != FunctionType::Graph);
   index.VisitStmt(func->body_);
   if (!index.first_return || index.first_return->value_.empty()) {
     if (IsWrapperType(func->func_type_)) {
@@ -503,8 +543,8 @@ VarPtr TraceToParam(const VarPtr& var, const StmtPtr& body, const std::vector<Va
   BodyIndexCollector index;
   index.VisitStmt(body);
   auto param_indices = IndexParams(params);
-  std::unordered_set<const Var*> visited;
-  const Var* root = TraceVar(var.get(), index, param_indices, program, visited);
+  VarRootMap memo;
+  const Var* root = TraceVar(var.get(), index, param_indices, program, memo).root;
   if (!root) return nullptr;
   auto param_it = param_indices.find(root);
   return param_it == param_indices.end() ? nullptr : params[param_it->second];

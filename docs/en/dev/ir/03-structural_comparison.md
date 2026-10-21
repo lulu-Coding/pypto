@@ -1,339 +1,136 @@
-# PyPTO Structural Comparison
+# Structural Comparison
 
-## Overview
-
-PyPTO provides two utility functions for comparing IR nodes by structure rather than pointer identity:
-
-```python
-structural_equal(lhs, rhs, enable_auto_mapping=False) -> bool
-structural_hash(node, enable_auto_mapping=False) -> int
-```
-
-**Use Cases:** CSE, IR optimization, pattern matching, testing
-
-**Key Feature:** Both functions ignore `Span` (source location), focusing only on logical structure.
-
-## Reference vs Structural Equality
-
-### Reference Equality (Default `==`)
-
-Compares pointer addresses (O(1), fast):
+`structural_equal`, `structural_hash`, and `assert_structural_equal` use one exact
+structural semantics. There is no comparison mode. `Type.__eq__` and
+`Type.__hash__` use the same implementation.
 
 ```python
 from pypto import DataType, ir
 
-x1 = ir.Var("x", ir.ScalarType(DataType.INT64), ir.Span.unknown())
-x2 = ir.Var("x", ir.ScalarType(DataType.INT64), ir.Span.unknown())
-assert x1 != x2  # Different pointers
+span = ir.Span.unknown()
+x = ir.Var("x", ir.ScalarType(DataType.INDEX), span)
+y = ir.Var("y", ir.ScalarType(DataType.INDEX), span)
+assert not ir.structural_equal(x, y)
+assert ir.structural_equal(x, y, enable_auto_mapping=True)
+assert ir.structural_hash(x, True) == ir.structural_hash(y, True)
+ir.assert_structural_equal(x, y, True)
 ```
 
-### Structural Equality
+## Equality Contract
 
-Compares content and structure:
+| Field | Comparison |
+| ----- | ---------- |
+| Source spans, comments, function and bound-variable names | Ignored through `IgnoreField` |
+| Definitions and uses | Consistently alpha-renamed; alias patterns preserved |
+| Free variables | Identity preserved unless `enable_auto_mapping=True` |
+| Scalar dtypes | Exact raw codes, including `INDEX` versus `INT64` |
+| Floating values | Exact stored bits, including signed zero and NaN payload/sign |
+| Operators | Kind and name, independent of pointer identity |
+| Attributes | Unique keys sorted; value types and vector order retained |
+| Types and views | All reflected fields, including attached storage and nullable offsets |
+| Function metadata | Directions, return types, attrs, kind, stage and runtime-binding flag |
+| Call and Submit | Distinct kinds; reflected scheduling fields participate |
+
+`f(x) = x + x` and `g(y) = y + y` compare equal. Replacing the second `y` with
+another parameter changes the reference pattern and compares unequal. Sharing a
+pure expression subtree does not change equality.
 
 ```python
-ir.assert_structural_equal(x1, x2, enable_auto_mapping=True)  # True
+a = ir.ConstFloat(0.0, DataType.FP32, span)
+b = ir.ConstFloat(-0.0, DataType.FP32, span)
+assert not ir.structural_equal(a, b)
+assert not ir.structural_equal(
+    ir.ConstInt(1, DataType.INDEX, span),
+    ir.ConstInt(1, DataType.INT64, span),
+)
 ```
 
-## Comparison Process
+A Function reserves all parameters before traversing its signature, so an earlier
+tensor shape may reference a later scalar parameter. Symbols in physical parameter
+shapes and bare `valid_shape` slots are additional bindings. The classification is
+shared with `MaterializeValidShapeSymbols` and traverses tuple constructors and
+item expressions. Other open references retain free-variable semantics.
+Program functions have independent contexts; program map keys and callee names
+remain significant.
 
-The `structural_equal` function follows these steps:
+## Storage and Partial IR
 
-1. **Fast Path Checks**
-   - Reference equality: If same pointer, return `true`
-   - Null check: If either is null, return `false`
-   - Type check: Compare `TypeName()` - must match exactly
+`MemRef`, `WindowBuffer`, pointer/resource marker types, and attached storage are
+supported. Storage descriptors retain their base allocation references, geometry,
+slot expressions, and staging flags. Different allocation-reference patterns must
+not collapse merely because their sizes match. Unknown types can be compared as
+unknown types; their presence does not certify that type inference is complete.
 
-2. **Type Dispatch**
-   - Variables get special handling (auto-mapping)
-   - Other types use reflection-based field comparison
-
-3. **Field-Based Recursive Comparison**
-   - Get field descriptors via `GetFieldDescriptors()`
-   - Iterate through all fields using reflection
-   - Compare each field based on its type
-   - Combine results with AND logic
-
-## Reflection and Field Types
-
-The reflection system defines three field types:
-
-| Field Type | Auto-Mapping | Compared? | Use Case | Effect |
-| ---------- | ------------ | --------- | -------- | ------ |
-| **IgnoreField** | N/A | ❌ No | Source locations (`Span`), names | Always considered equal |
-| **UsualField** | Follows parameter | ✅ Yes | Operands, expressions, types | Compared with current `enable_auto_mapping` |
-| **DefField** | ✅ Always enabled | ✅ Yes | Variable definitions, parameters | Always uses auto-mapping |
-
-### Example Field Definitions
-
-```cpp
-class IRNode {
-  Span span_;
-  static constexpr auto GetFieldDescriptors() {
-    return std::make_tuple(
-      reflection::IgnoreField(&IRNode::span_, "span")
-    );
-  }
-};
-
-class BinaryExpr : public Expr {
-  ExprPtr left_;
-  ExprPtr right_;
-  static constexpr auto GetFieldDescriptors() {
-    return std::tuple_cat(
-      Expr::GetFieldDescriptors(),
-      std::make_tuple(
-        reflection::UsualField(&BinaryExpr::left_, "left"),
-        reflection::UsualField(&BinaryExpr::right_, "right")
-      )
-    );
-  }
-};
-
-class AssignStmt : public Stmt {
-  VarPtr var_;     // Definition
-  ExprPtr value_;  // Usage
-  static constexpr auto GetFieldDescriptors() {
-    return std::tuple_cat(
-      Stmt::GetFieldDescriptors(),
-      std::make_tuple(
-        reflection::DefField(&AssignStmt::var_, "var"),
-        reflection::UsualField(&AssignStmt::value_, "value")
-      )
-    );
-  }
-};
-```
-
-### Why DefField Matters
-
-DefFields represent variable definitions. When comparing definitions, we care about structural position, not identity:
+Structure comparison does not verify SSA, scope validity, closure, side effects,
+or eligibility for a particular optimization. Comparing invalid IR to itself can
+succeed. Optimization passes must verify their own preconditions first.
 
 ```python
-# Build: x = y
-x1 = ir.Var("x", ir.ScalarType(DataType.INT64), span)
-y1 = ir.Var("y", ir.ScalarType(DataType.INT64), span)
-stmt1 = ir.AssignStmt(x1, y1, span)
-
-# Build: a = b
-a = ir.Var("a", ir.ScalarType(DataType.INT64), span)
-b = ir.Var("b", ir.ScalarType(DataType.INT64), span)
-stmt2 = ir.AssignStmt(a, b, span)
-
-# var_ is DefField, so x1 and a are mapped automatically
-ir.assert_structural_equal(stmt1, stmt2, enable_auto_mapping=True)
+ir.verify_structural_bindings(function)
+fingerprint = ir.structural_hash(function)
 ```
 
-## structural_equal Function
+`verify_structural_bindings` checks repeated definitions and local uses before
+definition or outside lexical scope, including uses inside types and attributes.
+Assignments bind after their RHS, loop initializers use the outer scope, and region
+results bind after the region. Branch/loop locals cannot escape; straight-line
+scope definitions can flow out. Open captures are allowed. The verifier also checks
+signature-symbol eligibility and rejects shared statement objects. It is not a
+replacement for the complete compiler verifier or an optimization's effect checks.
 
-### Basic Usage
+## Diagnostics and Unsupported Payloads
 
-```python
-# Same value
-c1 = ir.ConstInt(42, DataType.INT64, ir.Span.unknown())
-c2 = ir.ConstInt(42, DataType.INT64, ir.Span.unknown())
-ir.assert_structural_equal(c1, c2)  # True
+`assert_structural_equal` raises `ValueError` with the first differing field path.
+Unrepresentable structures raise `StructuralComparisonUnsupported` (a `TypeError`)
+with `reason` and `field_path`: unknown attribute payload types, duplicate attribute
+keys, cycles, and node/type nesting beyond 512 levels. These errors are distinct
+from inequality. Binding verification uses the same structured error reporting;
+`BindingNotVisible` identifies the actual invalid use, including later uses of a
+shared expression or type.
 
-# Different types
-var = ir.Var("x", ir.ScalarType(DataType.INT64), ir.Span.unknown())
-const = ir.ConstInt(1, DataType.INT64, ir.Span.unknown())
-assert not ir.structural_equal(var, const)  # False
-```
+## Implementation and Complexity
 
-### Auto-Mapping Behavior
+The reflection descriptors determine the compared fields: `IgnoreField` skips
+metadata, `UsualField` follows structure, and `DefField` establishes a binding.
+One projection in `src/ir/transforms/structural_comparison.cpp` supplies equality,
+hashing, and diagnostics. It first reserves binding identities, then builds immutable
+records containing exact scalar values and child record IDs. Records are interned
+by full ordered keys. Equality compares IDs in a shared arena, never hash values.
+Hashes combine child hashes rather than arena IDs, so independent invocations agree.
 
-| Scenario | enable_auto_mapping=False | enable_auto_mapping=True |
-| -------- | ------------------------- | ------------------------ |
-| Same variable pointer | ✅ Equal | ✅ Equal |
-| Different variable pointers | ❌ Not equal | ✅ Equal (if type matches) |
-| Consistent mapping (`x + x` vs `y + y`) | ❌ Not equal | ✅ Equal |
-| Inconsistent mapping (`x + x` vs `y + z`) | ❌ Not equal | ❌ Not equal |
+Memoization distinguishes definitions from references and belongs to one function
+context. Expression/type DAGs are traversed without expansion into trees. For N
+visited nodes plus field/string data, projection costs O(N log N) time and O(N)
+space. Binding verification propagates use intervals through DAG edges to check all
+use sites without repeatedly traversing shared subtrees.
 
-### When to Enable Auto-Mapping
+Hashes are process-local fingerprints, not persistent cache keys. Use the same
+`enable_auto_mapping` policy for hashing and equality, and always confirm hash
+matches with equality before merging candidates.
 
-| Use Case | Setting |
-| -------- | ------- |
-| Pass transform tests (Before/Expected pattern) | `False` (default) — DefFields always auto-map |
-| Serialization round-trip tests | `True` — deserialized Vars are never DefFields |
-| Pattern matching regardless of variable names | `True` |
-| Template matching for optimization rules | `True` |
-| Exact matching with same variables | `False` |
-| CSE (Common Subexpression Elimination) | `False` |
+## Migration from Relaxed Comparison
 
-> **Why pass tests don't need it:** `VisitDefField` always enables auto-mapping
-> internally (see `structural_equal.cpp:650`), populating the bidirectional Var
-> maps. When the same Vars later appear as UsualField references, they are found
-> in the maps — even with `enable_auto_mapping=False`.
+Structural comparison no longer treats integer syntax dtypes as interchangeable,
+compares floating values numerically, or ignores attached memory references.
+Consumers needing type compatibility must state which fields are irrelevant to
+that operation. Printers/parsers must preserve exact dtypes, or their callers must
+explicitly normalize syntax before comparison. Do not add compatibility exceptions
+to the structural comparator. Tuple annotations validate element kinds, shapes, and
+dtypes recursively. Omitted views and memory spaces are inherited from inference, including for
+annotated loop results. Allocation annotations, including their absence, remain exact.
 
-## structural_hash Function
+## Lossless Text Roundtrips
 
-### Basic Usage
+The printer retains non-INDEX shape dtypes and typed offset expressions. Storage
+calls use private `pl._dump.call` and `pl._dump.submit` spellings to preserve their
+recorded result types independently of operator or callee inference. Multi-result
+regions use `pl._dump.yield_(..., types=[...])`. These spellings are parser markers,
+not a kernel authoring API. Roundtrip instruments explicitly map open references
+because reconstruction creates fresh objects; definitions and storage aliases
+still participate in exact comparison.
 
-```python
-c1 = ir.ConstInt(42, DataType.INT64, ir.Span.unknown())
-c2 = ir.ConstInt(42, DataType.INT64, ir.Span.unknown())
-assert ir.structural_hash(c1) == ir.structural_hash(c2)
-```
-
-### Determinism
-
-`structural_hash` is deterministic within a single process run. Variable identity is based on monotonic unique IDs (`Var::unique_id_`) assigned at construction, not pointer addresses or `name_hint_` strings, so the same construction sequence always produces the same hashes. The `name_hint_` field is an `IgnoreField` and is excluded from both structural comparison and hashing.
-
-### Hash Consistency Guarantee
-
-**Rule:** If `structural_equal(a, b, mode)` is `True`, then `structural_hash(a, mode) == structural_hash(b, mode)`
-
-### Using with Containers
-
-```python
-class CSEPass:
-    def __init__(self):
-        self.expr_cache = {}
-
-    def deduplicate(self, expr):
-        hash_val = ir.structural_hash(expr, enable_auto_mapping=False)
-        if hash_val in self.expr_cache:
-            for cached_expr in self.expr_cache[hash_val]:
-                if ir.structural_equal(expr, cached_expr, enable_auto_mapping=False):
-                    return cached_expr
-            self.expr_cache[hash_val].append(expr)
-        else:
-            self.expr_cache[hash_val] = [expr]
-        return expr
-```
-
-## Auto-Mapping Algorithm
-
-The implementation maintains bidirectional maps:
-
-```cpp
-class StructuralEqual {
-  std::unordered_map<VarPtr, VarPtr> lhs_to_rhs_var_map_;
-  std::unordered_map<VarPtr, VarPtr> rhs_to_lhs_var_map_;
-
-  bool EqualVar(const VarPtr& lhs, const VarPtr& rhs) {
-    if (!enable_auto_mapping_) {
-      return lhs.get() == rhs.get();  // Strict pointer equality
-    }
-
-    // Check type equality first
-    if (!EqualType(lhs->GetType(), rhs->GetType())) return false;
-
-    // Check existing mapping
-    auto it = lhs_to_rhs_var_map_.find(lhs);
-    if (it != lhs_to_rhs_var_map_.end()) {
-      return it->second == rhs;  // Verify consistent
-    }
-
-    // Ensure rhs not already mapped to different lhs
-    auto rhs_it = rhs_to_lhs_var_map_.find(rhs);
-    if (rhs_it != rhs_to_lhs_var_map_.end() && rhs_it->second != lhs) {
-      return false;
-    }
-
-    // Create new mapping
-    lhs_to_rhs_var_map_[lhs] = rhs;
-    rhs_to_lhs_var_map_[rhs] = lhs;
-    return true;
-  }
-};
-```
-
-**Key Points:**
-
-- Without auto-mapping: strict identity comparison (pointer equality for `structural_equal`, unique IDs for `structural_hash`)
-- With auto-mapping: establish and enforce consistent mapping
-- Type equality checked before mapping
-- Bidirectional maps prevent inconsistent mappings
-
-## Implementation Details
-
-### Hash Combine Algorithm
-
-Uses Boost-inspired algorithm:
-
-```cpp
-inline uint64_t hash_combine(uint64_t seed, uint64_t value) {
-  return seed ^ (value + 0x9e3779b9 + (seed << 6) + (seed >> 2));
-}
-```
-
-### Reflection-Based Field Visitor
-
-Generic traversal without type-specific code:
-
-```cpp
-template <typename NodePtr>
-bool EqualWithFields(const NodePtr& lhs_op, const NodePtr& rhs_op) {
-  using NodeType = typename NodePtr::element_type;
-  auto descriptors = NodeType::GetFieldDescriptors();
-  return std::apply([&](auto&&... descs) {
-    return reflection::FieldIterator<...>::Visit(
-      *lhs_op, *rhs_op, *this, descs...);
-  }, descriptors);
-}
-```
-
-### Types Are Compared by Hand, Not by Reflection
-
-`Expr` and `Stmt` go through the reflection visitor above. **`Type` does not.**
-Four independent if/else ladders each re-encode "what fields does this Type
-have", and nothing links them:
-
-| Ladder | Location |
-| ------ | -------- |
-| `EqualType` | `src/ir/transforms/structural_equal.cpp` |
-| `HashType` | `src/ir/transforms/structural_hash.cpp` |
-| `SerializeType` | `src/ir/serialization/serializer.cpp` |
-| `DeserializeType` | `src/ir/serialization/deserializer.cpp` |
-
-**Adding a Type means editing all four.** A Type added to three of them
-compiles, passes serialization round-trips, and compares correctly — then hits
-`HashType`'s trailing `INTERNAL_CHECK(false)` the first time a user writes
-`hash(t)` or puts the Type in a `set`. That breaks the equal-nodes-hash-equally
-guarantee above, since `structural_equal` accepts what `structural_hash`
-rejects.
-
-Three dispatch hazards to mirror across the ladders:
-
-- **Subclass kinds.** `As<T>()` is a precise `ObjectKind` match, so
-  `As<TensorType>(dt)` returns `nullptr` for a `DistributedTensorType` by
-  design (see `include/pypto/ir/kind_traits.h`). A shared branch must name both
-  kinds explicitly and `static_pointer_cast` — see `.claude/rules/ir-kind-traits.md`.
-- **Subclass-only fields.** `DistributedTensorType::window_buffer_` has no
-  `TensorType` counterpart; a shared branch has to hash and compare it under a
-  kind guard.
-- **Nullable fields.** A bare `ExprPtr` field with no non-null invariant —
-  `TileView::start_offset`, which the default ctor and `pl.TileView(...)` both
-  leave unset — is a *legal, distinct* state, not a construction bug.
-  `EqualType` gets that for free by routing it through the null-tolerant
-  `Equal(...)`, so `HashType` must hash a presence tag rather than
-  `INTERNAL_CHECK` on it. Guarding one ladder and not the other breaks the
-  guarantee in the same direction as a missing Type: `structural_equal` reports
-  a value equal to itself that `structural_hash` aborts on. Reserve
-  `INTERNAL_CHECK` in `HashType` for fields that genuinely cannot be null, such
-  as `shape_` elements.
-
-`tests/ut/ir/transforms/test_hash.py::TestHashTypeLadderParity` walks every
-Python-constructible Type and fails when one is missing from `HashType`. Add a
-factory there for each new Type.
-
-## Summary
-
-**Key Takeaways:**
-
-1. **Three Field Types**:
-   - `IgnoreField`: Never compared (Span, names)
-   - `UsualField`: Compared with user's `enable_auto_mapping`
-   - `DefField`: Always uses auto-mapping
-
-2. **Auto-Mapping**:
-   - Enable for pattern matching
-   - Disable for exact CSE
-   - Always consistent: maintains bijective variable mapping
-
-3. **Hash Consistency**:
-   - Equal nodes → equal hashes (guaranteed)
-   - Use same `enable_auto_mapping` for both functions
-
-For IR node types and construction, see [IR Overview](00-overview.md).
+Within a function, allocation bases referenced only by storage descriptors are
+implicit resource bindings. A MemRef's identity is its base plus descriptor fields,
+not the descriptor object's address. WindowBuffer retains its resource binding and
+all storage fields. This permits renamed and serialized functions to compare equal
+while preserving allocation and window alias patterns.

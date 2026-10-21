@@ -46,6 +46,19 @@ from pypto import ir, passes
 from pypto.backend import BackendType
 
 
+def _default_allocation_snapshot(program: ir.Program) -> ir.Program:
+    """Inspect planner-owned Tile allocations while still running the full pipeline."""
+    from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
+
+    snapshot = None
+    for transform in PassManager(OptimizationStrategy.Default).passes:
+        if transform.get_name() == "LowerTileToBuffer":
+            snapshot = program
+        program = transform(program)
+    assert snapshot is not None
+    return snapshot
+
+
 class TestAutoTileMatmulL0ExplicitL0Diagnostics:
     """Actionable failures for manual L0 operands that cannot fit."""
 
@@ -698,7 +711,7 @@ class TestAutoTileMatmulL0KOnly:
         once = passes.auto_tile_matmul_l0()(Before)
         # First run must have rewritten — otherwise the idempotency check is
         # vacuously true.
-        with pytest.raises(ValueError, match="Structural equality"):
+        with pytest.raises(ValueError, match="Structural mismatch"):
             ir.assert_structural_equal(once, Before)
         twice = passes.auto_tile_matmul_l0()(once)
         ir.assert_structural_equal(twice, once)
@@ -748,7 +761,7 @@ class TestAutoTileMatmulL0KOnly:
         so this test asserts the branch is *absent*.
         """
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -786,7 +799,7 @@ class TestAutoTileMatmulL0KOnly:
     def test_matmul_bias_a2a3_float_mat_bias_is_supported(self):
         """The pinned A2/A3 ISA supports an FP32 Mat-to-Bias move."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -812,7 +825,7 @@ class TestAutoTileMatmulL0KOnly:
     def test_matmul_bias_a2a3_int_k_split_is_supported(self):
         """A2/A3 supports the INT32 Mat-to-Bias path used by INT8 matmul."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -1378,7 +1391,7 @@ class TestAutoTileMatmulL0MNTiling:
     def test_matmul_bias_mn_and_k_tiling_slices_bias_by_n(self):
         """Each output-column tile reloads one Bias window and applies it once."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
         M, K, N = 256, 1024, 512
 
         @pl.program
@@ -1436,7 +1449,7 @@ class TestAutoTileMatmulL0MNTiling:
     def test_matmul_bias_n_tiling_with_partial_valid_load_is_deferred(self):
         """A narrowed bias snapshot cannot be widened by reconstructed N-window loads."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
         M, K, N = 256, 1024, 512
 
         @pl.program
@@ -1462,7 +1475,7 @@ class TestAutoTileMatmulL0MNTiling:
     def test_matmul_bias_n_tiling_without_store_reports_placement_hint(self, capfd):
         """A missing store is a placement gap, not a bias-snapshot ordering hazard."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
         M, K, N = 256, 1024, 512
 
         @pl.program
@@ -1490,7 +1503,7 @@ class TestAutoTileMatmulL0MNTiling:
     def test_matmul_bias_n_tiling_with_intervening_store_is_deferred(self):
         """Reloading after an intervening effect must not replace the earlier bias snapshot."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
         M, K, N = 256, 1024, 512
 
         @pl.program
@@ -1635,7 +1648,7 @@ class TestAutoTileMatmulL0MNTiling:
     def test_matmul_bias_window_load_uses_tensor_remapped_by_earlier_fold(self):
         """A prior M/N store fold must update a later reconstructed bias load."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
         M, K, N = 256, 1024, 512
 
         @pl.program
@@ -1672,7 +1685,7 @@ class TestAutoTileMatmulL0MNTiling:
     def test_matmul_bias_capacity_caps_n_even_when_l0abc_fit(self):
         """The 910B 1 KiB bias table limits INT32 bias windows to N=256."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
         M, K, N = 16, 32, 512
 
         @pl.program
@@ -1702,7 +1715,7 @@ class TestAutoTileMatmulL0MNTiling:
     def test_matmul_bias_nonfractal_mn_is_deferred(self):
         """AutoTile does not emit physically illegal narrow cube/Bias boxes."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -1772,7 +1785,7 @@ class TestAutoTileMatmulL0MNTiling:
     def test_matmul_bias_m_only_tiling_reuses_bias_resident_source(self):
         """M-only tiling reuses one full-width Bias tile without pipeline replication."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
         # FP32 Bias capacity is N=256 on 910B. The output needs M tiling,
         # while full N fits only when the existing Bias tile is charged once;
         # applying the Mat-window /2 pipeline bound would force unsupported N
@@ -1941,7 +1954,7 @@ class TestAutoTileMatmulL0MNTiling:
 
         After = passes.auto_tile_matmul_l0()(Before)
         # Sanity: the pass actually tiled (otherwise the numeric check is vacuous).
-        with pytest.raises(ValueError, match="Structural equality"):
+        with pytest.raises(ValueError, match="Structural mismatch"):
             ir.assert_structural_equal(After, Before)
         ok, max_diff = _torch_codegen_matches_matmul(After, 512, 512, 512)
         assert ok, f"512×512 M/N-tiled output mismatch: max abs diff {max_diff:.3e}"
@@ -1973,13 +1986,13 @@ class TestAutoTileMatmulL0MNTiling:
                 return out
 
         After = passes.auto_tile_matmul_l0()(Before)
-        with pytest.raises(ValueError, match="Structural equality"):
+        with pytest.raises(ValueError, match="Structural mismatch"):
             ir.assert_structural_equal(After, Before)
         ok, max_diff = _torch_codegen_matches_matmul(After, 384, 384, 512)
         assert ok, f"384×384 partial-tile output mismatch: max abs diff {max_diff:.3e}"
 
     def test_mn_tiling_end_to_end_no_l0c_overflow(self):
-        """End-to-end acceptance: a 256×256 @ 256 FP32 matmul on Ascend910B
+        """End-to-end acceptance: a 256×256 @ 256 FP32 matmul on Ascend910
         (output 256 KB > L0c = 128 KB; operands fit L1) compiles through the
         **full** pass pipeline — M/N tiling makes it pass ``AllocateMemoryAddr``
         with no L0c overflow — and the executed ``torch_codegen`` reference
@@ -1994,7 +2007,7 @@ class TestAutoTileMatmulL0MNTiling:
         # but overflows it on 910B, which is the configuration that forces M/N
         # tiling here (and matches the solver's per-tile-kernel target backend).
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @jit
         def kernel(a: pl.Tensor, b: pl.Tensor, c: pl.Out[pl.Tensor]):
@@ -2104,13 +2117,13 @@ class TestAutoTileMatmulL0MNTiling:
         inner cols, both ``ForKind::Pipeline`` stage=2 — so ``LowerPipelineLoops``
         double-buffers both operand extracts (the pto-isa cost model's ~15% win).
 
-        384×640 @ 64 BF16 on Ascend910B: the roofline chooser picks (m=192, n=160,
+        384×640 @ 64 BF16 on Ascend910: the roofline chooser picks (m=192, n=160,
         k=64), a divisible 2×4 grid (output [384,640] FP32 overflows L0c). The left
         panel (192×64) is not smaller than the right (64×160), so A is stationary
         and the M-row loop is the outer one."""
 
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -2159,10 +2172,10 @@ class TestAutoTileMatmulL0MNTiling:
         case).  Same nested-pipelined-loop structure; the outer loop iterates over
         N, the inner over M.
 
-        384×256 @ 64 BF16 on Ascend910B."""
+        384×256 @ 64 BF16 on Ascend910."""
 
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -2209,7 +2222,7 @@ class TestAutoTileMatmulL0MNTiling:
         """The full-K OS emit must hoist the SAME operand the chooser scored the
         wall under — a bandwidth-weighted (not raw-byte) decision.
 
-        384×512 @ 64 BF16 on Ascend910B → output-stationary full-K tile
+        384×512 @ 64 BF16 on Ascend910 → output-stationary full-K tile
         (m = 128, n = 256), a 3×2 grid. L0A is faster than L0B (~200 vs ~132
         B/cyc), so streaming A on the fast port while holding B is cheaper than the
         reverse: the chooser's min-hoist load scores **hold B**, recorded in
@@ -2227,7 +2240,7 @@ class TestAutoTileMatmulL0MNTiling:
         avoids it. This aligned-N asymmetric shape exercises the same hoist path.)"""
 
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -2286,7 +2299,7 @@ class TestAutoTileMatmulL0MNTiling:
         in ``test_a_stationary_*``.)"""
 
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -2335,7 +2348,7 @@ class TestAutoTileMatmulL0MNTiling:
         from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
 
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -2434,7 +2447,7 @@ class TestAutoTileMatmulL0MNTiling:
         from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
 
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -2568,7 +2581,7 @@ class TestAutoTileMatmulL0MNTiling:
         strictly cheaper full-K one-dimensional dbC schedule.
         """
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -2639,7 +2652,7 @@ class TestAutoTileMatmulL0MNTiling:
     ):
         """Planner-specific A-stationary shapes reuse held A across the moving loop."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -2708,7 +2721,7 @@ class TestAutoTileMatmulL0MNTiling:
     ):
         """Planner-specific B-stationary system shapes keep B in the outer loop."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -2769,7 +2782,7 @@ class TestAutoTileMatmulL0MNTiling:
         """Structural lock for the direct-store dbC system-test geometries."""
         K = 64
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -2820,7 +2833,7 @@ class TestAutoTileMatmulL0MNTiling:
         from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
 
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -2905,7 +2918,7 @@ class TestAutoTileMatmulL0MNTiling:
         smaller, <= L0C/2) leaves room for two co-live buffers.
         """
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -2956,7 +2969,6 @@ class TestAutoTileMatmulL0MNTiling:
         the two co-live L0C accumulators in distinct buffers. Default off: the same shape
         coalesces to a single accumulator. Pins the opt-in gate + the end-to-end
         allocation (the golden test above only pins the emit ordering)."""
-        from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
 
         @pl.program
         class Before:
@@ -2979,7 +2991,7 @@ class TestAutoTileMatmulL0MNTiling:
 
         def acc_buffer_count() -> int:
             """Distinct L0C (Acc) buffers after the full Default pipeline."""
-            prog = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Before)
+            prog = _default_allocation_snapshot(Before)
             bases = {
                 line.strip().split(":")[0]
                 for line in ir.python_print(prog).splitlines()
@@ -2988,12 +3000,12 @@ class TestAutoTileMatmulL0MNTiling:
             return len(bases)
 
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
         with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO):
             assert acc_buffer_count() == 1, "PyPTO default must keep a single L0C accumulator (dbC=1)"
 
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
         with passes.PassContext(
             [], memory_planner=passes.MemoryPlanner.PYPTO, enable_pypto_l0c_double_buffer=True
         ):
@@ -3016,11 +3028,10 @@ class TestAutoTileMatmulL0MNTiling:
         the inner loop carrying ``pipeline_double_buffer_c``. PYPTO requires
         its legacy opt-in; DSA_RP enables dbC automatically and ignores it.
         """
-        from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
 
         K = 128
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -3040,12 +3051,12 @@ class TestAutoTileMatmulL0MNTiling:
         pypto_opt_in = planner == passes.MemoryPlanner.PYPTO
         with passes.PassContext([], memory_planner=planner, enable_pypto_l0c_double_buffer=pypto_opt_in):
             tiled = passes.auto_tile_matmul_l0()(Before)
-            optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Before)
+            optimized = _default_allocation_snapshot(Before)
 
         if planner == passes.MemoryPlanner.DSA_RP:
             with passes.PassContext([], memory_planner=planner, enable_pypto_l0c_double_buffer=True):
                 explicit_tiled = passes.auto_tile_matmul_l0()(Before)
-                explicit_optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Before)
+                explicit_optimized = _default_allocation_snapshot(Before)
             ir.assert_structural_equal(tiled, explicit_tiled)
             ir.assert_structural_equal(optimized, explicit_optimized)
 
@@ -3087,7 +3098,7 @@ class TestAutoTileMatmulL0MNTiling:
 
         K = 64
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -3232,10 +3243,9 @@ class TestAutoTileMatmulL0ExistingPipelineDbC:
 
     def test_marks_only_direct_inner_pipeline_when_two_accumulators_fit(self):
         """#2131 shape: shared L0A, moving L0B, and two 8 KiB L0C slots."""
-        from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
 
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
         Before = self._single_matmul_pipeline()
 
         After = passes.auto_tile_matmul_l0()(Before)
@@ -3265,7 +3275,7 @@ class TestAutoTileMatmulL0ExistingPipelineDbC:
 
         # PyPTO must preserve the two Acc slots without requiring the chooser's
         # experimental enable_pypto_l0c_double_buffer flag.
-        allocated = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Before)
+        allocated = _default_allocation_snapshot(Before)
         allocated_text = ir.python_print(allocated)
 
         def alloc_bases(space: str) -> set[str]:
@@ -3292,10 +3302,9 @@ class TestAutoTileMatmulL0ExistingPipelineDbC:
         Complete pairs are scheduled as ``MMSS`` and an odd final stage as
         ``MS``; they must not become ``inner_stage`` co-live accumulators.
         """
-        from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
 
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
         # Keep nested-pipeline L0B placement below the 64 KiB Right capacity so
         # both tested source depths are legal independently of the L0C policy.
         Before = self._single_matmul_pipeline(tile_n=32, inner_stage=inner_stage, width=width)
@@ -3315,7 +3324,7 @@ class TestAutoTileMatmulL0ExistingPipelineDbC:
                 sequence.append("S")
         assert expected in "".join(sequence), f"expected depth-two dbC chunks, got: {sequence}"
 
-        allocated = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Before)
+        allocated = _default_allocation_snapshot(Before)
         acc_allocs = {
             line.strip().split(":")[0]
             for line in ir.python_print(allocated).splitlines()
@@ -3328,7 +3337,7 @@ class TestAutoTileMatmulL0ExistingPipelineDbC:
     def test_rejects_pipeline_with_separately_lowered_tail_group(self):
         """A partial stage group can need an additional physical Acc allocation."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
         # Three iterations at stage=2 lower as one two-stage main group plus a
         # separate one-stage tail. Until allocation can prove cross-group reuse,
         # leave this pipeline on its original one-accumulator policy.
@@ -3340,7 +3349,7 @@ class TestAutoTileMatmulL0ExistingPipelineDbC:
     def test_defers_single_compute_drain_pair(self):
         """Two iterations do not amortize the two-slot fill/drain bubble."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         Before = self._single_matmul_pipeline(tile_n=128, inner_stage=2, width=256)
 
@@ -3351,7 +3360,7 @@ class TestAutoTileMatmulL0ExistingPipelineDbC:
     def test_marks_exact_half_l0c_accumulator(self):
         """Two 128x128 f32 accumulators exactly fill A2/A3's 128 KiB L0C."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         After = passes.auto_tile_matmul_l0()(self._single_matmul_pipeline(tile_m=128))
         assert "pipeline_double_buffer_c" in ir.python_print(After)
@@ -3361,7 +3370,7 @@ class TestAutoTileMatmulL0ExistingPipelineDbC:
         """M=16 INT32 occupies 32 physical rows on 910B: two 16x512
         accumulators exactly fit L0C, while two 16x768 accumulators need 192 KiB."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         after = passes.auto_tile_matmul_l0()(self._int8_pipeline(tile_n))
         assert ("pipeline_double_buffer_c" in ir.python_print(after)) is expected_marker
@@ -3369,13 +3378,10 @@ class TestAutoTileMatmulL0ExistingPipelineDbC:
     def test_int32_dbc_allocations_use_non_overlapping_physical_ranges(self):
         """The admitted 16x512 INT32 ping-pong gets two physical 64 KiB
         allocations, not adjacent logical 32 KiB ranges that overlap in SRAM."""
-        from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
 
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
-        allocated = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(
-            self._int8_pipeline(tile_n=512)
-        )
+        _backend.set_backend_type(BackendType.Ascend910)
+        allocated = _default_allocation_snapshot(self._int8_pipeline(tile_n=512))
         printed = ir.python_print(allocated)
         alloc_lines = [line for line in printed.splitlines() if "tile.alloc(pl.Mem.Acc" in line]
         assert len(alloc_lines) == 2
@@ -3393,7 +3399,7 @@ class TestAutoTileMatmulL0ExistingPipelineDbC:
     def test_ptoas_planner_leaves_existing_pipeline_unchanged(self):
         """#2131 targets PyPTO; PTOAS already supplies physical Acc separation."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         with passes.PassContext([], memory_planner=passes.MemoryPlanner.PTOAS):
             After = passes.auto_tile_matmul_l0()(self._single_matmul_pipeline())
@@ -3412,7 +3418,7 @@ class TestAutoTileMatmulL0ExistingPipelineDbC:
     def test_preserves_explicit_one_accumulator_policy_on_rerun(self):
         """A chooser-emitted dbC=1 loop is an explicit policy, not a new candidate."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -3444,7 +3450,7 @@ class TestAutoTileMatmulL0ExistingPipelineDbC:
     def test_marks_pipeline_with_moving_left_operand(self):
         """The stationary-panel pattern is symmetric: L0A may be the moving side."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -3489,7 +3495,7 @@ class TestAutoTileMatmulL0ExistingPipelineDbC:
     def test_applies_path_specific_mat_scratch_profitability(self, tile_m, trips, expected):
         """Acc->Mat uses its own trip-count and L0C-share admission gate."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         Before = self._mat_scratch_pipeline(tile_m, trips)
         After = passes.auto_tile_matmul_l0()(Before)
@@ -3516,7 +3522,7 @@ class TestAutoTileMatmulL0ExistingPipelineDbC:
     def test_rejects_loop_carried_matmul_operand(self):
         """An operand IterArg changes by loop semantics and is not invariant."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -3551,7 +3557,7 @@ class TestAutoTileMatmulL0ExistingPipelineDbC:
     def test_rejects_noncanonical_assemble_target(self):
         """An assemble must update and yield its matching scratch IterArg."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -3589,7 +3595,7 @@ class TestAutoTileMatmulL0ExistingPipelineDbC:
     def test_rejects_when_other_live_acc_values_exhaust_l0c(self):
         """The extra slot is checked against all co-resident function Acc values."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -3640,7 +3646,7 @@ class TestAutoTileMatmulL0ExistingPipelineDbC:
     ):
         """Capacity admission charges every physical stage copy of another Acc."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
         staged_width = 2 * staged_cols
 
         @pl.program
@@ -3702,7 +3708,7 @@ class TestAutoTileMatmulL0ExistingPipelineDbC:
     def test_rejects_other_acc_definition(self):
         """The marker is loop-wide, so unrelated Acc state defers it."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -3740,7 +3746,7 @@ class TestAutoTileMatmulL0ExistingPipelineDbC:
     def test_rejects_additional_store_like_operation(self):
         """Canonicalize would float every store-like op, so only one drain is allowed."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -3777,7 +3783,7 @@ class TestAutoTileMatmulL0ExistingPipelineDbC:
     def test_rejects_gemv_side_accumulator(self):
         """Every registered cube MAD family participates in the one-MAD guard."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -3820,7 +3826,7 @@ class TestAutoTileMatmulL0ExistingPipelineDbC:
     def test_does_not_mark_when_two_accumulators_exceed_l0c(self):
         """A 192x128 f32 accumulator is 96 KiB, larger than half of A2/A3 L0C."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         After = passes.auto_tile_matmul_l0()(self._single_matmul_pipeline(tile_m=192))
         assert "pipeline_double_buffer_c" not in ir.python_print(After)
@@ -3829,7 +3835,7 @@ class TestAutoTileMatmulL0ExistingPipelineDbC:
     def test_does_not_make_independent_matmuls_compete_for_half_l0c(self):
         """Two MADs in one stage need a joint schedule; the local recognizer defers."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -4082,7 +4088,7 @@ class TestAutoTileMatmulL0Skips:
     def test_matmul_bias_n_tiling_with_bias_resident_source_is_deferred(self):
         """The architectural bias table cannot form a Bias-to-Bias N sub-window."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -4108,7 +4114,7 @@ class TestAutoTileMatmulL0Skips:
     def test_matmul_bias_vec_left_is_out_of_scope(self):
         """The historical Vec-left K-only exception is not widened to biased matmul."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -4183,7 +4189,7 @@ class TestAutoTileMatmulL0Skips:
                 return out
 
         incore_after = passes.auto_tile_matmul_l0()(InCoreProg)
-        with pytest.raises(ValueError, match="Structural equality"):
+        with pytest.raises(ValueError, match="Structural mismatch"):
             ir.assert_structural_equal(incore_after, InCoreProg)
 
 
@@ -4306,7 +4312,7 @@ class TestAutoTileMatmulL0MatScratch:
         subdivide a freed region (the offset-packing follow-up).  Asserts structure + SSA
         + numerics, and that the full Default pipeline allocates without an L0 overflow."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -4391,7 +4397,7 @@ class TestAutoTileMatmulL0MatScratch:
         from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
 
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -4448,7 +4454,7 @@ class TestAutoTileMatmulL0MatScratch:
         import re  # noqa: PLC0415
 
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
         M, K, N = 128, 64, 272
 
         cfg = passes.l0_tile_chooser.L0TileConfig()
@@ -4515,10 +4521,10 @@ class TestAutoTileMatmulL0MatScratch:
         """The conservative Mat-capacity gate: a bf16 chained matmul whose result is
         consumed entirely as a matmul operand WOULD take the Mat-scratch path, but its
         ``[512, 1024]`` bf16 scratch (1 MiB) exceeds the backend's Mat/L1 capacity (512
-        KiB on Ascend910B). The pass leaves the producer on the deferred ``PH-AT-006``
+        KiB on Ascend910). The pass leaves the producer on the deferred ``PH-AT-006``
         path (left whole, no Acc->Mat assemble) instead of an impossible allocation."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -4552,7 +4558,7 @@ class TestAutoTileMatmulL0MatScratch:
         ``pl.pipeline`` loop with loop-variable offsets (``tile.assemble`` accepts a
         ``MakeTuple`` of index-typed variables, not only constants)."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -4649,7 +4655,7 @@ class TestAutoTileMatmulL0FitsL0cCastFold:
         scratch on-chip. (Numerics are covered by the st suite — see
         ``tests/st/runtime/ops/test_auto_tile_matmul.py``.)"""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Expected:
@@ -4702,7 +4708,7 @@ class TestAutoTileMatmulL0FitsL0cCastFold:
         (cast dropped) — the fold is independent of whether the producer was K-tiled.
         (Numerics are covered by the st suite.)"""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Expected:
@@ -4766,7 +4772,7 @@ class TestAutoTileMatmulL0FitsL0cCastFold:
         matmul operand) must keep the Vector cast path — a non-matmul consumer cannot
         read the bf16 value from Mat, so the fold must not fire."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -4797,7 +4803,7 @@ class TestAutoTileMatmulL0FitsL0cCastFold:
         into ``pto.tinsert`` would silently change rounding. Only ``rint``
         (round-half-to-even — FIXPIPE's fixed tie rule) is foldable."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -4831,7 +4837,7 @@ class TestAutoTileMatmulL0FitsL0cCastFold:
         kwarg still folds -- a float destination has no default saturation, so
         absent means "did not ask" (see ``*cast_folds*``)."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -4861,7 +4867,7 @@ class TestAutoTileMatmulL0FitsL0cCastFold:
         (the pass also emits a ``PH-AT-010`` hint pointing at ``mode="rint"``). Only an
         explicit ``rint`` cast folds onto the cube (see the ``*cast_folds*`` tests)."""
         _backend.reset_for_testing()
-        _backend.set_backend_type(BackendType.Ascend910B)
+        _backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -4885,7 +4891,7 @@ class TestAutoTileMatmulL0FitsL0cCastFold:
         # must survive untouched; only an explicit ``rint`` folds onto the cube.
         _assert_unchanged_by_pass(Before, After)
 
-    @pytest.mark.parametrize("backend", [BackendType.Ascend910B, BackendType.Ascend950])
+    @pytest.mark.parametrize("backend", [BackendType.Ascend910, BackendType.Ascend950])
     def test_cast_fold_lowers_cube_only_no_vector(self, backend):
         """End-to-end: the folded fits-L0c chain generates a cube-only kernel —
         ``pto.tinsert`` (FIXPIPE downcast) and zero ``pto.tcvt`` (Vector cast), with no

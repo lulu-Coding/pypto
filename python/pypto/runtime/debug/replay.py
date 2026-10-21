@@ -37,7 +37,7 @@ Python::
     replay(
         "build_output/_jit_xxx/",
         a, b, c,
-        config=RunConfig(platform="a2a3sim", enable_pmu=2, enable_chip_swimlane=4),
+        config=RunConfig(enable_pmu=2, enable_chip_swimlane=4),
     )
 """
 
@@ -49,9 +49,11 @@ from collections.abc import Callable
 from ctypes import _SimpleCData
 from pathlib import Path
 from types import ModuleType
+from typing import Any, cast
 
 import torch
 
+from pypto._target import _parse_platform
 from pypto.runtime._binary_cache import binary_context_lock, invalidate_binary_context
 from pypto.runtime.debug.pto_rebuild import rebuild_kernel_cpp_from_pto
 from pypto.runtime.device_tensor import DeviceTensor
@@ -102,7 +104,7 @@ def invalidate_binary_cache(work_dir: Path | str) -> None:
 
 def replay(
     work_dir: Path | str,
-    *tensors: torch.Tensor | DeviceTensor | _SimpleCData,
+    *tensors: torch.Tensor | DeviceTensor | _SimpleCData[Any],
     config: RunConfig | None = None,
     recompile: bool = True,
     rebuild_from_pto: bool = True,
@@ -173,7 +175,9 @@ def replay(
     golden_module = None
     if validate:
         golden_module = _load_golden_module(work_dir)
-        named_defaults = list(golden_module.generate_inputs({"name": "Default"}))
+        named_defaults = cast(
+            "list[tuple[str, Any]]", list(golden_module.generate_inputs({"name": "Default"}))
+        )
         if len(tensors) != len(named_defaults):
             raise ValueError(
                 f"replay(validate=True): expected {len(named_defaults)} tensors "
@@ -208,7 +212,9 @@ def replay(
             DistributedCompiledProgram,
         )
 
-        compiled = DistributedCompiledProgram.from_dir(work_dir, platform=config.platform)
+        compiled = DistributedCompiledProgram.from_dir(
+            work_dir, backend_type=config.backend_type, execution_mode=config.execution_mode
+        )
         compiled(*tensors, config=config)
     else:
         _execute_compiled(
@@ -291,7 +297,7 @@ def _validate_against_golden_module(
 def _main(
     argv: list[str] | None = None,
     *,
-    inline_inputs: Callable[[], list] | None = None,
+    inline_inputs: Callable[[], list[Any]] | None = None,
     user_compare: Callable[..., None] | None = None,
     default_platform: str = "a2a3sim",
 ) -> int:
@@ -408,8 +414,10 @@ def _main(
         tensors = [v for _, v in _load_named_inputs_from_golden(args.work_dir)]
         do_validate = args.validate
 
+    backend_type, execution_mode = _parse_platform(args.platform)
     config = RunConfig(
-        platform=args.platform,
+        backend_type=backend_type,
+        execution_mode=execution_mode,
         device_id=args.device_id,
         enable_pmu=args.pmu,
         enable_chip_swimlane=(args.swimlane_level if args.swimlane_level is not None else args.swimlane),

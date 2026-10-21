@@ -11,10 +11,17 @@
 
 import logging
 import os
+import tempfile
 from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+from pypto._target import (
+    ExecutionMode,
+    _platform_string,
+    _resolve_target,
+    _warn_deprecated_platform,
+)
 from pypto.backend import BackendType
 from pypto.backend.pto_backend import PartialCodegenError, generate, multi_chip_orch_names
 from pypto.compile_profiling import CompileProfiler, get_active_profiler
@@ -105,13 +112,7 @@ def _add_headers_to_file(cpp_file: str) -> None:
 
 def _backend_type_for_platform(platform: str | None, fallback: BackendType) -> BackendType:
     """Return the codegen backend selected by a runtime platform string."""
-    if platform is None:
-        return fallback
-    if platform in ("a2a3", "a2a3sim"):
-        return BackendType.Ascend910B
-    if platform in ("a5", "a5sim"):
-        return BackendType.Ascend950
-    raise ValueError(f"Invalid platform {platform!r}. Expected 'a2a3sim', 'a2a3', 'a5sim', or 'a5'.")
+    return _resolve_target(fallback, platform=platform)[0]
 
 
 class _PassPipelineResult(NamedTuple):
@@ -166,7 +167,7 @@ def _run_pass_pipeline(  # noqa: PLR0913
     *,
     operation: str,
     strategy: OptimizationStrategy = OptimizationStrategy.Default,
-    backend_type: BackendType = BackendType.Ascend910B,
+    backend_type: BackendType = BackendType.Ascend910,
     platform: str | None = None,
     verification_level: _passes.VerificationLevel | None = None,
     diagnostic_phase: _passes.DiagnosticPhase | None = None,
@@ -213,6 +214,7 @@ def _run_pass_pipeline(  # noqa: PLR0913
             else outer.get_enable_pypto_l0c_double_buffer()
         )
         rt = runtime if runtime is not None else outer.get_runtime()
+        buffer_ir = outer.get_enable_buffer_ir()
     else:
         instruments = list(extra_instruments)
         vlevel = (
@@ -223,7 +225,8 @@ def _run_pass_pipeline(  # noqa: PLR0913
         mplan = memory_planner if memory_planner is not None else _passes.MemoryPlanner.PYPTO
         dbc_flag = enable_pypto_l0c_double_buffer if enable_pypto_l0c_double_buffer is not None else False
         rt = runtime if runtime is not None else _passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER
-    ctx = _passes.PassContext(instruments, vlevel, dphase, disabled, mplan, dbc_flag, rt)
+        buffer_ir = True
+    ctx = _passes.PassContext(instruments, vlevel, dphase, disabled, mplan, dbc_flag, rt, buffer_ir)
 
     if mplan == _passes.MemoryPlanner.PTOAS:
         logger.warning(
@@ -231,7 +234,7 @@ def _run_pass_pipeline(  # noqa: PLR0913
             "PlanMemory (--pto-level=level2) owns lifetime reuse and address assignment. "
             "MaterializeSemanticAliases still runs so semantics-required aliasing (loop-carried "
             "accumulators, in-place ops) is preserved as a shared tile_buf handle. The "
-            "Ascend910B load + tpop_from_aic in-place hazard guard and reserve-buffer base "
+            "Ascend910 load + tpop_from_aic in-place hazard guard and reserve-buffer base "
             "resolution are deferred to ptoas — verify on-device."
         )
 
@@ -252,13 +255,39 @@ def _run_pass_pipeline(  # noqa: PLR0913
     return _PassPipelineResult(transformed_program, mplan, effective_backend_type, rt)
 
 
+def make_default_output_dir(name: str) -> str:
+    """Create a fresh ``<base>/<name>_<YYYYmmdd_HHMMSS>_<random>`` directory.
+
+    ``<base>`` is ``PYPTO_PROG_BUILD_DIR`` when set and non-empty, else
+    ``build_output``.
+
+    Args:
+        name: Program name used as the directory prefix
+
+    Returns:
+        Path of the newly created, empty directory
+    """
+    # ``or`` (not get's default arg) so an empty-but-set env var
+    # (``export PYPTO_PROG_BUILD_DIR=``) still falls back to build_output
+    # rather than writing artifacts into the current working directory.
+    base = os.environ.get("PYPTO_PROG_BUILD_DIR") or "build_output"
+    os.makedirs(base, exist_ok=True)
+    # The timestamp is for humans (readable, sorts chronologically); mkdtemp's
+    # random suffix is what guarantees uniqueness. A bare one-second timestamp
+    # created with ``exist_ok=True`` let two same-named compiles within one
+    # second share a directory, the second silently overwriting the first's
+    # kernels -- a batch compiled up front then dispatched the wrong kernel.
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return tempfile.mkdtemp(prefix=f"{name}_{timestamp}_", dir=base)
+
+
 def compile(  # noqa: PLR0913
     program: _ir_core.Program,
     *,
     output_dir: str | None = None,
     strategy: OptimizationStrategy = OptimizationStrategy.Default,
     dump_passes: bool | PassDumpLevel = True,
-    backend_type: BackendType = BackendType.Ascend910B,
+    backend_type: BackendType = BackendType.Ascend910,
     skip_ptoas: bool = False,
     verification_level: _passes.VerificationLevel | None = None,
     diagnostic_phase: _passes.DiagnosticPhase | None = None,
@@ -267,6 +296,7 @@ def compile(  # noqa: PLR0913
     enable_pypto_l0c_double_buffer: bool | None = None,
     profiling: bool = False,
     platform: str | None = None,
+    execution_mode: ExecutionMode | None = None,
     distributed_config: Any = None,
     analyze_auto_scopes_for_deps: bool = False,
     emit_source_loc: bool | None = None,
@@ -289,10 +319,11 @@ def compile(  # noqa: PLR0913
 
     Args:
         program: Input Program to compile
-        output_dir: Output directory. When None, defaults to
-            ``<base>/<program_name>_<timestamp>``, where ``<base>`` is the
-            ``PYPTO_PROG_BUILD_DIR`` environment variable if set (and
-            non-empty), else ``build_output``.
+        output_dir: Output directory. When None, a fresh directory
+            ``<base>/<program_name>_<YYYYmmdd_HHMMSS>_<random>`` is created per call, where
+            ``<base>`` is the ``PYPTO_PROG_BUILD_DIR`` environment variable if
+            set (and non-empty), else ``build_output``. The suffix is opaque --
+            do not derive one; read ``compiled.output_dir`` instead.
         strategy: Optimization strategy to use (default: Default)
         dump_passes: Per-pass IR dump control. A ``PassDumpLevel``
             (``NONE`` / ``CONCISE`` / ``EXPLICIT``) or a ``bool``
@@ -303,7 +334,7 @@ def compile(  # noqa: PLR0913
             every ptoas pass under
             ``<output_dir>/ptoas_passes/<codegen-unit>/``. Default: False.
             Has no effect when ``skip_ptoas=True``.
-        backend_type: Backend type for passes and codegen (default: Ascend910B)
+        backend_type: Backend type for passes and codegen (default: Ascend910)
         skip_ptoas: Skip the ptoas compilation step and emit raw MLIR (.pto) files
             instead of compiled C++ kernel wrappers.
         emit_source_loc: When True, each generated ``.pto`` operation carries an
@@ -340,10 +371,14 @@ def compile(  # noqa: PLR0913
             or ``PTOAS``, which enable chooser dbC=2 automatically.
         profiling: If True, enable compile profiling that records per-stage
             wall-clock timings.  Results are written to ``output_dir/report/``.
-        platform: Target execution platform.  One of ``"a2a3sim"``,
+        platform: Deprecated; use backend_type and execution_mode.
+            Target execution platform. One of ``"a2a3sim"``,
             ``"a2a3"``, ``"a5sim"``, or ``"a5"``.  Defaults to the
             simulator for the given *backend_type*.  When set, it also
             selects the matching codegen backend.
+        execution_mode: Simulator or onboard execution. Defaults to SIM when
+            platform is absent, otherwise inherits the legacy platform. An
+            explicit mode must agree with an explicit platform.
         distributed_config: Optional :class:`DistributedConfig` for L3+
             distributed programs.  When ``None`` (default), auto-detected
             from the program: if L3+ functions are found, a default
@@ -377,17 +412,16 @@ def compile(  # noqa: PLR0913
         >>> c = compiled(a, b)          # return style
         >>> compiled(a, b, c, config=RunConfig(device_id=1))  # specify device
     """
+    if platform is not None:
+        _warn_deprecated_platform("ir.compile")
+    backend_type, mode = _resolve_target(backend_type, execution_mode, platform)
+    platform = _platform_string(backend_type, mode)
     _select_backend(backend_type=backend_type, platform=platform)
 
     if output_dir is None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # ``or`` (not get's default arg) so an empty-but-set env var
-        # (``export PYPTO_PROG_BUILD_DIR=``) still falls back to build_output
-        # rather than writing artifacts into the current working directory.
-        base = os.environ.get("PYPTO_PROG_BUILD_DIR") or "build_output"
-        output_dir = os.path.join(base, f"{program.name}_{timestamp}")
-
-    os.makedirs(output_dir, exist_ok=True)
+        output_dir = make_default_output_dir(program.name)
+    else:
+        os.makedirs(output_dir, exist_ok=True)
 
     _validate_pass_context_conflicts(
         operation="compile",

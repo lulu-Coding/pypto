@@ -7,37 +7,55 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Codegen behaviour of the declared GM cache-access policy (pypto #2534).
+"""Codegen behaviour of the declared GM cache-access policy (pypto #2534, #2680).
 
-PTOAS has no L2-bypass path yet
-(https://github.com/hw-native-sys/PTOAS/issues/1356), so a ``CachePolicy.BYPASS``
-declaration is carried all the way to codegen but changes nothing it emits. That
-makes the codegen contract two-sided, and both sides are asserted here:
+PTOAS >= v0.64 carries a streaming GM read as a ``cache_policy`` attribute on
+``pto.tload`` plus an optional byte ``offset`` it adds to that one load's source
+address. On a2a3 the uncached mapping of a page is reached by address alias, so
+the attribute alone declares the policy and moves nothing: the offset is what
+makes the load bypass. That distance is a per-device value only the driver
+knows, so it is threaded in as the synthetic ``%__pypto_l2_cache_offset``
+parameter the kernel wrapper fills from ``get_l2_cache_offset(args)``.
 
-1. **The generated MLIR is byte-identical** with and without the declaration.
-   Anything else would mean the "compiles as an ordinary cached access" promise
-   is already broken.
-2. **The user is told.** The declaration is diagnosed once per tensor per
-   kernel — not once per emitted load — and the message points at the PTOAS
-   issue so the reader can see when the request will start to mean something.
+The contract asserted here has four sides:
 
-The warning travels the C++ ``LOG_WARN`` channel, which writes to ``std::cerr``
-from native code, so it is read with pytest's ``capfd`` (file-descriptor level)
-rather than ``capsys`` — the same mechanism ``tests/ut/core/test_logging.py``
-and the MemoryReuse fallback diagnostics use.
+1. **A declared read carries the attribute** — once per emitted load, since the
+   hint belongs to the instruction rather than to the tensor (an unrolled loop
+   emits the same load many times, and each one must carry it).
+2. **An undeclared read carries nothing.** ``CachePolicy.DEFAULT`` emits no
+   attribute at all, so a kernel that states no policy keeps the PTO form it had
+   before the feature existed. That is also what makes the emitted dict the
+   *only* difference between the two otherwise identical kernels below.
+3. **The per-access surface still wins.** An explicit
+   ``cache=CachePolicy.DEFAULT`` inside a bypassing scope re-caches that one
+   read, which is observable in the emitted MLIR for the first time — while
+   BYPASS was a no-op, the documented precedence could only be checked on the IR
+   (``tests/ut/ir/transforms/test_convert_tensor_to_tile_ops.py``).
+4. **The device offset reaches every declared load, from one parameter.** The
+   value cannot change during a dispatch, so it is read once at kernel entry and
+   passed down; a kernel with no declared read gains no parameter. An
+   architecture that does not map GM twice — a5 — emits the attribute and no
+   offset, and the declaration has no effect there.
+
+The assembler's own acceptance of the attribute is not asserted here: every UT
+runs with ``skip_ptoas=True``, so these tests stop at the emitted MLIR text (the
+same contract as the MX ``layout`` attribute in ``test_mx_ops_codegen.py``).
 """
 
 import pypto.language as pl
 import pytest
-from _pto_loc_common import strip_loc
-from pypto import LogLevel, backend, codegen, ir, set_log_level
+from pypto import LogLevel, backend, codegen, ir, passes, set_log_level
 from pypto.backend import BackendType
 from pypto.ir import OptimizationStrategy, PassManager
 
-# The exact link the message must carry: it is the only thing in the warning
-# that tells a reader when BYPASS stops being a no-op.
-PTOAS_ISSUE_URL = "https://github.com/hw-native-sys/PTOAS/issues/1356"
-# Diagnostic tag, used to pick this warning out of unrelated pipeline output.
+# The exact attribute PTOAS >= v0.64 consumes on `pto.tload`.
+BYPASS_ATTR = "cache_policy = #pto.load_cache_policy<l2_bypass>"
+# The operand that carries the device's no-cache alias distance to that load,
+# and the synthetic parameter it is bound to.
+OFFSET_PARAM = "%__pypto_l2_cache_offset"
+OFFSET_OPERAND = f"offset = {OFFSET_PARAM} : i64"
+# The diagnostic that stood in for the attribute while PTOAS had no bypass path.
+# It must never be emitted again — the request is now honoured, not reported.
 BYPASS_WARNING_TAG = "[CacheBypassUnsupported]"
 
 M, K, N = 256, 128, 256
@@ -53,7 +71,7 @@ def _setup_backend_and_log_level():
     stderr assertions independent of ``PYPTO_LOG_LEVEL`` and of test order.
     """
     backend.reset_for_testing()
-    backend.set_backend_type(BackendType.Ascend910B)
+    backend.set_backend_type(BackendType.Ascend910)
     set_log_level(LogLevel.WARN)
     yield
     backend.reset_for_testing()
@@ -63,8 +81,8 @@ def _setup_backend_and_log_level():
 # Programs
 #
 # `DeclaredBypass` and `PlainMatmul` are the SAME kernel; the declaration line
-# is the only difference between them, which is what makes the byte-identity
-# comparison meaningful.
+# is the only difference between them, which is what makes the "the attribute is
+# the whole difference" comparison meaningful.
 # ---------------------------------------------------------------------------
 
 
@@ -88,7 +106,7 @@ class DeclaredBypass:
 
 @pl.program
 class PlainMatmul:
-    """The same kernel with no declaration — the byte-identity reference."""
+    """The same kernel with no declaration — the comparison reference."""
 
     @pl.function
     def main(
@@ -105,7 +123,7 @@ class PlainMatmul:
 
 @pl.program
 class TwoDeclaredTensors:
-    """Both operands declared: the diagnostic is per tensor, so two warnings."""
+    """Both operands declared: both synthesised loads carry the attribute."""
 
     @pl.function
     def main(
@@ -124,7 +142,7 @@ class TwoDeclaredTensors:
 
 @pl.program
 class TwoBypassingLoadsOfOneTensor:
-    """Two `pl.load(..., cache=BYPASS)` reads of ONE tensor — still one warning."""
+    """Two `pl.load(..., cache=BYPASS)` reads of ONE tensor — two hinted loads."""
 
     @pl.function(type=pl.FunctionType.InCore)
     def kernel(
@@ -137,6 +155,30 @@ class TwoBypassingLoadsOfOneTensor:
         out_0: pl.Tensor[[ROWS, COLS], pl.FP32] = pl.store(top, [0, 0], out)
         out_1: pl.Tensor[[ROWS, COLS], pl.FP32] = pl.store(bottom, [16, 0], out_0)
         return out_1
+
+
+@pl.program
+class ReCachedSingleLoad:
+    """A declared parameter with one access explicitly opted back into the cache.
+
+    The declaration is written the way pass 9 leaves it — ``cache_policy`` on the
+    outlined kernel, ``(param index, policy)`` — because the override has to be
+    stated at the access, and a hand-written InCore kernel is where an access is
+    spelled out. See the pass-level pair in
+    ``tests/ut/ir/transforms/test_convert_tensor_to_tile_ops.py``.
+    """
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(
+        self,
+        x: pl.Tensor[[ROWS, COLS], pl.FP32],
+        out: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
+    ) -> pl.Tensor[[ROWS, COLS], pl.FP32]:
+        # (param index, policy-as-int); 1 is CachePolicy.BYPASS. The parser takes
+        # integer literals here only, which is also how pass 9 writes the attr.
+        pl.func_attr({"cache_policy": [(0, 1)]})
+        t: pl.Tile[[16, COLS], pl.FP32] = pl.load(x, [0, 0], [16, COLS], cache=pl.CachePolicy.DEFAULT)
+        return pl.store(t, [0, 0], out)
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +198,7 @@ def _incore_mlir(program_cls, *, emit_source_loc: bool = False) -> str:
             ``loc("file":line:col)``. Off by default: the declaration line shifts
             every following statement down by one, so the locations legitimately
             differ between two otherwise identical kernels and would mask a
-            byte-for-byte comparison of what is actually emitted.
+            comparison of what is actually emitted.
 
     Returns:
         The generated MLIR text.
@@ -169,112 +211,190 @@ def _incore_mlir(program_cls, *, emit_source_loc: bool = False) -> str:
     return result if isinstance(result, str) else "".join(result.values())
 
 
-def _bypass_warnings(capfd) -> list[str]:
-    """Drain captured stderr and return only the cache-bypass warning lines."""
+def _tload_lines(mlir: str) -> list[str]:
+    """Every emitted ``pto.tload`` — the operation the declaration changes."""
+    return [line.strip() for line in mlir.splitlines() if "pto.tload" in line]
+
+
+def _hinted_tloads(mlir: str) -> list[str]:
+    """The emitted loads that carry the L2-bypass attribute."""
+    return [line for line in _tload_lines(mlir) if BYPASS_ATTR in line]
+
+
+def _source_of(tload_line: str) -> str:
+    """The declared tensor a ``pto.tload`` reads, taken from its partition view.
+
+    ``pto.tload ins(%b__ssa_v0_pview : ...)`` → ``b``. The SSA name is built from
+    the source tensor's name, which is what makes the operand identifiable at all.
+    """
+    ins = tload_line.split("ins(%", 1)[1]
+    return ins.split("__", 1)[0]
+
+
+def _warnings(capfd) -> list[str]:
+    """Drain captured stderr and return any cache-bypass warning lines."""
     err = capfd.readouterr().err
     return [line for line in err.splitlines() if BYPASS_WARNING_TAG in line]
 
 
-def _tload_lines(mlir: str) -> list[str]:
-    """Every emitted ``pto.tload`` — the operation a declaration would change."""
-    return [line.strip() for line in mlir.splitlines() if "pto.tload" in line]
-
-
 # ---------------------------------------------------------------------------
-# (a) The declaration must not change a single byte of the generated MLIR
+# (a) A declared read carries the attribute, and it is the whole difference
 # ---------------------------------------------------------------------------
 
 
-def test_declaration_leaves_generated_mlir_byte_identical():
-    """`pl.set_cache_policy(b, BYPASS)` compiles to exactly today's MLIR.
+def test_declared_tensor_load_carries_the_bypass_attribute():
+    """Only the declared operand's load is hinted; the other is untouched."""
+    mlir = _incore_mlir(DeclaredBypass)
+    loads = _tload_lines(mlir)
 
-    The policy reaches codegen through the ``cache`` kwarg on ``tile.load``, and
-    codegen deliberately consumes it without emitting anything: no extra
-    operation, no extra attribute, no reordering. Comparing the whole module
-    text — not just the tload lines — is what makes "emit nothing else" testable.
+    assert len(loads) == 2, f"expected one load per matmul operand:\n{mlir}"
+    hinted = {_source_of(line) for line in loads if BYPASS_ATTR in line}
+    plain = {_source_of(line) for line in loads if BYPASS_ATTR not in line}
+    assert hinted == {"b"}, f"only the declared tensor may be hinted, got {hinted}"
+    assert plain == {"a"}, f"the undeclared tensor must stay cached, got {plain}"
+
+
+def test_the_declaration_adds_only_the_attribute_offset_and_parameter():
+    """`pl.set_cache_policy(b, BYPASS)` adds an annotated load and nothing else.
+
+    No extra operation, no extra view, no reordering: stripping the attribute,
+    the offset operand and the parameter that feeds it from the declared
+    kernel's MLIR must reproduce the undeclared kernel's, line for line. That is
+    what keeps the declaration a property of the load rather than a codegen mode.
     """
-    with_decl = _incore_mlir(DeclaredBypass)
-    without_decl = _incore_mlir(PlainMatmul)
+    # Compare the policy within Tile IR: bypass keeps a kernel off the Buffer path.
+    with passes.PassContext([], enable_buffer_ir=False):
+        with_decl = _incore_mlir(DeclaredBypass)
+        without_decl = _incore_mlir(PlainMatmul)
 
-    # Guard against a vacuous pass: there must be real loads to have changed.
-    assert _tload_lines(without_decl), f"reference kernel emitted no pto.tload:\n{without_decl}"
-    assert with_decl == without_decl, (
-        "CachePolicy.BYPASS must not change generated code while PTOAS lacks a "
-        f"bypass path ({PTOAS_ISSUE_URL})"
-    )
-
-
-def test_declaration_leaves_generated_mlir_identical_with_source_locations():
-    """The same, through the default emit path that also writes `loc(...)`.
-
-    ``emit_source_loc=True`` is what production codegen uses, so it is worth
-    exercising; the locations themselves must differ, because the declaration
-    is a real source line that shifts the statements after it. Everything else
-    — every operation, in order — must still match.
-    """
-    with_decl = _incore_mlir(DeclaredBypass, emit_source_loc=True)
-    without_decl = _incore_mlir(PlainMatmul, emit_source_loc=True)
-
-    assert "loc(" in with_decl, f"expected source locations in the emitted MLIR:\n{with_decl}"
-    stripped_with = [strip_loc(line) for line in with_decl.splitlines()]
-    stripped_without = [strip_loc(line) for line in without_decl.splitlines()]
-    assert stripped_with == stripped_without
+    assert BYPASS_ATTR in with_decl, f"declared kernel emitted no bypass hint:\n{with_decl}"
+    assert BYPASS_ATTR not in without_decl, f"undeclared kernel must carry no hint:\n{without_decl}"
+    stripped = with_decl.replace(" {" + BYPASS_ATTR + "}" + " " + OFFSET_OPERAND, "")
+    stripped = stripped.replace(f", {OFFSET_PARAM}: i64", "")
+    assert stripped == without_decl
 
 
-# ---------------------------------------------------------------------------
-# (b) The warning: once per tensor, and it names the PTOAS issue
-# ---------------------------------------------------------------------------
+def test_each_declared_tensor_gets_its_own_hinted_load():
+    """Two declared operands produce two hinted loads."""
+    mlir = _incore_mlir(TwoDeclaredTensors)
+    hinted = {_source_of(line) for line in _hinted_tloads(mlir)}
+    assert hinted == {"a", "b"}, f"expected both operands hinted, got {hinted}:\n{mlir}"
 
 
-def test_undeclared_kernel_emits_no_bypass_warning(capfd):
-    """No declaration, no warning: the diagnostic tracks the request, not loads."""
-    _incore_mlir(PlainMatmul)
-    assert _bypass_warnings(capfd) == []
+def test_every_emitted_load_of_a_declared_tensor_is_hinted():
+    """Many loads, one declaration, one hint each.
 
-
-def test_declared_bypass_warns_once_and_links_the_ptoas_issue(capfd):
-    """One declared tensor produces exactly one warning naming it and the issue.
-
-    The link is asserted verbatim: it is the message's only forward reference,
-    and it is what tells the reader the request is recorded rather than ignored.
-    """
-    _incore_mlir(DeclaredBypass)
-    warnings = _bypass_warnings(capfd)
-
-    assert len(warnings) == 1, f"expected exactly one bypass warning, got {warnings}"
-    message = warnings[0]
-    assert "tensor 'b'" in message, f"warning must name the declared tensor: {message}"
-    assert "CachePolicy.BYPASS" in message, message
-    assert PTOAS_ISSUE_URL in message, f"warning must link the PTOAS issue: {message}"
-
-
-def test_each_declared_tensor_warns_exactly_once(capfd):
-    """Two declared tensors get one warning each — the state is keyed by tensor."""
-    _incore_mlir(TwoDeclaredTensors)
-    warnings = _bypass_warnings(capfd)
-
-    assert len(warnings) == 2, f"expected one warning per declared tensor, got {warnings}"
-    assert len([w for w in warnings if "tensor 'a'" in w]) == 1, warnings
-    assert len([w for w in warnings if "tensor 'b'" in w]) == 1, warnings
-    assert all(PTOAS_ISSUE_URL in w for w in warnings), warnings
-
-
-def test_repeated_bypassing_loads_of_one_tensor_warn_once(capfd):
-    """Many loads, one declaration, one warning.
-
-    The policy is read by every load of the tensor and a load inside an unrolled
-    loop is emitted many times over, so the naive placement would produce one
-    line per emitted ``pto.tload``. This kernel reads `x` twice with
-    ``cache=BYPASS``; the MLIR is asserted to really carry both loads, so a
-    single warning proves de-duplication rather than a missing load.
+    The hint belongs to the instruction, not to the tensor: the old diagnostic
+    was deliberately once-per-tensor, but an L2 hint that lands on only the
+    first of two loads would leave the second one allocating in L2. This kernel
+    reads `x` twice with ``cache=BYPASS``; both emitted loads must carry it.
     """
     mlir = _incore_mlir(TwoBypassingLoadsOfOneTensor)
-    warnings = _bypass_warnings(capfd)
+    loads = _tload_lines(mlir)
 
-    assert len(_tload_lines(mlir)) == 2, f"expected two emitted loads:\n{mlir}"
-    assert len(warnings) == 1, f"warning must be once per tensor, not once per load: {warnings}"
-    assert "tensor 'x'" in warnings[0], warnings[0]
-    assert PTOAS_ISSUE_URL in warnings[0], warnings[0]
+    assert len(loads) == 2, f"expected two emitted loads:\n{mlir}"
+    assert len(_hinted_tloads(mlir)) == 2, f"every emitted load must carry the hint:\n{mlir}"
+
+
+# ---------------------------------------------------------------------------
+# (b) The device offset reaches every declared load through one parameter
+# ---------------------------------------------------------------------------
+
+
+def _signature_line(mlir: str) -> str:
+    """The emitted ``func.func`` signature — where synthetic params are appended."""
+    return next(line.strip() for line in mlir.splitlines() if line.strip().startswith("func.func @"))
+
+
+def test_declared_load_takes_the_device_offset_as_its_tload_operand():
+    """The attribute declares the policy; the offset is what moves the address.
+
+    PTOAS applies the offset only to a load that also declared ``l2_bypass``, so
+    the two travel together on the same ``pto.tload`` — an attribute without an
+    offset compiles to an ordinary cached load, which would make the declaration
+    silently inert.
+    """
+    mlir = _incore_mlir(DeclaredBypass)
+    hinted = _hinted_tloads(mlir)
+
+    assert len(hinted) == 1, f"expected exactly one hinted load:\n{mlir}"
+    assert OFFSET_OPERAND in hinted[0], f"hinted load carries no device offset:\n{hinted[0]}"
+    assert f"{OFFSET_PARAM}: i64" in _signature_line(mlir), _signature_line(mlir)
+
+
+def test_one_parameter_serves_every_declared_load():
+    """Two hinted loads, one parameter: the value cannot change within a dispatch.
+
+    The wrapper reads ``get_l2_cache_offset(args)`` once at kernel entry, so a
+    second parameter would mean a second GM read of a constant.
+    """
+    mlir = _incore_mlir(TwoBypassingLoadsOfOneTensor)
+    hinted = _hinted_tloads(mlir)
+
+    assert len(hinted) == 2, f"expected two hinted loads:\n{mlir}"
+    assert all(OFFSET_OPERAND in line for line in hinted), f"every hinted load takes it:\n{mlir}"
+    assert _signature_line(mlir).count(f"{OFFSET_PARAM}: i64") == 1, _signature_line(mlir)
+
+
+def test_a5_declares_the_policy_without_an_address_offset():
+    """A5 does not map GM twice, so there is no alias for an offset to reach.
+
+    Its runtime exposes no ``get_l2_cache_offset`` either, so emitting the
+    parameter would produce a kernel wrapper that cannot compile. PTOAS v0.64
+    lowers the bare attribute to an ordinary load, so the declaration is
+    accepted there and does nothing — which is a property of the target, not a
+    missing operand.
+    """
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend950)
+    mlir = _incore_mlir(TwoBypassingLoadsOfOneTensor)
+
+    assert _hinted_tloads(mlir), f"a5 must still carry the declaration:\n{mlir}"
+    assert OFFSET_PARAM not in mlir, f"a5 must take no address offset:\n{mlir}"
+
+
+# ---------------------------------------------------------------------------
+# (c) An undeclared read — and an explicitly re-cached one — carry nothing
+# ---------------------------------------------------------------------------
+
+
+def test_undeclared_kernel_emits_no_cache_attribute():
+    """`CachePolicy.DEFAULT` emits nothing, so unrelated kernels are unchanged."""
+    mlir = _incore_mlir(PlainMatmul)
+
+    assert _tload_lines(mlir), f"reference kernel emitted no pto.tload:\n{mlir}"
+    assert "cache_policy" not in mlir, f"an undeclared kernel must emit no cache attribute:\n{mlir}"
+
+
+def test_explicit_default_load_beats_the_declaration_and_emits_no_attribute():
+    """An explicit ``cache=CachePolicy.DEFAULT`` re-caches that one read.
+
+    The documented precedence — the per-access kwarg wins over the scope
+    declaration, in both directions — becomes observable in codegen only now
+    that BYPASS emits something.
+    """
+    mlir = _incore_mlir(ReCachedSingleLoad)
+
+    assert _tload_lines(mlir), f"kernel emitted no pto.tload:\n{mlir}"
+    assert "cache_policy" not in mlir, f"the re-cached access must carry no hint:\n{mlir}"
+
+
+# ---------------------------------------------------------------------------
+# (d) The stand-in diagnostic is gone
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("program_cls", [PlainMatmul, DeclaredBypass, TwoBypassingLoadsOfOneTensor])
+def test_no_cache_bypass_warning_is_emitted(program_cls, capfd):
+    """Nothing warns any more: the request is honoured rather than reported.
+
+    The warning travelled the C++ ``LOG_WARN`` channel, which writes to
+    ``std::cerr`` from native code, so it is read with pytest's ``capfd``
+    (file-descriptor level) rather than ``capsys`` — the same mechanism
+    ``tests/ut/core/test_logging.py`` uses.
+    """
+    _incore_mlir(program_cls)
+    assert _warnings(capfd) == []
 
 
 if __name__ == "__main__":

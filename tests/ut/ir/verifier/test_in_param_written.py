@@ -111,6 +111,25 @@ class TestWrittenInParamIsRejected:
         assert "'out'" in messages[0]
         assert "tile.mscatter" in messages[0]
 
+    def test_gather_writes_scratch_through_validshape_view(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tile[[1, 128], pl.FP16, pl.Mem.Vec],
+                idx: pl.Tile[[1, 16], pl.INT32, pl.Mem.Vec],
+                scratch: pl.Tile[[1, 16], pl.INT32, pl.Mem.Vec],
+            ) -> pl.Tile[[1, 16], pl.FP16, pl.Mem.Vec]:
+                tmp = pl.tile.set_validshape(scratch, 1, 16)
+                result = pl.tile.gather(src, idx, tmp)
+                return result
+
+        messages = _messages(Prog)
+        assert len(messages) == 1
+        assert "'scratch'" in messages[0]
+        assert "tile.gather" in messages[0]
+
     def test_notify_into_in_signal(self):
         """``pld.system.notify`` deposits into the peer's slot of its signal.
         Reading that signal as an input is what dropped the RAW edge a waiter
@@ -494,6 +513,55 @@ def test_check_is_registered():
     checks = passes.DiagnosticCheckSet()
     checks.insert(passes.DiagnosticCheck.InParamWritten)
     assert checks.contains(passes.DiagnosticCheck.InParamWritten)
+
+
+@pytest.mark.parametrize(
+    ("operation", "written"),
+    [
+        ("buffer.load", "buffer"),
+        ("buffer.store", "tensor"),
+        ("buffer.copy", "other"),
+        ("buffer.set_validshape", None),
+        ("buffer.alloc", None),
+    ],
+)
+def test_buffer_stage_reports_only_explicit_data_writes(operation, written):
+    span = _ir.Span.unknown()
+    tensor = _ir.Var("tensor", _ir.TensorType([16, 32], pl.FP32), span)
+    descriptor = _ir.BufferType([16, 32], pl.FP32, _ir.MemorySpace.Vec)
+    buffer = _ir.Var("buffer", descriptor, span)
+    other = _ir.Var("other", descriptor, span)
+    offsets = _ir.MakeTuple([_ir.ConstInt(0, pl.INDEX, span), _ir.ConstInt(0, pl.INDEX, span)], span)
+    valid = _ir.MakeTuple([_ir.ConstInt(16, pl.INDEX, span), _ir.ConstInt(32, pl.INDEX, span)], span)
+    arguments = {
+        "buffer.load": [tensor, offsets, valid, buffer],
+        "buffer.store": [buffer, offsets, valid, tensor],
+        "buffer.copy": [buffer, other],
+        "buffer.set_validshape": [buffer, valid],
+        "buffer.alloc": [_ir.MakeTuple([], span)],
+    }[operation]
+    alloc = operation == _ir.get_op("buffer.alloc").name
+    call = _ir.Call(_ir.get_op(operation), arguments, {}, None, descriptor if alloc else _ir.VoidType(), span)
+    statement = (
+        _ir.AssignStmt(_ir.Var("fresh", descriptor, span), call, span) if alloc else _ir.EvalStmt(call, span)
+    )
+    function = _ir.Function(
+        "kernel",
+        [tensor, buffer, other],
+        [],
+        statement,
+        span,
+        type=_ir.FunctionType.InCore,
+        ir_stage=_ir.FunctionIRStage.Buffer,
+    )
+    messages = _messages(_ir.Program([function], "BufferWrites", span))
+    if written is None:
+        assert messages == []
+    else:
+        assert len(messages) == 1
+        assert f"'{written}'" in messages[0]
+        assert operation in messages[0]
+        assert "declared In" in messages[0]
 
 
 if __name__ == "__main__":

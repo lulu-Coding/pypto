@@ -2703,7 +2703,7 @@ class TestInferTileMemorySpaceIterArgInherit:
         """
         # A backend is needed so the Mat tile.create carries the implicit NZ TileView,
         # matching the tile.assemble result type for the loop-carried reassignment.
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -2748,7 +2748,7 @@ class TestInferTileMemorySpaceIterArgInherit:
         the ``tile.create``, the inner from the outer iter-arg via ``AsVarLike``). Pins
         the recursive seeding the single-loop test does not reach.
         """
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -2805,7 +2805,7 @@ class TestInferTileMemorySpaceLoopCarriedOperand:
         target can execute -- and the property verifier stayed silent about it,
         so the violation only surfaced in the backend.
         """
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -2859,7 +2859,7 @@ class TestInferTileMemorySpaceLoopCarriedOperand:
         carry edge the load defaulted to Vec and the operand was routed
         GM -> UB -> L0B, putting a cube-only operand on the vector core.
         """
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -2950,7 +2950,7 @@ class TestInferTileMemorySpaceLoopCarriedOperand:
         operand reached `tile.matmul`'s Right slot with no memory space
         whatsoever.
         """
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -3008,12 +3008,12 @@ class TestLoopInvariantMatResidency:
 
     @staticmethod
     def _run_infer(program):
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         return passes.infer_tile_memory_space()(passes.convert_to_ssa()(program))
 
     @staticmethod
     def _run_tensor_infer(program):
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         program = passes.convert_to_ssa()(program)
         program = passes.convert_tensor_to_tile_ops()(program)
         program = passes.flatten_tile_nd_to_2d()(program)
@@ -3225,7 +3225,7 @@ class RetargetedBridgeAttrs:
 
         Before = passes.convert_to_ssa()(pl.parse_program(program.format(body=before_body)))
         Expected = passes.convert_to_ssa()(pl.parse_program(program.format(body=expected_body)))
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         ir.assert_structural_equal(passes.infer_tile_memory_space()(Before), Expected)
 
     def test_private_marker_stripped_when_function_has_no_tile_memory(self):
@@ -3257,7 +3257,7 @@ class MarkerOnlyScalarCall:
         Expected = passes.convert_to_ssa()(
             pl.parse_program(program.format(attrs='attrs={"residency_test_sentinel": 11}'))
         )
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         ir.assert_structural_equal(passes.infer_tile_memory_space()(Before), Expected)
 
     def test_tensor_matmul_stationary_lhs_loads_once(self):
@@ -3267,7 +3267,7 @@ class MarkerOnlyScalarCall:
         loop.  This is the load-once QK shape reported in #2077, reduced to two
         N tiles so the test stays compact.
         """
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -3317,7 +3317,7 @@ class MarkerOnlyScalarCall:
         GM->Mat load is invariant; the L0 staging remains in the inner
         pipeline.
         """
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Before:
@@ -4768,6 +4768,147 @@ for n in pl.range(0, 2, 1):
         assert self._line_index(printed, "tile.load(lhs") > loop
         assert self._line_index(printed, "transpose_view") > loop
         assert self._line_index(printed, "lhs_left", "tile.move") > loop
+
+
+class TestRewrittenTileLayout:
+    """Rewritten producer layouts must reach aliases and loop carries (#2753)."""
+
+    def test_alias_chain_inherits_rewritten_view(self):
+        backend.set_backend_type(BackendType.Ascend950)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.AIV)
+            def kernel(
+                self,
+                x: pl.Tile[[32, 128], pl.FP32, pl.Mem.Acc, pl.TileView(valid_shape=[17, 96])],
+            ):
+                value = pl.mul(x, 1.0)
+                alias = value
+                alias2 = alias
+                _result = pl.add(alias2, alias)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.AIV)
+            def kernel(
+                self,
+                x: pl.Tile[[32, 128], pl.FP32, pl.Mem.Acc, pl.TileView(valid_shape=[17, 96])],
+            ):
+                x_Vec = pl.move(
+                    x,
+                    target_memory=pl.Mem.Vec,
+                    blayout=pl.TileLayout.row_major,
+                    slayout=pl.TileLayout.none_box,
+                )
+                value = pl.mul(x_Vec, 1.0)
+                alias = value
+                alias2 = alias
+                _result = pl.add(alias2, alias)
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(pl.parse_program(ir.python_print(After)), After)
+
+    @pytest.mark.parametrize("stop", [0, 1, 20])
+    def test_nested_for_carries_inherit_rewritten_layout(self, stop):
+        backend.set_backend_type(BackendType.Ascend950)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.AIV)
+            def kernel(self, x: pl.Tile[[32, 128], pl.FP32, pl.Mem.Acc]):
+                value = pl.mul(x, 1.0)
+                for i, (acc, held) in pl.range(stop, init_values=(value, value)):
+                    alias = held
+                    for j, (inner,) in pl.range(2, init_values=(acc,)):
+                        total = pl.add(inner, alias)
+                        inner_result = pl.yield_(total)
+                    result, held_result = pl.yield_(inner_result, held)
+                _output = pl.add(result, held_result)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.AIV)
+            def kernel(self, x: pl.Tile[[32, 128], pl.FP32, pl.Mem.Acc]):
+                x_Vec = pl.move(
+                    x,
+                    target_memory=pl.Mem.Vec,
+                    blayout=pl.TileLayout.row_major,
+                    slayout=pl.TileLayout.none_box,
+                )
+                value = pl.mul(x_Vec, 1.0)
+                for i, (acc, held) in pl.range(stop, init_values=(value, value)):
+                    alias = held
+                    for j, (inner,) in pl.range(2, init_values=(acc,)):
+                        total = pl.add(inner, alias)
+                        inner_result = pl.yield_(total)
+                    result, held_result = pl.yield_(inner_result, held)
+                _output = pl.add(result, held_result)
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(pl.parse_program(ir.python_print(After)), After)
+
+    def test_while_carries_inherit_rewritten_layout(self):
+        backend.set_backend_type(BackendType.Ascend950)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.AIV)
+            def kernel(self, x: pl.Tile[[32, 128], pl.FP32, pl.Mem.Acc], count: pl.Scalar[pl.INT32]):
+                value = pl.mul(x, 1.0)
+                for acc, remaining in pl.while_(init_values=(value, count)):
+                    pl.cond(remaining > 0)
+                    alias = acc
+                    total = pl.add(acc, alias)
+                    result, remaining_result = pl.yield_(total, remaining - pl.const(1, pl.INT32))
+                _output = pl.mul(result, 1.0)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.AIV)
+            def kernel(self, x: pl.Tile[[32, 128], pl.FP32, pl.Mem.Acc], count: pl.Scalar[pl.INT32]):
+                x_Vec = pl.move(
+                    x,
+                    target_memory=pl.Mem.Vec,
+                    blayout=pl.TileLayout.row_major,
+                    slayout=pl.TileLayout.none_box,
+                )
+                value = pl.mul(x_Vec, 1.0)
+                for acc, remaining in pl.while_(init_values=(value, count)):
+                    pl.cond(remaining > 0)
+                    alias = acc
+                    total = pl.add(acc, alias)
+                    result, remaining_result = pl.yield_(total, remaining - pl.const(1, pl.INT32))
+                _output = pl.mul(result, 1.0)
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(pl.parse_program(ir.python_print(After)), After)
+
+    def test_explicit_boxed_vec_layout_is_preserved(self):
+        backend.set_backend_type(BackendType.Ascend950)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.AIV)
+            def kernel(
+                self,
+                x: pl.Tile[
+                    [32, 128],
+                    pl.FP32,
+                    pl.Mem.Vec,
+                    pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major),
+                ],
+            ):
+                alias = x
+                for i, (acc,) in pl.range(2, init_values=(alias,)):
+                    held = acc
+                    result = pl.yield_(held)
+                _output = result
+
+        ir.assert_structural_equal(passes.infer_tile_memory_space()(Before), Before)
 
 
 if __name__ == "__main__":

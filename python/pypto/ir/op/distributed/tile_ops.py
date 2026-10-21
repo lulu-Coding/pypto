@@ -90,10 +90,10 @@ def _build_remote_load(
     actual_span = _get_span_or_capture(span, frame_offset=2)
     offsets_tuple = _to_make_tuple(offsets, actual_span)
     shape_tuple = _to_make_tuple(shape, actual_span)
-    args = [target, peer, offsets_tuple, shape_tuple]
+    args: list[Expr] = [target, peer, offsets_tuple, shape_tuple]
     if valid_shape is not None:
         args.append(_to_make_tuple(valid_shape, actual_span))
-    kwargs = {}
+    kwargs: dict[str, bool] = {}
     if allow_physical_tail_padding:
         kwargs["allow_physical_tail_padding"] = True
     return _ir_core.create_op_call(
@@ -163,7 +163,7 @@ def put(
     and dtype as ``stage``.
 
     ``atomic=Add`` requires an fp32/bf16/fp16/int32/int16/int8 destination (the
-    hardware atomic-add dtypes); a bf16 destination is Ascend910B-only, checked
+    hardware atomic-add dtypes); a bf16 destination is Ascend910-only, checked
     by the ``AtomicAddDtypeValid`` verifier.
     """
     actual_span = _get_span_or_capture(span, frame_offset=1)
@@ -228,4 +228,4 @@ def get(
     return _ir_core.create_op_call("pld.tile.get", args, {}, actual_span)
 
 
-__all__ = ["get", "remote_load", "remote_store", "put"]
+__all__ = ["get", "remote_load", "remote_store", "put", "_remote_load_with_physical_tail_padding"]

@@ -16,12 +16,13 @@ lambda would mint one pointer per syntactic occurrence and burn through the
 16-entry Definition cache.
 
 The assertions that matter most are the ones covering silent failures. A
-boundary scalar bound by value instead of by reference severs the pointer
-identity the runtime uses to track it, and the value is frozen at its first-call
-number on every later replay — with no warning anywhere.
+boundary scalar converted to an integer loses the parameter origin the runtime
+uses to track it, and the value is frozen at its first-call number on every
+later replay. Preserve the runtime's InheritableScalar wrapper instead.
+
+Runtime-header integration checks also cover builtin orchestration templates.
 """
 
-import os
 import re
 import shutil
 import subprocess
@@ -30,8 +31,14 @@ from pathlib import Path
 from unittest import mock
 
 import pypto.language as pl
+import pypto.language.distributed as pld
 import pytest
-from _orchestration_codegen_common import _out_of_scope_tensor_refs
+from _orchestration_codegen_common import (
+    _assert_orchestration_compiles,
+    _out_of_scope_tensor_refs,
+    _runtime_include_args,
+)
+from pypto.backend import BackendType, pto_backend
 from pypto.ir.compile import compile as ir_compile
 from pypto.pypto_core import passes
 
@@ -135,17 +142,11 @@ def test_boundary_tensors_are_bound_from_the_task_args(orch):
     assert "const Tensor& c = args.tensor(1).ref();" in body
 
 
-def test_boundary_scalars_are_bound_by_reference(orch):
-    """The single most consequential line in the whole feature.
-
-    The runtime tracks a boundary scalar by the *address* of its argument slot.
-    Copying it into a local (``uint64_t base = args.scalar(1);``) severs that
-    link, so the value is frozen at the first call's number and silently reused
-    on every replay.
-    """
+def test_boundary_scalars_preserve_the_runtime_parameter(orch):
+    """Forward InheritableScalar without converting it to the first call's value."""
     body = _graph_body(orch)
-    assert "const uint64_t& layer_idx = args.scalar(0);" in body
-    assert "const uint64_t& base = args.scalar(1);" in body
+    assert "const auto layer_idx = args.scalar(0);" in body
+    assert "const auto base = args.scalar(1);" in body
 
 
 def test_graph_body_allocates_nothing(orch):
@@ -218,38 +219,6 @@ def test_artifact_targets_the_graph_runtime(artifacts):
 # ---------------------------------------------------------------------------
 
 
-def _runtime_include_args(repo_root: Path) -> list[str]:
-    """``-I`` flags for the a2a3 host_build_graph orchestration headers.
-
-    The same directories, in the same order, that simpler's own kernel compiler
-    puts on an orchestration TU: ``get_orchestration_include_dirs`` followed by
-    the runtime's ``build_config`` ``orchestration.include_dirs``. Handing the
-    compiler every directory that holds a header instead lets a runtime that is
-    not under test shadow the one that is -- ``common/hierarchical/types.h``
-    wins over ``host_build_graph/types.h`` and drags in
-    ``task_interface/buffer.h``, whose global ``Tensor`` then collides with the
-    runtime's own ``Tensor`` alias. The tree root comes last, for the includes
-    spelled with a directory prefix (``common/host_phase_kind.h``).
-    """
-    src = repo_root / "runtime" / "src"
-    runtime_dir = src / "a2a3" / "runtime" / "host_build_graph"
-    return [
-        f"-I{path}"
-        for path in (
-            runtime_dir / "runtime",
-            runtime_dir / "orchestration",
-            runtime_dir / "common",
-            src / "a2a3" / "runtime",
-            src / "common" / "host_build_graph",
-            src / "common" / "task_interface",
-            src / "common",
-            src / "a2a3" / "platform" / "include",
-            src / "common" / "platform" / "include",
-            src,
-        )
-    ]
-
-
 def test_generated_orchestration_compiles_against_the_pinned_runtime(artifact_root):
     """Type-check the emitted file — the only check that covers the graph ABI.
 
@@ -262,38 +231,66 @@ def test_generated_orchestration_compiles_against_the_pinned_runtime(artifact_ro
     hard compile error in the generated file that a string assertion happily
     confirms instead of catching.
     """
-    repo_root = Path(__file__).resolve().parents[3]
-    main_cpp = artifact_root / "orchestration" / "main.cpp"
-    assert main_cpp.is_file(), f"no orchestration emitted at {main_cpp}"
+    _assert_orchestration_compiles(artifact_root / "orchestration" / "main.cpp")
 
-    if not (repo_root / "runtime" / "src" / "a2a3" / "runtime" / "host_build_graph").is_dir():
-        pytest.skip("runtime submodule not checked out")
-    candidates = (os.environ.get("CXX"), "g++-15", "g++", "c++")
-    compiler = next(
-        (found for name in candidates if name and (found := shutil.which(name))),
-        None,
-    )
-    if compiler is None:
-        pytest.skip("no C++ compiler available")
 
-    result = subprocess.run(
-        [compiler, "-std=c++17", "-fsyntax-only", *_runtime_include_args(repo_root), str(main_cpp)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode == 0:
-        return
+@pytest.mark.parametrize(
+    "runtime", [passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER, passes.RuntimeKind.HOST_BUILD_GRAPH]
+)
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910, BackendType.Ascend950], indirect=True)
+def test_collective_builtins_compile_against_runtime(tmp_path, runtime, ascend_backend):
+    """Compile actual builtin specs, including their runtime-specific launch API."""
 
-    # A missing header means this environment's include layout differs from the
-    # one the flags above assume — not a codegen defect, so do not fail on it.
-    # Anything the compiler blames on the generated file is.
-    if "fatal error:" in result.stderr and str(main_cpp) not in result.stderr.split("fatal error:")[0][-200:]:
-        pytest.skip(f"runtime headers not resolvable here: {result.stderr.strip().splitlines()[0]}")
-    blamed = [line for line in result.stderr.splitlines() if "error:" in line]
-    raise AssertionError(
-        "generated orchestration does not compile against the pinned runtime:\n" + "\n".join(blamed[:15])
-    )
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(
+            self,
+            inp: pld.DistributedTensor[[8, 64], pl.FP32],
+            data: pld.DistributedTensor[[8, 64], pl.FP32],
+            signal: pld.DistributedTensor[[4, 8], pl.INT32],
+            counts: pld.DistributedTensor[[4, 1], pl.INT32],
+            recv: pld.DistributedTensor[[4, 1], pl.INT32],
+        ):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            input_buf = pld.alloc_window_buffer(8 * 64 * pl.FP32.get_byte())
+            data_buf = pld.alloc_window_buffer(8 * 64 * pl.FP32.get_byte())
+            signal_buf = pld.alloc_window_buffer(4 * 8 * pl.INT32.get_byte())
+            counts_buf = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
+            recv_buf = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
+            inp = pld.window(input_buf, [8, 64], dtype=pl.FP32)
+            data = pld.window(data_buf, [8, 64], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [4, 8], dtype=pl.INT32)
+            counts = pld.window(counts_buf, [4, 1], dtype=pl.INT32)
+            recv = pld.window(recv_buf, [4, 1], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(inp, data, signal, counts, recv, device=r)
+            pld.tensor.all_to_all_v(inp, data, signal, counts, recv, core_num=4)
+            pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum, core_num=4)
+            return 0
+
+    with passes.PassContext([], runtime=runtime):
+        context = passes.PassContext.current()
+        program = passes.materialize_comm_domain_scopes()(Prog)
+        program = passes.lower_host_tensor_collectives()(program)
+        program = passes.materialize_dist_tensor_ctx()(program)
+        program = passes.derive_call_directions()(program)
+        program = passes.classify_iter_arg_carry()(passes.materialize_runtime_scopes()(program))
+        # Lowering and builtin codegen must target the same runtime ABI.
+        files = pto_backend.generate(program, str(tmp_path), skip_ptoas=True, runtime=runtime)
+        assert passes.PassContext.current() is context
+    arch = "a5" if ascend_backend == BackendType.Ascend950 else "a2a3"
+    for variant in ("all_to_all_v__fp32", "allreduce__sum__fp32"):
+        entry_cpp = tmp_path / f"{variant}.cpp"
+        entry_cpp.write_text(
+            files[f"next_levels/builtin.tensor.{variant}/orchestration/builtin_tensor_{variant}.cpp"]
+        )
+        _assert_orchestration_compiles(
+            entry_cpp, runtime_name=passes.runtime_kind_to_name(runtime), arch=arch
+        )
 
 
 @pl.program
@@ -506,6 +503,223 @@ def _compile_orch(program) -> str:
     ):
         ir_compile(program, skip_ptoas=False, platform="a2a3", output_dir=out_dir, dump_passes=False)
     return (Path(out_dir) / "orchestration" / "main.cpp").read_text()
+
+
+@pl.program
+class _ScalarValueReads:
+    """Read boundary scalar values without changing the graph's task topology."""
+
+    @pl.function(type=pl.FunctionType.Graph)
+    def layer(
+        self,
+        a: pl.Tensor[[512, 128], pl.FP32],
+        c: pl.InOut[pl.Tensor[[128, 128], pl.FP32]],
+        start: pl.Scalar[pl.INDEX],
+        n: pl.Scalar[pl.INDEX],
+        step: pl.Scalar[pl.INDEX],
+        enabled: pl.Scalar[pl.BOOL],
+        scale: pl.Scalar[pl.FP32],
+    ) -> pl.Tensor[[128, 128], pl.FP32]:
+        for _ in pl.range(n):
+            pass
+        for _ in pl.range(start, n + 1, step):
+            pass
+        if enabled:
+            for _ in pl.range(n):
+                pass
+        if scale > 0.0:
+            for _ in pl.range(n):
+                pass
+        acc = scale
+        for _ in pl.range(2):
+            acc = acc + 1.0
+        if acc > 0.0:
+            for _ in pl.range(n):
+                pass
+        with pl.at(level=pl.Level.CORE_GROUP):
+            t: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [n, 0], [128, 128])
+            t = pl.mul(t, scale)
+            pl.store(t, [0, 0], c)
+        return c
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+        a: pl.Tensor[[512, 128], pl.FP32],
+        c: pl.InOut[pl.Tensor[[128, 128], pl.FP32]],
+        start: pl.Scalar[pl.INDEX],
+        n: pl.Scalar[pl.INDEX],
+        step: pl.Scalar[pl.INDEX],
+        enabled: pl.Scalar[pl.BOOL],
+        scale: pl.Scalar[pl.FP32],
+    ) -> pl.Tensor[[128, 128], pl.FP32]:
+        c = self.layer(a, c, start, n, step, enabled, scale)
+        return c
+
+
+def test_graph_scalar_value_reads_compile_and_preserve_task_forwarding(tmp_path):
+    orch = _compile_orch(_ScalarValueReads)
+    main_cpp = tmp_path / "main.cpp"
+    main_cpp.write_text(orch)
+    _assert_orchestration_compiles(main_cpp)
+
+    body = _graph_body(orch)
+    for slot, (name, cpp_type) in enumerate(
+        (("start", "int64_t"), ("n", "int64_t"), ("step", "int64_t"), ("enabled", "bool"), ("scale", "float"))
+    ):
+        assert f"from_u64<{cpp_type}>(_pypto_graph_config.scalar_{slot})" in body, body
+        assert f".scalar_{slot} = to_u64({name})" in _entry_body(orch), orch
+    # Reading a value elsewhere must not discard its origin when forwarding it.
+    assert re.search(r"float \w+ = from_u64<float>\(_pypto_graph_config.scalar_4\);", body), body
+    assert ".add_scalar(n)" in body, body
+    assert ".add_scalar(scale)" in body, body
+
+
+@pl.program
+class _MixedScalarUses:
+    @pl.function(type=pl.FunctionType.Graph)
+    def layer(
+        self,
+        a: pl.Tensor[[128, 128], pl.FP32],
+        n: pl.Scalar[pl.INDEX],
+        c: pl.InOut[pl.Tensor[[128, 128], pl.FP32]],
+        scale: pl.Scalar[pl.FP32],
+    ) -> pl.Tensor[[128, 128], pl.FP32]:
+        for _ in pl.range(n):
+            pass
+        with pl.at(level=pl.Level.CORE_GROUP):
+            t = pl.load(a, [0, 0], [128, 128])
+            t = pl.mul(t, scale)
+            pl.store(t, [0, 0], c)
+        return c
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+        a: pl.Tensor[[128, 128], pl.FP32],
+        n: pl.Scalar[pl.INDEX],
+        c: pl.InOut[pl.Tensor[[128, 128], pl.FP32]],
+        scale: pl.Scalar[pl.FP32],
+    ) -> pl.Tensor[[128, 128], pl.FP32]:
+        c = self.layer(a, n, c, scale)
+        return c
+
+
+def test_graph_scalar_declarations_and_forwarding_execute_against_runtime(tmp_path):
+    """Exercise generated scalar packing with the real runtime's Config keys and inherited handles."""
+    orch = _compile_orch(_MixedScalarUses)
+    main_cpp = tmp_path / "main.cpp"
+    main_cpp.write_text(orch)
+    _assert_orchestration_compiles(main_cpp)
+    body = _graph_body(orch)
+    assert "from_u64<int64_t>(_pypto_graph_config.scalar_0)" in body
+    assert ".add_scalar(scale)" in body
+    assert "_pypto_graph_config.scalar_1" not in body
+
+    boundary = re.search(r"GraphTaskArgs (\w+);(.*?)rt_submit_graph", _entry_body(orch), re.DOTALL)
+    assert boundary is not None, orch
+    scalar_packing = "\n".join(
+        line for line in boundary[2].splitlines() if re.search(r"\.add_(?:static_)?scalar\(", line)
+    )
+    assert scalar_packing.count(";") == 2, scalar_packing
+    config_definition = re.search(
+        r"struct (\w+Config) : simpler::hbg::ConfigBase \{.*?\n\};", orch, re.DOTALL
+    )
+    assert config_definition is not None, orch
+    config_packing = "\n".join(line for line in boundary[2].splitlines() if "_config" in line)
+    config_preamble = orch[
+        orch.index("static std::vector<uint64_t> pypto_graph_boundary_layout") : orch.index(
+            "static void pypto_graph_"
+        )
+    ]
+    source = tmp_path / "scalar_contract.cpp"
+    source.write_text(
+        f"""#include <cassert>
+#include "types.h"
+#include "graph_config.h"
+#include "host_build_graph/host/graph_boundary_match.h"
+{config_preamble}
+
+int main() {{
+    uint64_t previous_hash = 0;
+    for (int invocation = 0; invocation < 2; ++invocation) {{
+        int64_t n = 3 + invocation;
+        float scale = invocation == 0 ? 1.25f : -2.5f;
+        GraphTaskArgs {boundary[1]};
+        {scalar_packing}
+        {config_packing}
+        const auto config = {boundary[1]}_config;
+        assert(from_u64<int64_t>(config.scalar_0) == n);
+        assert(config == config);
+        assert(config.hash() != previous_hash);
+        previous_hash = config.hash();
+        auto changed = config;
+        changed.scalar_0 = to_u64(n + 1);
+        assert(!(config == changed));
+        assert(config.hash() != changed.hash());
+        GraphTaskArgs args;
+        args.gen_scalar_params_from_args({boundary[1]});
+        const auto forwarded_scale = args.scalar(1);
+        CoreTaskArgs task;
+        task.add_scalar(forwarded_scale);
+        assert(task.scalar(0).origin() == args.scalar(1).origin());
+        uint64_t bits[1];
+        task.pack_scalars(bits);
+        assert(from_u64<float>(bits[0]) == scale);
+    }}
+    auto layout = [](uint64_t address, uint64_t start, uint64_t view_offset,
+                     uint32_t view_shape, bool alias) {{
+        simpler::hbg::Tensor whole{{}};
+        whole.buffer.addr = address;
+        whole.buffer.size = 256;
+        whole.ndims = 1;
+        whole.shapes[0] = 32;
+        whole.strides[0] = 1;
+        whole.start_offset = start;
+        simpler::hbg::Tensor view = whole;
+        view.buffer.addr = alias ? address : address + 4096;
+        view.start_offset = start + view_offset;
+        view.shapes[0] = view_shape;
+        GraphTaskArgs boundary;
+        boundary.add_input(whole);
+        boundary.add_input(view);
+        return pypto_graph_boundary_layout(boundary);
+    }};
+    {config_definition[1]} first, relocated, different_view, different_alias, different_shape;
+    first.boundary = layout(4096, 0, 32, 8, true);
+    relocated.boundary = layout(8192, 16, 32, 8, true);
+    different_view.boundary = layout(4096, 0, 64, 8, true);
+    different_alias.boundary = layout(4096, 0, 32, 8, false);
+    different_shape.boundary = layout(4096, 0, 32, 4, true);
+    assert(first == relocated && first.hash() == relocated.hash());
+    assert(!(first == different_view) && first.hash() != different_view.hash());
+    assert(!(first == different_alias) && first.hash() != different_alias.hash());
+    assert(!(first == different_shape) && first.hash() != different_shape.hash());
+}}
+"""
+    )
+    repo_root = Path(__file__).resolve().parents[3]
+    compiler = shutil.which("g++") or shutil.which("c++")
+    if compiler is None:
+        pytest.skip("no C++ compiler available")
+    binary = tmp_path / "scalar_contract"
+    result = subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            *_runtime_include_args(repo_root),
+            str(source),
+            str(repo_root / "runtime/src/common/task_interface/assert_compat.cpp"),
+            "-o",
+            str(binary),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    result = subprocess.run([str(binary)], capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
 
 
 def test_graph_helper_defines_the_dynamic_dims_its_body_reads():

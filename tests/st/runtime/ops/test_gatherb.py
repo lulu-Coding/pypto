@@ -54,6 +54,20 @@ _ELEMENT_BYTES = {
 }
 
 
+# The 1-byte destinations below were skipped for hw-native-sys/PTOAS#1495: v0.61
+# narrowed `pto.tgatherb`'s A2/A3 destination width from {1, 2, 4} bytes to {2, 4}
+# in the shared op verifier (PTOAS#971), to match a new VPTO lowering path whose
+# `llvm.hivm.VGATHERB` intrinsics only come in `.b16` and `.b32`, so these stopped
+# compiling with `'pto.tgatherb' op expects A2/A3 dst element size to be 2 or 4
+# bytes`. The EmitC path they take lowers a 1-byte destination through the ISA's
+# dedicated `GatherBInstrB8`, which is why they passed under v0.60.
+#
+# PTOAS v0.63 (`fix: accept byte-sized A2/A3 tgatherb destinations`) restores the
+# 1-byte width, and #1495 is closed as completed. The marks are therefore dropped
+# along with the v0.61 -> v0.63 bump in `toolchain/versions.env`; they must come
+# back if the pin ever moves to a release between v0.61 and v0.63.
+
+
 def _byte_offsets(pattern: str, rows: int, offsets_per_row: int) -> torch.Tensor:
     source_blocks = rows * offsets_per_row
     indices = torch.arange(source_blocks, dtype=torch.int64)
@@ -172,13 +186,13 @@ class TestGatherb:
     """TGATHERB dtype, block permutation, and valid-shape branches."""
 
     @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
-    @pytest.mark.parametrize("dtype", list(_PL_DTYPE))
+    @pytest.mark.parametrize("dtype", _PL_DTYPE, ids=str)
     def test_dtypes(self, test_runner, platform, dtype):
         result = test_runner.run(GatherbTestCase(dtype=dtype, platform=platform))
         assert result.passed, f"Test failed: {result.error}"
 
     @pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
-    @pytest.mark.parametrize("pattern", ["reverse", "roll3"])
+    @pytest.mark.parametrize("pattern", ("reverse", "roll3"))
     def test_byte_offset_patterns(self, test_runner, platform, pattern):
         result = test_runner.run(GatherbTestCase(dtype=DataType.UINT8, pattern=pattern, platform=platform))
         assert result.passed, f"Test failed: {result.error}"
@@ -187,11 +201,14 @@ class TestGatherb:
     @pytest.mark.parametrize(
         ("dtype", "output_dtype"),
         [
-            (DataType.INT16, DataType.INT32),
-            (DataType.UINT8, DataType.UINT16),
-            (DataType.INT32, DataType.INT8),
-            (DataType.FP32, DataType.UINT8),
-            (DataType.UINT32, DataType.FP16),
+            pytest.param(src, dst, id=f"{src}-{dst}")
+            for src, dst in (
+                (DataType.INT16, DataType.INT32),
+                (DataType.UINT8, DataType.UINT16),
+                (DataType.INT32, DataType.INT8),
+                (DataType.FP32, DataType.UINT8),
+                (DataType.UINT32, DataType.FP16),
+            )
         ],
     )
     def test_cross_dtype_byte_reinterpretation(self, test_runner, platform, dtype, output_dtype):

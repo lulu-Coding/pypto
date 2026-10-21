@@ -4,9 +4,9 @@
 
 Orchestration codegen follows the same principle as [PTO codegen](00-pto_codegen.md#design-principle-strict-1-to-1-mapping): a **strict 1-to-1 translation** from IR to generated C++ code. The codegen should not perform optimization, analysis, or indirection — such work belongs in earlier passes.
 
-For example, return-to-parameter tracing (mapping callee return values back to `Out` parameters) is analysis that should be resolved by a pass before codegen sees the IR. The [`NormalizeReturnOrder`](../passes/28-normalize_return_order.md) pass now canonicalizes this before codegen, so orchestration codegen maps `return[i]` directly to `out_indices[i]` without tracing through `tile.store`/yield chains.
+For example, return-to-parameter tracing (mapping callee return values back to `Out` parameters) is analysis that should be resolved by a pass before codegen sees the IR. The [`NormalizeReturnOrder`](../passes/29-normalize_return_order.md) pass now canonicalizes this before codegen, so orchestration codegen maps `return[i]` directly to `out_indices[i]` without tracing through `tile.store`/yield chains.
 
-Likewise, deciding whether a `ForStmt` iter_arg needs a materialised carry variable used to require an alias-equivalence fixpoint over the loop body. The [`ClassifyIterArgCarry`](../passes/50-classify_iter_arg_carry.md) pass now stamps that decision (and the TaskId fence-array extent) onto `ForStmt::attrs_`, so codegen reads `iter_arg_rebind_<i>` / `iter_arg_array_size_<i>` instead of deriving them.
+Likewise, deciding whether a `ForStmt` iter_arg needs a materialised carry variable used to require an alias-equivalence fixpoint over the loop body. The [`ClassifyIterArgCarry`](../passes/52-classify_iter_arg_carry.md) pass now stamps that decision (and the TaskId fence-array extent) onto `ForStmt::attrs_`, so codegen reads `iter_arg_rebind_<i>` / `iter_arg_array_size_<i>` instead of deriving them.
 
 ## Overview
 
@@ -76,6 +76,15 @@ This allows extensible operation codegen without modifying the core visitor.
 #include "orchestration_api.h"
 ```
 
+The runtime SDK supplies include paths and helper sources from its `build_config.py`.
+HBG's orchestration API lives under `src/common/host_build_graph/host/orchestration/`;
+Graph code also includes `host_build_graph/host/graph_boundary_match.h`.
+Builtin entry templates access the HBG context through `current_orch_context()`
+and the TensorMap/RingBuffer context through `current_runtime()`.
+
+Both runtimes use `launch_spec.set_block_num()` on A2/A3 and A5 to set the
+per-task logical block count. This setter is independent of `PassContext.runtime`.
+
 ### Phase 2–3: Entry Points
 
 ```cpp
@@ -109,7 +118,7 @@ const ChipTensor& tmp = alloc_0.get_ref(0);
 
 All task submission is wrapped in a top-level `SIMPLER_SCOPE()`. Codegen no longer
 decides scope placement from the `for` / `if` structure: the
-[MaterializeRuntimeScopes](../passes/49-materialize_runtime_scopes.md) pass
+[MaterializeRuntimeScopes](../passes/51-materialize_runtime_scopes.md) pass
 inserts explicit AUTO `RuntimeScopeStmt` nodes (the function body and each
 `for` / `if` body) into the IR, and codegen emits `SIMPLER_SCOPE` 1:1 from those
 nodes (manual scopes lower to `SIMPLER_SCOPE(ScopeMode::MANUAL)`):
@@ -195,7 +204,7 @@ params_t1.add_input(ext_output);  // `result` -> ext_output (no alias decl)
 
 Which `Out`/`InOut` param a result aliases is a lookup, not a heuristic — and
 not an analysis either. `ReturnParamsExplicit`
-([`NormalizeReturnOrder`](../passes/28-normalize_return_order.md)) guarantees
+([`NormalizeReturnOrder`](../passes/29-normalize_return_order.md)) guarantees
 that every tensor param-writeback return value *is* the param, by pointer
 identity. Codegen therefore reads the return-position → param-index map straight
 off the callee's `ReturnStmt` via `ir::return_lineage::ExplicitReturnedParamIndices`;
@@ -215,6 +224,12 @@ see *Cross-scope tensors and `manual_scope`* below) keeps the decl path. A
 runtime-allocated output bound to `task_<n>_outs.get_ref(k)` likewise keeps its
 `const ChipTensor&` binding.
 
+Copies of hoisted tensor carries inside a nested runtime scope remain distinct
+snapshots. When the source is valid outside that scope, codegen hoists the copy's
+declaration with `EmitMutableTensorCarryDecl` and keeps its assignment at the
+original position. Later readers can name the snapshot without observing a
+subsequent carry update; no tensor allocation moves with the declaration.
+
 ### Core Type Inference
 
 The codegen determines whether to submit to AIC (CUBE) or AIV (VECTOR) based on the callee's `MemorySpace`:
@@ -225,7 +240,7 @@ The codegen determines whether to submit to AIC (CUBE) or AIV (VECTOR) based on 
 | `Vec` (default) | VECTOR (AIV) | `rt_submit_aiv_task` |
 
 **Exception — dual-AIV kernels.** An AIV kernel stamped `dual_aiv_dispatch` (any
-`split_aiv` kernel; see [`SplitVectorKernel`](../passes/26-split_vector_kernel.md))
+`split_aiv` kernel; see [`SplitVectorKernel`](../passes/27-split_vector_kernel.md))
 must run on **both** vector lanes of a cluster — a `pl.split_aiv` region hands each
 lane disjoint work selected by `aiv_id`. `rt_submit_aiv_task` fills only the AIV0
 slot, so the runtime schedules an *AIV-shape* task — one AIV core per block: the second
@@ -539,7 +554,7 @@ inside the branches instead.
 ```python
 from pypto import codegen, backend
 
-backend.set_backend_type(backend.BackendType.Ascend910B)
+backend.set_backend_type(backend.BackendType.Ascend910)
 result = codegen.generate_orchestration(MyProgram, orch_func)
 code = result.code
 
@@ -584,7 +599,7 @@ carriers of `manual_dep_edges` no longer exist — the
 ManualDepsOnSubmitOnly structural property verifies that no cross-function
 `Call` carries it; only the `system.task_dummy` barrier op keeps the attr as
 its fanin contract. Compiler-derived edges come from
-[`AutoDeriveTaskDependencies`](../passes/42-auto_derive_task_dependencies.md)
+[`AutoDeriveTaskDependencies`](../passes/44-auto_derive_task_dependencies.md)
 in `Call.attrs["compiler_manual_dep_edges"]` (a separate key, allowed on plain
 calls). That pass never analyzes a user-written MANUAL scope — inside
 `pl.manual_scope()` the explicit `deps=[...]` list stays the only source of
@@ -638,10 +653,8 @@ scope registers a carry whose backing `TaskId[N]` was declared further out. The
 slot write is emitted in place, but the *carry* is read after the closing brace,
 by the enclosing loop's yield. Restoring it away makes that yield misread an
 Array value as a scalar TaskId, so `PreserveEnclosingArrayCarries` keeps any
-carry whose backing array outlives the block — for both scope kinds. Locality is
-decided per kind: a MANUAL scope hoists its allocations and knows its local
-names outright; an AUTO scope hoists nothing, so storage counts as enclosing
-exactly when a pre-entry carry already named it.
+carry whose backing array outlives the block — for both scope kinds. Both scope kinds track local names directly; declarations hoisted into the
+enclosing scope are removed from the current scope's local set.
 
 ### Unresolvable dep edges
 
@@ -659,7 +672,7 @@ on scope exit. Codegen's response depends on the edge's provenance:
 Provenance is the attr key. Note that `attrs["dummy_task"]` is *not* an
 authorship marker: the parser stamps it on a user-written
 `pl.system.task_dummy(deps=[...])` exactly as
-[`ExpandManualPhaseFence`](../passes/43-expand_manual_phase_fence.md) does on the
+[`ExpandManualPhaseFence`](../passes/45-expand_manual_phase_fence.md) does on the
 barriers it synthesises, so every `manual_dep_edges` carrier is enforced. The
 synthesised barrier only ever names a TaskId live in the manual scope it
 rewrites, so its fanin always resolves.
@@ -721,6 +734,55 @@ mechanisms enforce this, both gated on whether a name is *enclosing-scope-valid*
 Together these make a tensor created before *or* inside the scope and read after
 it resolve to a single enclosing-scope `const ChipTensor& buf = ...;` — the
 after-scope task simply does `add_input(buf)`, with no per-SSA-version alias.
+
+**Tensor carries across AUTO scopes.** An explicit `pl.scope()` may close before
+its enclosing loop's yield. In particular, `LegalizeSpmdLaunches` introduces
+Tensor phis for launches whose dynamic block count may be zero. Declaring those
+phis inside the AUTO block would leave the later yield referencing a closed
+C++ scope. Codegen buffers AUTO bodies as well as MANUAL bodies and hoists
+initialized Tensor carries/phis declared directly in the body when their
+initializer is valid in the enclosing scope. Copies of those hoisted handles
+at the original body level reuse the enclosing name; copies inside nested loops
+remain snapshots. Branch assignments and task submissions stay in place, and
+AUTO buffer allocations remain inside their scheduling scope.
+
+Consecutive nested AUTO scopes may hoist a descriptor through multiple wrappers
+when its initializer is immutable and visible outside each wrapper. Hoisting stops
+at a loop or branch boundary, a MANUAL scope, or a scope-local initializer. The
+original body level still controls SSA-copy collapse, preserving nested snapshots.
+Copies of immutable enclosing Tensors reuse their existing names in either scope
+mode, including aliases left after a single-iteration loop is simplified away.
+
+**Validate uses separately from names.** `ValidateValueUse(value, use_span)` is
+the shared check for Tensor operands emitted by orchestration codegen: expression
+reads, task arguments, tensor operations, dispatch predicates, loop initialization,
+and loop writeback. It resolves existing SSA aliases through `emit_name_map_` and
+rejects a name owned by a closed AUTO scope, reporting the use site's span. The
+scope's existing local-name set supplies this information; hoisted names are
+removed before closure and remain usable. Allocate buffers in an enclosing scope
+when later tasks need them, or keep their consumers inside the allocating scope.
+
+Descriptor copies and branch/loop yields also retain allocation-source edges.
+When a scope closes, codegen invalidates its allocations and propagates that state
+to dependent descriptors. Descriptors hoisted out of AUTO scopes and their aliases are checked against
+this state, so a hoisted descriptor cannot hide a reclaimed buffer. Each value and dependency edge is visited once per propagated flag. MANUAL
+allocation batches belong to the enclosing scope where they are emitted; existing
+MANUAL carry behavior is unchanged.
+
+Source edges identify values rather than mutable C++ names. A loop carry has
+separate entry and exit values, so yielding a new buffer does not retroactively
+change an earlier snapshot. A known single iteration has no backedge; repeated
+or unknown iterations connect the exit to the next entry and recheck body reads
+affected by that connection. Zero iterations return only the initializer, and
+unknown trip counts also retain that zero-iteration path. Branch yields continue
+to merge their possible sources into the branch result.
+
+Yield writeback validates the destination's lexical scope without reading its old
+storage; allocation lifetime is checked on the yielded value and later reads.
+
+`GetVarName()`, `TryGetVarName()`, and name reservation remain independent of this
+validation. A fresh SSA definition can therefore reuse the source spelling of a
+closed local and receive a new, unique C++ name without being mistaken for a read.
 
 ### Array carry for `pl.parallel` TaskId iter_args
 
@@ -852,3 +914,7 @@ Every task in phase `N+1` waits for **all** `N_BRANCHES` tasks of phase `N`.
 - [PTO Codegen](00-pto_codegen.md) — MLIR generation for PTO backend
 - [Pass Manager](../passes/00-pass_manager.md) — IR optimization passes applied before codegen
 - [Python syntax: manual dependency primitives](../language/02-manual_dependencies.md#manual-dependency-primitives) — the user-facing surface form
+
+## Kernel registrations
+
+Code identity and runtime tensor signatures are separate. See [DeduplicateOutlinedKernels](../passes/11-deduplicate_outlined_kernels.md#code-and-registration-identity).

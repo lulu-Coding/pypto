@@ -38,6 +38,7 @@
 #include "pypto/ir/span.h"
 #include "pypto/ir/transforms/base/functor.h"
 #include "pypto/ir/type.h"
+#include "src/ir/arith/simplify_utils.h"
 
 namespace pypto {
 namespace ir {
@@ -73,7 +74,7 @@ ExprPtr CanonicalSimplifier::Impl::VisitExpr(const ExprPtr& expr) {
       stype && stype->dtype_.IsFloat()) {
     return expr;
   }
-  return ExprFunctor<ExprPtr>::VisitExpr(expr);
+  return PreserveIntegerResultType(expr, ExprFunctor<ExprPtr>::VisitExpr(expr));
 }
 
 CompareResult CanonicalSimplifier::Impl::TryCompare(const ExprPtr& /*x*/, int64_t /*val*/) {
@@ -536,7 +537,15 @@ ExprPtr CanonicalSimplifier::Impl::VisitExpr_(const MulPtr& op) {
 ExprPtr CanonicalSimplifier::Impl::VisitExpr_(const FloorDivPtr& op) {
   ExprPtr a = VisitExpr(op->left_);
   ExprPtr b = VisitExpr(op->right_);
-  if (auto folded = TryConstFoldBinary(ObjectKind::FloorDiv, a, b)) return folded;
+  // Bound-based rewrites also assume stored constants are mathematical values.
+  // Preserve this operation if a literal would wrap during runtime lowering.
+  const DataType dtype = GetScalarDtype(op);
+  if (!detail::FloorDivModOperandsFitDtype(a, b, dtype)) {
+    if (a.get() == op->left_.get() && b.get() == op->right_.get()) return op;
+    // Operand promotion here would change the width used to interpret the literal.
+    return std::make_shared<FloorDiv>(a, b, dtype, op->span_);
+  }
+  if (auto folded = TryConstFoldBinary(ObjectKind::FloorDiv, a, b, dtype)) return folded;
 
   auto ci = As<ConstInt>(b);
   if (ci && ci->value_ > 0) {
@@ -566,7 +575,15 @@ ExprPtr CanonicalSimplifier::Impl::VisitExpr_(const FloorDivPtr& op) {
 ExprPtr CanonicalSimplifier::Impl::VisitExpr_(const FloorModPtr& op) {
   ExprPtr a = VisitExpr(op->left_);
   ExprPtr b = VisitExpr(op->right_);
-  if (auto folded = TryConstFoldBinary(ObjectKind::FloorMod, a, b)) return folded;
+  // Bound-based rewrites also assume stored constants are mathematical values.
+  // Preserve this operation if a literal would wrap during runtime lowering.
+  const DataType dtype = GetScalarDtype(op);
+  if (!detail::FloorDivModOperandsFitDtype(a, b, dtype)) {
+    if (a.get() == op->left_.get() && b.get() == op->right_.get()) return op;
+    // Operand promotion here would change the width used to interpret the literal.
+    return std::make_shared<FloorMod>(a, b, dtype, op->span_);
+  }
+  if (auto folded = TryConstFoldBinary(ObjectKind::FloorMod, a, b, dtype)) return folded;
 
   auto ci = As<ConstInt>(b);
   if (ci && ci->value_ > 0) {
@@ -769,6 +786,9 @@ ExprPtr CanonicalSimplifier::Impl::VisitExpr_(const BitNotPtr& op) {
 
 ExprPtr CanonicalSimplifier::Impl::VisitExpr_(const CastPtr& op) {
   ExprPtr a = VisitExpr(op->operand_);
+  // Fold before the identity check: ``cast(<literal>, dtype)`` folds even when
+  // the operand itself did not simplify.
+  if (auto folded = TryConstFoldCast(a, GetScalarDtype(op))) return folded;
   if (a.get() == op->operand_.get()) return op;
   return MakeCast(a, GetScalarDtype(op));
 }

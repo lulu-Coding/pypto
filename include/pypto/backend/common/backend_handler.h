@@ -24,6 +24,8 @@
 namespace pypto {
 namespace backend {
 
+class Backend;
+
 /**
  * @brief The (src, dst) dtype pairs an architecture converts in one `pto.tcvt`.
  *
@@ -116,7 +118,7 @@ struct L0CostModel {
  * @brief Backend-specific behavior dispatch interface
  *
  * BackendHandler centralises every behavioural difference between backends
- * (e.g. Ascend910B vs Ascend950). Passes and codegen never branch on
+ * (e.g. Ascend910 vs Ascend950). Passes and codegen never branch on
  * BackendType directly; instead they invoke virtual methods on a handler
  * obtained from PassContext or from a Backend instance.
  *
@@ -143,10 +145,9 @@ class BackendHandler {
   [[nodiscard]] virtual std::string GetPtoTargetArch() const = 0;
 
   /**
-   * @brief Method name used on `launch_spec` to set the per-task core count.
+   * @brief Method name used on `launch_spec` to set the per-task logical block count.
    *
-   * Different runtimes expose different APIs for the same concept
-   * (Ascend910B: "set_block_num"; Ascend950: "set_core_num").
+   * Both supported architectures and runtimes use "set_block_num".
    */
   [[nodiscard]] virtual std::string GetLaunchSpecCoreCountMethod() const = 0;
 
@@ -162,7 +163,7 @@ class BackendHandler {
    *
    * Some PTOAS releases require an explicit ISA selector even when the MLIR
    * module already carries a backend-specific target_arch attribute (e.g.
-   * Ascend910B needs ["--pto-arch", "a3"], Ascend950 needs
+   * Ascend910 needs ["--pto-arch", "a3"], Ascend950 needs
    * ["--pto-arch", "a5"]).
    */
   [[nodiscard]] virtual std::vector<std::string> GetExtraPtoasFlags() const = 0;
@@ -180,6 +181,23 @@ class BackendHandler {
     return dtype.GetBit() != 4;
   }
 
+  /**
+   * @brief Whether this backend's PTO-ISA honours the `precisionType` attribute
+   *        that `high_precision=True` emits.
+   *
+   * The attribute survives every layer — PyPTO writes it into the PTO IR and
+   * PTOAS keeps it as a `HIGH_PRECISION` template argument — but only some
+   * PTO-ISA backends select a different algorithm from it. Ascend910's
+   * `TDIV_IMPL` / `TLOG_IMPL` / `TREM_IMPL` / `TFMOD_IMPL` accept the template
+   * parameter and never read it, so the request is silently dropped and the
+   * result is bit-identical to the default algorithm.
+   *
+   * `tile.rsqrt` is not covered by this hook: it opts into high precision by
+   * taking a scratch tile rather than by carrying `precisionType`, and that
+   * form is implemented on every backend.
+   */
+  [[nodiscard]] virtual bool HonorsHighPrecisionAlgorithm() const = 0;
+
   // ---------------------------------------------------------------------------
   // Pass behavioural hooks
   // ---------------------------------------------------------------------------
@@ -188,10 +206,14 @@ class BackendHandler {
    * @brief Whether this backend needs the `__gm_pipe_buffer` injection in
    *        ExpandMixedKernelPass.
    *
-   * Ascend910B routes cross-core pipe data through a GM-backed slot buffer;
+   * Ascend910 routes cross-core pipe data through a GM-backed slot buffer;
    * Ascend950 uses on-chip cross-core hardware and does not need it.
    */
   [[nodiscard]] virtual bool RequiresGMPipeBuffer() const = 0;
+
+  /// Whether frontend pipes can size local consumer storage independently of
+  /// the transport ring. A5 local-to-local pipes use the transport depth itself.
+  [[nodiscard]] virtual bool SupportsLocalPipeDepth() const { return false; }
 
   /**
    * @brief Whether this backend needs the MemoryReuse load + tpop_from_aic
@@ -200,10 +222,31 @@ class BackendHandler {
   [[nodiscard]] virtual bool RequiresSplitLoadTpopWorkaround() const = 0;
 
   /**
+   * @brief Whether `tile.cmp` / `tile.cmps` evaluate an ORDERING comparison
+   *        (`lt` / `le` / `gt` / `ge`) correctly for `src_dtype` on this target.
+   *
+   * A2/A3 has exactly one int32 comparator, `vcmpvs_eq`; the ISA capability
+   * table reports no int32 form of the ordering compares. pto-isa's
+   * `GenCmpCall` (a2a3/TCmps.hpp, and a2a3/TCmp.hpp for the tile-vs-tile form)
+   * short-circuits `int32_t` onto that one instruction and drops the requested
+   * mode, so an ordering compare silently yields an EQUALITY mask instead of
+   * failing -- see pto-isa issue #321. Equality and inequality stay correct
+   * (`ne` is `eq` plus the `vnot` fix-up), so only the ordering modes are
+   * gated.
+   *
+   * This is a denylist of the one combination confirmed wrong on device, not
+   * an allowlist of what is proven right. The 16-bit path bit-casts source and
+   * scalar to `half` and borrows the fp16 comparator, which matches integer
+   * ordering only for non-negative values; that is analysis, not a measured
+   * failure, so it is reported in issue #321 rather than rejected here.
+   */
+  [[nodiscard]] virtual bool SupportsOrderingCompareDataType(const DataType& src_dtype) const = 0;
+
+  /**
    * @brief Whether PyPTO/DSA-RP must materialize PTOAS level-3 explicit tmp
    *        scratch and emit static-valid codegen views.
    *
-   * True on Ascend910B (a2a3): InitMemRef appends compiler-owned scratch for
+   * True on Ascend910 (a2a3): InitMemRef appends compiler-owned scratch for
    * ops such as tile.ci / narrowing tile.cast / tile.sort32, and codegen
    * bridges explicit-tmp forms with static valid_shape. False on Ascend950:
    * PTOAS level-2 PlanMemory owns implicit tmp instead.
@@ -216,7 +259,7 @@ class BackendHandler {
    *
    * Ascend950 hardware cross-core pipe expects fractal layout at the boundary
    * (Left / Right / Mat -> NZ), so the AIV producer must convert.
-   * Ascend910B routes via UB -> GM -> Mat which accepts ND directly, so no
+   * Ascend910 routes via UB -> GM -> Mat which accepts ND directly, so no
    * adapter is needed.
    */
   [[nodiscard]] virtual bool RequiresVtoCFractalAdapt() const = 0;
@@ -225,7 +268,7 @@ class BackendHandler {
    * @brief Whether A2A3 split AIV wrappers must source the subblock id from
    *        the runtime context.
    *
-   * Only relevant on Ascend910B. Other backends always return false.
+   * Only relevant on Ascend910. Other backends always return false.
    */
   [[nodiscard]] virtual bool RequiresRuntimeSubblockBridge() const = 0;
 
@@ -233,7 +276,7 @@ class BackendHandler {
    * @brief Whether mixed kernels with no split mode (or `SplitMode::None`)
    *        must still be dispatched on both AIV lanes for cross-core sync.
    *
-   * On Ascend910B the AIC side performs cross-core pipe handshakes against
+   * On Ascend910 the AIC side performs cross-core pipe handshakes against
    * both AIVs, so a `no_split` mixed kernel cannot dispatch a single AIV
    * lane without deadlocking. ExpandMixedKernel marks such functions with the
    * `dual_aiv_dispatch` attribute so that downstream passes (notably
@@ -245,13 +288,26 @@ class BackendHandler {
   [[nodiscard]] virtual bool RequiresNoSplitDualAivDispatch() const = 0;
 
   /**
+   * @brief Whether a split Cube-to-Vector push divides its transported extent
+   *        between the two AIV lanes itself.
+   *
+   * Ascend950 pushes L0C straight into both lanes' UB with a dual-mode TMOV
+   * (`DualModeSplitM` / `DualModeSplitN`) that hands each lane half of the
+   * transported rows / cols, so the transported extent IS the lane partition.
+   * Ascend910 stages the tile through a GM slot, and each lane locates its own
+   * band there from its popped extent, so the transported extent only has to
+   * cover the rows the lanes read.
+   */
+  [[nodiscard]] virtual bool SplitsCubeToVectorTransportInHardware() const = 0;
+
+  /**
    * @brief Whether a tiled (offset) Acc->Mat FIXPIPE writeback must downcast to
    *        a low-precision (bf16/f16) destination.
    *
    * The only offset Acc->Mat path on A2/A3 is `pto.tinsert`, whose verifier
    * requires `src=f32, dst=f16/bf16` — it cannot keep f32 (PTOAS
    * `TInsertOp::verify`). So AutoTileMatmulL0's oversized chained-matmul result,
-   * when M/N-tiled into an L1/Mat scratch, must be bf16/f16 on Ascend910B; the
+   * when M/N-tiled into an L1/Mat scratch, must be bf16/f16 on Ascend910; the
    * pass folds a `tile.cast(result, bf16)` into the per-sub-tile assemble.
    *
    * Ascend950 (a5) `tinsert` accepts `dst=f32`, so the Mat scratch may stay f32
@@ -263,7 +319,7 @@ class BackendHandler {
    * @brief Whether this backend's store pipe honours a bf16 atomic-add into GM.
    *
    * A bf16 atomic-add lowers to `set_atomic_bf16`, honoured on the A2/A3 store
-   * path (Ascend910B) and not on the A5 one (Ascend950). Both arches'
+   * path (Ascend910) and not on the A5 one (Ascend950). Both arches'
    * `SetAtomicAdd<T>` helpers *do* list `bfloat16_t`, so that dispatch
    * static_assert is not the evidence; the pinned ST suite is. a2a3 covers
    * atomic-add into a bf16 destination (`tstore_acc2gm` case 60,
@@ -277,7 +333,7 @@ class BackendHandler {
    * *destination* dtype, so this also covers the cube path (fp32 Acc -> bf16 GM
    * via fix-pipe).
    *
-   * Ascend910B: true. Ascend950: false.
+   * Ascend910: true. Ascend950: false.
    */
   [[nodiscard]] virtual bool SupportsBf16AtomicAdd() const = 0;
 
@@ -289,7 +345,7 @@ class BackendHandler {
    * into a fixed destination set. pto-isa encodes this as the non-quant
    * `CheckAcc2gm` whitelist and ptoas as a `pto.tstore` verifier rule:
    *
-   *   Ascend910B (a2a3): INT32 / FP32 / FP16 / BF16
+   *   Ascend910 (a2a3): INT32 / FP32 / FP16 / BF16
    *   Ascend950  (a5)  : INT32 / FP32 / FP16 / BF16
    *
    * The two arches accept the same set today. The hook stays per-backend
@@ -317,12 +373,48 @@ class BackendHandler {
   [[nodiscard]] virtual bool SupportsAccToGmDtype(const DataType& dtype) const = 0;
 
   /**
+   * @brief Which FIXPIPE writeback a scale-bearing (`pre_quant`) conversion targets.
+   *
+   * The legal (source, destination) dtype pairs differ between the two, so the
+   * destination has to be part of the query rather than implied by the dtypes.
+   */
+  enum class FixpipeDest {
+    kMat,  ///< Acc -> Mat (L1), `pto.tinsert` / `mte_l0c_l1`
+    kGm,   ///< Acc -> GM,        `pto.tstore`  / `mte_l0c_gm`
+  };
+
+  /**
+   * @brief Whether this backend's FIXPIPE can drain an `src` accumulator into a
+   *        `dst` destination while applying a scalar pre-quantization scale.
+   *
+   * This is the *scale-bearing* half of the writeback, the one
+   * `ir::CubeWritebackSupportsDataType` deliberately excludes: `INT32 -> FP16`
+   * is a dequantization (`DEQF16`), `FP32 -> INT8` a quantization
+   * (`QF322B8_PRE`), `INT32 -> INT8` a requantization (`REQ8`). The scale
+   * travels as the `pre_quant` operand — see `codegen::EncodeFixpipePreQuant`.
+   *
+   * The authority for these sets is **pto-isa's `GetScalarPreQuantMode<Src,
+   * Dst>()`**, not the assembler: ptoas verifies the pair only on a2a3
+   * (`"expects A2/A3 acc fp/preQuantScalar tinsert element types to be ..."`)
+   * and accepts anything on a5, while pto-isa's a5 table silently returns
+   * `QuantMode_t::NoQuant` for an unsupported pair — which drops the scale
+   * instead of failing. So this table, not the assembler, is what keeps a
+   * mis-typed fold from becoming a wrong answer on device.
+   *
+   * `INT16` is excluded on every backend even where pto-isa lists it: its
+   * `SHIFTS322S16` payload is a shift count, not an FP32 scale, so it cannot
+   * carry the multiplier this interface promises.
+   */
+  [[nodiscard]] virtual bool SupportsFixpipePreQuant(const DataType& src, const DataType& dst,
+                                                     FixpipeDest dest) const = 0;
+
+  /**
    * @brief Compute the destination tile view for a cross-core transfer.
    *
    * Encapsulates the per-backend rule for how to lay out the bridge tile
    * crossing the AIC/AIV boundary.
    *
-   * Ascend910B (a2a3): cross-core transfer goes through GM. Left/Right/Mat
+   * Ascend910 (a2a3): cross-core transfer goes through GM. Left/Right/Mat
    *   destinations all use NZ (col_major blayout, row_major slayout) because
    *   GM -> Mat transfer requires fractal layout. Vec destinations preserve
    *   the original view: the GM-backed C2V pop materialises through an ND
@@ -355,7 +447,7 @@ class BackendHandler {
    *
    * The hardware fetches at this granularity, so a tile innermost dimension
    * smaller than this value forces the bus to discard part of every fetch.
-   * Ascend910B: 512 bytes. Ascend950: 128 bytes.
+   * Ascend910: 512 bytes. Ascend950: 128 bytes.
    */
   [[nodiscard]] virtual uint32_t GetGmAccessGranularityBytes() const = 0;
 
@@ -363,7 +455,7 @@ class BackendHandler {
    * @brief L2 cache line size in bytes.
    *
    * A tile innermost dimension below this size leaves part of every cache
-   * line unused. Both Ascend910B and Ascend950 use 512-byte L2 cache lines.
+   * line unused. Both Ascend910 and Ascend950 use 512-byte L2 cache lines.
    */
   [[nodiscard]] virtual uint32_t GetL2CacheLineBytes() const = 0;
 
@@ -374,7 +466,7 @@ class BackendHandler {
    * Below this threshold the TileInnermostDimGranularity perf-hint check
    * (PH001) emits an advisory diagnostic.
    *
-   * On Ascend910B this equals the GM granularity (512 B); on Ascend950 it is
+   * On Ascend910 this equals the GM granularity (512 B); on Ascend950 it is
    * the GM granularity (128 B), with 512 B preferable to fully utilise the
    * L2 cache line but 128 B taken as the hard threshold for the hint.
    */
@@ -385,32 +477,14 @@ class BackendHandler {
   // ---------------------------------------------------------------------------
 
   /**
-   * @brief L0a (Left) on-chip SRAM capacity, in bytes.
+   * @brief Capacity of one memory component in the owning SoC, in bytes.
    *
-   * Used by ChooseL0Tile to bound `m * k * bytes_a` (per buffer when
-   * double-buffered). Must match the AIC-core `MemorySpace::Left` size in the
-   * SoC config; encoded here so passes do not depend on the SoC walker.
+   * Delegates to Backend::GetMemSize() without multiplying by core/die counts
+   * or consulting the global target. For spaces present on multiple cores,
+   * returns the first matching component's capacity. Returns 0 when the SoC
+   * does not model the space; this does not imply that the hardware lacks it.
    */
-  [[nodiscard]] virtual uint32_t GetL0aCapacityBytes() const = 0;
-
-  /**
-   * @brief L0b (Right) on-chip SRAM capacity, in bytes.
-   */
-  [[nodiscard]] virtual uint32_t GetL0bCapacityBytes() const = 0;
-
-  /**
-   * @brief L0c (Acc) on-chip SRAM capacity, in bytes.
-   */
-  [[nodiscard]] virtual uint32_t GetL0cCapacityBytes() const = 0;
-
-  /**
-   * @brief Bias-table on-chip SRAM capacity, in bytes.
-   *
-   * Used by AutoTileMatmulL0 to cap the N extent of ``tile.matmul_bias``
-   * output tiles. Must match the AIC-core ``MemorySpace::Bias`` size in the
-   * SoC config and the PTO ISA Mat-to-Bias transfer limit.
-   */
-  [[nodiscard]] virtual uint32_t GetBiasCapacityBytes() const = 0;
+  [[nodiscard]] uint64_t GetCapacityBytes(ir::MemorySpace memory_space) const;
 
   /**
    * @brief Whether the PTO ISA can transfer this dtype pair from Mat to Bias.
@@ -423,15 +497,6 @@ class BackendHandler {
    */
   [[nodiscard]] virtual bool SupportsMatToBiasMove(const DataType& source_dtype,
                                                    const DataType& bias_dtype) const = 0;
-
-  /**
-   * @brief Mat (L1) on-chip SRAM capacity, in bytes.
-   *
-   * Used by passes that need a conservative per-core capacity gate without
-   * walking the global Backend SoC object. This keeps pass-level backend
-   * decisions on the BackendHandler / PassContext path.
-   */
-  [[nodiscard]] virtual uint64_t GetMatCapacityBytes() const = 0;
 
   /**
    * @brief Cube fractal alignment in *elements* for L0 tile dimensions.
@@ -489,6 +554,14 @@ class BackendHandler {
    * reference for the duration of a pass.
    */
   [[nodiscard]] virtual const TcvtAdjacency& GetTcvtAdjacency() const = 0;
+
+ protected:
+  /// The backend must outlive this handler. Built-in handlers bind to their
+  /// backend singleton; never use the global compilation target for capacities.
+  explicit BackendHandler(const Backend& backend) : backend_(backend) {}
+
+ private:
+  const Backend& backend_;
 };
 
 }  // namespace backend

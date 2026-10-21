@@ -1,5 +1,9 @@
 # Types
 
+> **Legacy Python API examples:** `platform=` calls on this page are retained for
+> compatibility. They emit `DeprecationWarning`; new code should use
+> `backend_type` and `execution_mode`. See the [target mapping](../../dev/08-entry-points.md#legacy-platform-examples).
+
 Every value in a PyPTO program carries a type that says where it lives and how wide its
 elements are. Getting the annotation right is how you tell the compiler what to allocate
 and what it is allowed to do.
@@ -104,7 +108,8 @@ torch.testing.assert_close(acc, acc_before + scaled, rtol=1e-2, atol=1e-2)  # In
 | `pl.FP16` | 16 | IEEE half |
 | `pl.BF16` | 16 | Brain float |
 | `pl.FP32` | 32 | IEEE single |
-| `pl.FP4` | 4 | Packed MXFP4 E2M1×2 |
+| `pl.FP4` | 4 | Frontend logical MXFP4 E2M1 nibble (incomplete without automatic pack; prefer `FP4E2M1X2`) |
+| `pl.FP4E2M1X2` | 8 | Packed carrier (two nibbles); physical last dim matches `torch.float4_e2m1fn_x2` / `!pto.f4E2M1x2` |
 | `pl.FP8E4M3FN` / `pl.FP8E5M2` | 8 | MXFP8 data formats |
 | `pl.FP8E8M0` | 8 | MX block-scale exponent |
 | `pl.HF4` / `pl.HF8` | 4 / 8 | Hisilicon float formats |
@@ -121,19 +126,48 @@ packs every semantic 4-bit dtype two logical elements per byte, so the physical 
 nbytes = 256 * pl.FP32.get_byte()          # 1024, not 256
 ```
 
-FP4 shapes inside PyPTO IR are logical nibble shapes, and `valid_shape` uses the same
-logical units. At the Torch/runtime boundary, `torch.float4_e2m1fn_x2` uses a physical x2
-carrier shape: its last dimension contains one byte per two logical FP4 values. JIT expands
-that last dimension on entry, while compiled-call metadata and orchestration allocations
-contract it by two; no separate `storage_shape` is stored in `TensorType` or `TileType`. Packed
-FP4 requires a positive even logical last dimension, including static allocation and view
-shapes; dynamic widths are checked before conversion. A 4-bit slice origin must land on a byte
-boundary, so an odd linear nibble offset is rejected.
+Frontend `pl.FP4` is a logical nibble type (`GetBit()==4`, even last dim). Prefer
+hand-written `pl.FP4E2M1X2` for the packed carrier (`GetBit()==8`, last dim already
+in x2 units). Resolving the short `FP4` name emits a `UserWarning` until automatic
+pack lands. At the Torch/runtime boundary, `torch.float4_e2m1fn_x2` maps to
+`FP4E2M1X2` without expanding the last dim; logical `FP4` call metadata still
+contracts/expands by two where that dtype remains.
 
-End-to-end 4-bit execution is backend-gated. Ascend950 supports `pl.FP4`; `INT4`, `UINT4`,
-and `HF4` remain storage-accounted but are rejected by in-core codegen. Ascend910B/A2A3
-rejects every 4-bit in-core dtype because its isolated FP16↔INT4 conversion has no matching
-packed load/store carrier ABI.
+End-to-end 4-bit execution is backend-gated. Ascend950 in-core accepts packed
+`pl.FP4E2M1X2`; logical `pl.FP4` / `INT4` / `UINT4` / `HF4` are rejected by
+in-core codegen. Ascend910/A2A3 rejects every FP4-family in-core dtype because
+its isolated FP16↔INT4 conversion has no matching packed load/store carrier ABI.
+See [FP4](../../dev/fp4.md) for cast samples (`FP4E2M1X2`→BF16 / FP8), units, and
+`#2754`-class stride guidance.
+
+### Annotating a scalar binding
+
+Scalar arithmetic normalizes its operands to `pl.INDEX`, so the result is
+`INDEX`-typed even when the inputs were not:
+
+```python
+v = pl.cast(i, pl.INT32) + 1                        # pl.Scalar[pl.INDEX]
+```
+
+An annotation decides the dtype the name is bound at, and the value is converted
+to match it — so the two sides of the assignment always agree:
+
+```python
+v: pl.Scalar[pl.INT32] = pl.cast(i, pl.INT32) + 1   # binds INT32; the cast is inserted for you
+v: pl.Scalar[pl.INDEX] = pl.cast(i, pl.INT32) + 1   # binds INDEX; nothing to convert
+```
+
+Annotate the dtype you want the value *stored* at: a narrower annotation converts
+the value, it does not reinterpret it.
+
+INDEX-returning calls follow the same rule, including `pl.tile.get_block_idx()`:
+
+```python
+v: pl.Scalar[pl.INT32] = pl.tile.get_block_idx()    # converts the INDEX result to INT32
+```
+
+This compatibility applies only to integer/INDEX pairs. An FP32 annotation on an
+INDEX expression is rejected; use an explicit `pl.cast` for a float conversion.
 
 ### Container types
 
@@ -171,7 +205,28 @@ b: pl.Tensor[[N, K], pl.FP32]              # ✅ source shape, no marker
 The layout-only shorthand `pl.Tensor[..., pl.DN]` is not supported: it raises
 `ParserTypeError`. For a transposed matmul operand, pass `a_trans=True` / `b_trans=True` to
 `pl.matmul`, or derive the transposed view at the use site with `pl.transpose(x, -2, -1)`.
-A slice or reshape of a DN-producing operation inherits DN automatically.
+A slice or reshape of a DN-producing operation inherits DN automatically. A slice keeps the
+source layout whenever its trailing two axes survive intact, so a leading-axis shard
+(`w[r]` of a `[N_RANKS, R, C]` weight) stays on the parent's layout.
+
+**A layout annotation must agree on both sides of a call.** It is a claim about byte order in
+memory, not a conversion request, so passing an ND-typed argument to a parameter declared
+`pl.NZ` (or an MX scale layout) is rejected by the type checker before the first pass runs:
+`Layout mismatch at argument 1 of call to 'nz_helper': parameter 'b' is declared NZ but the
+argument is ND.` Annotate both ends, or neither. DN is exempt, because a parameter cannot
+declare it: a DN value is derived at the use site with `pl.transpose`, so handing one to an
+ND-declared parameter is the intended workflow, not a disagreement.
+
+A `device=` dispatch is the other exception: the host only says which card a buffer goes to, so
+an ND host tensor holding NZ-packed bytes may bind a `pl.NZ` parameter of the device program.
+That holds only for whole matrices — the host tensor itself, or a slice that keeps its last two
+axes whole, such as the rank shard `w[r]` of a `[N_RANKS, R, C]` stack. A window inside the
+matrix (`w[r * R : (r + 1) * R]` of a once-packed `[N_RANKS * R, C]` weight) is rejected: those
+rows are contiguous, but they are runs of several fractal column blocks, not an NZ-packed
+`[R, C]`. Pack each shard separately and stack the shards instead. An argument the checker
+cannot trace back to a host parameter through such slices — a reshape, a newly created tensor —
+is rejected too. The trace stays within the dispatching function, so a window passed into a
+helper function arrives there as a parameter and is not followed back to its caller.
 
 `pl.ND` is the default row-major layout and never needs writing. `pl.NZ` asserts that the
 tensor's bytes in global memory are *already* stored in PTO-native NZ fractal order, so a
@@ -179,7 +234,8 @@ matmul weight load can skip the online ND→NZ conversion. It is an assertion ab
 bytes, not a request to convert: the shape and slicing you write stay logical, and the
 compiler derives the blocked physical descriptor. It currently requires a statically shaped,
 fractal-aligned tensor with a whole-byte dtype (`shape[-2] % 16 == 0`,
-`shape[-1] % (256 / dtype bits) == 0`) read
+`shape[-1] % (256 / dtype bits) == 0`) of **logical rank 2 or 3** — `[R, C]` or `[B, R, C]`,
+since the underlying NZ descriptor has exactly one batch slot — read
 into a matmul operand; anything else is rejected with a diagnostic.
 
 When a tensor's rows are not contiguous — a window into a larger buffer, a strided slice
@@ -199,9 +255,10 @@ scale tensor** of an MX (microscaling) operand on Ascend950 — `MX_A_ZZ` for th
 scale pack, `MX_B_NN` for the right/B one — so that a Mat-to-scale `pl.move` can check the
 source layout instead of byte-copying incompatible data into `LeftScale` / `RightScale`.
 They are the one case where a layout marker on a `pl.Tensor` annotation is required rather
-than discouraged. Current limitations: an MX `pl.load` must pass `target_memory=pl.Mem.Mat`
-explicitly; ordinary MX subviews (`slice`, `reshape`, `transpose`, `reinterpret_view`) and
-MX `remote_load` are rejected. Exception: FP8E8M0 `pl.tensor.view` may alias packed ND
+than discouraged. An MX `pl.load` may omit `target_memory`; the Python API selects
+`pl.Mem.Mat`, and `matmul_mx` operand placement inserts the required moves. Ordinary MX
+subviews (`slice`, `reshape`, `transpose`, `reinterpret_view`) and MX `remote_load` are
+rejected. Exception: FP8E8M0 `pl.tensor.view` may alias packed ND
 backing to `MX_A_ZZ` / `MX_B_NN` as a logical rank-2 view (`layout=mx_*`; PTOAS v0.60 packs
 physically). The matmul itself is `pl.matmul_mx` and its `_acc` /
 `_bias` variants, which take a data tile and a scale tile per operand. Both data tiles reaching
@@ -209,8 +266,15 @@ the op must be `FP8E4M3FN`. The supported FP4-input form is a left FP4 operand m
 right FP8 operand: write `pl.cast(fp4_tile, pl.FP8E4M3FN)` before `matmul_mx`. On A5 the cast
 legalization pass expands that request to FP4→BF16→FP32→FP8E4M3FN. Native FP4×FP4 and the
 reverse FP8×FP4 form are not supported. Standalone `pl.quant_mx` (MXFP8-only in this release, with
-`group_axis` matching PTOAS `grpAxis`) is available;
-it cannot yet share one InCore mixed task with `matmul_mx` — stage through GM between AIV/AIC.
+`group_axis` matching PTOAS `grpAxis`) is available. On Ascend950 it can share one InCore mixed
+task with `matmul_mx`; the generated data and scale cross directly over V2C, with a generated
+Vec-to-Mat-to-scale-memory path for the scale.
+`pl.quant_mx(tensor, group_axis=1)` returns GM A data `[M,K]` plus an
+`MX_A_ZZ[M,K/32]` scale tensor. `group_axis=0` accepts `[N,K]` and returns
+Cube-oriented data `[K,N]` plus `MX_B_NN[K/32,N]`. Those two tensor pairs are
+the required inputs to tensor `pl.matmul_mx`, which is 2-D-only and returns
+FP32; tensor MX accumulation, bias, transpose flags, batches, dynamic shapes,
+and FP4 are intentionally not part of this interface.
 
 ### Dynamic shapes
 
@@ -283,16 +347,16 @@ it — which is a race, not a diagnostic.
 | **`ParserTypeError` about the DN layout-only shorthand** | `pl.Tensor[..., pl.DN]` — removed, it forced two coordinate systems onto one annotation | Write the source shape with no marker; derive DN at the use site with `pl.transpose(x, -2, -1)`; or inherit it through a slice/reshape of a DN-producing op |
 | **Results wrong only when two tasks overlap** | A read-write buffer declared `In` or `Out` instead of `InOut` | Declare the direction the kernel actually performs |
 | **Reading an `Out` parameter returns garbage** | `Out` promises write-before-read | Use `pl.InOut[...]` if the prior contents matter |
-| **`pl.cast` where you expected implicit promotion** | There is no implicit promotion | Insert the cast; check [LegalizeTileCast](../../dev/passes/17-legalize_tile_cast.md) for multi-hop pairs |
+| **`pl.cast` where you expected implicit promotion** | There is no implicit promotion | Insert the cast; check [LegalizeTileCast](../../dev/passes/18-legalize_tile_cast.md) for multi-hop pairs |
 | **Two dimensions that should match are treated as independent** | Two separate `pl.dynamic("M")` calls | Create the `DynVar` once and reuse the object |
 
 Not every `pl.cast` is one instruction. Whether a `(src, dst)` pair maps to a single
 hardware `pto.tcvt` or expands into a chain depends on the target: `INT32 -> FP16` is one
-instruction on Ascend910B and lowers to `INT32 -> FP32 -> FP16` on Ascend950. Each hop
+instruction on Ascend910 and lowers to `INT32 -> FP32 -> FP16` on Ascend950. Each hop
 costs a `tcvt`, and where an intermediate is narrower than the source the result can
 differ from a directly rounded conversion by one ULP of the destination. This is expected
 behaviour, not a defect — see
-[LegalizeTileCast](../../dev/passes/17-legalize_tile_cast.md) for the per-architecture
+[LegalizeTileCast](../../dev/passes/18-legalize_tile_cast.md) for the per-architecture
 tables.
 
 `pl.cast` also takes a keyword-only `saturation_mode` (`"on"` / `"off"`, or `1` / `0`) for
@@ -312,4 +376,4 @@ you named.
 - [Memory and Data Movement](03-memory.md) — moving data between the spaces these types name.
 - [Operations](../ops/index.md) — which operators accept `Tensor` versus `Tile`.
 - [IR Types](../../dev/ir/02-types.md) — the IR-level type system these annotations build.
-- [LegalizeTileCast](../../dev/passes/17-legalize_tile_cast.md) — per-architecture cast expansion and its precision consequences.
+- [LegalizeTileCast](../../dev/passes/18-legalize_tile_cast.md) — per-architecture cast expansion and its precision consequences.

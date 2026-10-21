@@ -49,6 +49,24 @@ class TestMemorySpace:
 class TestMemRef:
     """Tests for MemRef struct."""
 
+    @pytest.mark.parametrize("expression_offset", [False, True])
+    @pytest.mark.parametrize("explicit_none", [False, True])
+    def test_omitted_slot_is_structurally_unslotted(self, expression_offset, explicit_none):
+        """Python None has the same absent-slot representation as the C++ default."""
+        span = ir.Span.unknown()
+        base = ir.Var("storage", ir.PtrType(), span)
+        offset = ir.ConstInt(0, DataType.INT64, span) if expression_offset else 0
+        if explicit_none:
+            actual = ir.MemRef(base, offset, 1024, span, slot=None)
+        else:
+            actual = ir.MemRef(base, offset, 1024, span)
+        # The string-base overload uses the C++ constructor's nullopt default.
+        expected = ir.MemRef("storage", 0, 1024, span)
+        assert not actual.is_pinned_ and actual.slot_count_ == 1 and actual.slot_index_ is None
+        ir.assert_structural_equal(expected, actual, enable_auto_mapping=True)
+        restored = ir.deserialize(ir.serialize(actual))
+        ir.assert_structural_equal(actual, restored, enable_auto_mapping=True)
+
     def test_memref_creation_with_params(self):
         """Test creating a MemRef with all parameters."""
         span = ir.Span.unknown()
@@ -1205,7 +1223,7 @@ class TestPythonSyntaxPrinting:
         assert "pl.FP32" in printed
         # MemRef prints as positional arg (no keyword) with full constructor syntax
         assert "memref=" not in printed
-        assert 'pl.MemRef("mem_ddr_7", 4096, 1024)' in printed
+        assert 'pl.MemRef("mem_ddr_7", pl.const(4096, pl.INDEX), 1024)' in printed
 
     def test_tile_type_with_memref_and_tileview_print(self):
         """Test printing TileType with inline MemRef constructor syntax and TileView."""
@@ -1235,7 +1253,7 @@ class TestPythonSyntaxPrinting:
         assert "pl.Tile" in printed
         assert "pl.FP16" in printed
         assert "memref=" not in printed
-        assert 'pl.MemRef("mem_left_8", 8192, 512)' in printed
+        assert 'pl.MemRef("mem_left_8", pl.const(8192, pl.INDEX), 512)' in printed
         assert "pl.Mem.Left" in printed
         # TileView is now a positional arg in subscript (fixes #323), not keyword
         assert "pl.TileView" in printed
@@ -1355,13 +1373,13 @@ class TestPythonSyntaxPrinting:
         shape = [ir.ConstInt(32, DataType.INT64, span)]
         tensor_type_vec = ir.TensorType(shape, DataType.INT32, memref_vec)
         printed_vec = ir.python_print_type(tensor_type_vec)
-        assert 'pl.MemRef("mem_vec_9", base_addr + 128, 2048)' in printed_vec
+        assert 'pl.MemRef("mem_vec_9", base_addr + pl.const(128, pl.INDEX), 2048)' in printed_vec
 
         # DDR MemRef also prints in constructor form with symbolic address.
         memref_ddr = ir.MemRef(ir.MemorySpace.DDR, addr, 2048, 10)
         tensor_type_ddr = ir.TensorType(shape, DataType.INT32, memref_ddr)
         printed_ddr = ir.python_print_type(tensor_type_ddr)
-        assert 'pl.MemRef("mem_ddr_10", base_addr + 128, 2048)' in printed_ddr
+        assert 'pl.MemRef("mem_ddr_10", base_addr + pl.const(128, pl.INDEX), 2048)' in printed_ddr
 
     def test_tensor_type_with_tensorview_print(self):
         """Test printing TensorType with TensorView."""
@@ -1402,7 +1420,7 @@ class TestPythonSyntaxPrinting:
         assert "pl.FP16" in printed
         # TensorType always prints MemRef inline because tensor memory space is DDR.
         assert "memref=" not in printed
-        assert 'pl.MemRef("mem_left_42", 20480, 4096)' in printed
+        assert 'pl.MemRef("mem_left_42", pl.const(20480, pl.INDEX), 4096)' in printed
         # tensor_view is now positional, not keyword in subscript
         assert "pl.TensorView" in printed
         assert "pl.TensorLayout.NZ" in printed
@@ -1539,7 +1557,7 @@ class TestIRBuilderHelpers:
         assert "pl.Tile[[32, 32], pl.FP32," in printed
         assert "pl.FP32" in printed
         assert "memref=" not in printed
-        assert 'pl.MemRef("mem_right_36", 512, 1024)' in printed
+        assert 'pl.MemRef("mem_right_36", pl.const(512, pl.INDEX), 1024)' in printed
         assert "pl.Mem.Right" in printed
         assert "pl.TileView" in printed  # positional arg (fixes #323)
 
@@ -1791,7 +1809,7 @@ class TestMemRefRoundTrip:
         compile(printed, "<test_memref_valid_python>", "exec")
 
         # No alloc statement defines the base Ptr → falls back to string literal
-        assert 'pl.MemRef("mem_vec_0", 0, 16384)' in printed
+        assert 'pl.MemRef("mem_vec_0", pl.const(0, pl.INDEX), 16384)' in printed
         assert "pl.Mem.Vec" in printed
 
     def test_parse_tensor_with_memref(self):
@@ -1810,7 +1828,7 @@ class TestMemRefRoundTrip:
         # Verify the parsed IR contains memref by re-printing
         printed = program.as_python()
         # No alloc statement defines the base Ptr → falls back to string literal
-        assert 'pl.MemRef("mem_ddr_1", 0, 256)' in printed
+        assert 'pl.MemRef("mem_ddr_1", pl.const(0, pl.INT64), 256)' in printed
 
     def test_parse_tile_with_memref(self):
         """Parse tile memref annotations and reparse the printed IR."""
@@ -1829,7 +1847,7 @@ class TestMemRefRoundTrip:
 
         printed = program.as_python()
         # No alloc statement defines the base Ptr → falls back to string literal
-        assert 'pl.MemRef("mem_vec_0", 0, 16384)' in printed
+        assert 'pl.MemRef("mem_vec_0", pl.const(0, pl.INT64), 16384)' in printed
         assert "pl.Mem.Vec" in printed
         reparsed = pl.parse(printed)
         ir.assert_structural_equal(program, reparsed)
@@ -1853,7 +1871,7 @@ class TestMemRefRoundTrip:
         # Verify both layout and memref are preserved
         printed = program.as_python()
         # No alloc statement defines the base Ptr → falls back to string literal
-        assert 'pl.MemRef("mem_ddr_2", 0, 256)' in printed
+        assert 'pl.MemRef("mem_ddr_2", pl.const(0, pl.INT64), 256)' in printed
         # Layout appears as positional TensorView arg (fixes #323)
         assert "pl.TensorView" in printed
 
@@ -1907,7 +1925,7 @@ class TestMemRefRoundTrip:
             parsed1 = pl.parse(code)
             printed = parsed1.as_python()
             # No alloc statement defines the base Ptr → falls back to string literal
-            assert f'pl.MemRef("{base_name}", 0, 16384)' in printed, (
+            assert f'pl.MemRef("{base_name}", pl.const(0, pl.INT64), 16384)' in printed, (
                 f"Expected MemRef string literal in printed output, got: {printed}"
             )
             assert f"pl.Mem.{space_name}" in printed, (

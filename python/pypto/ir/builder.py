@@ -18,11 +18,12 @@ import builtins
 import inspect
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, cast
 
 from pypto.pypto_core import DataType, ir
 from pypto.pypto_core.ir import IRBuilder as CppIRBuilder
 
+from .type import _merge_annotation_metadata
 from .utils import _normalize_expr
 
 
@@ -64,6 +65,7 @@ class IRBuilder:
         role: ir.Role | None = None,
         attrs: dict[str, Any] | None = None,
         requires_runtime_binding: bool = False,
+        ir_stage: ir.FunctionIRStage = ir.FunctionIRStage.Functional,
     ) -> Iterator["FunctionBuilder"]:
         """Context manager for building functions.
 
@@ -76,6 +78,7 @@ class IRBuilder:
             attrs: Function-level attributes dict (default: None)
             requires_runtime_binding: True for abstract SubWorkers (``...`` body)
                 whose implementation is bound at runtime (default: False)
+            ir_stage: Function body representation (default: Functional)
 
         Yields:
             FunctionBuilder: Helper object for building the function
@@ -94,7 +97,7 @@ class IRBuilder:
         self._begin_spans[ctx_id] = begin_span
 
         self._builder.begin_function(
-            name, begin_span, type, level, role, attrs or {}, requires_runtime_binding
+            name, begin_span, type, level, role, attrs or {}, requires_runtime_binding, ir_stage
         )
         builder_obj = FunctionBuilder(self)
         try:
@@ -327,6 +330,37 @@ class IRBuilder:
             result = self._builder.end_scope(combined_span)
             builder_obj._result = result
             del self._begin_spans[ctx_id]
+
+    @contextmanager
+    def comm_domain_scope(
+        self,
+        devices: list[int],
+        slots: list[ir.WindowBuffer],
+        name_hint: str,
+        span: ir.Span,
+        attrs: list[tuple[str, Any]] | None = None,
+    ) -> Iterator["ScopeBuilder"]:
+        """Build a communication scope, reading its slots when the body is complete.
+
+        The parser fills ``slots`` after parsing body-local allocation definitions.
+        An empty ``devices`` list represents all runtime devices.
+
+        Args:
+            devices: Ordered device indices, or an empty list for all devices.
+            slots: Window definitions, read on context exit.
+            name_hint: Communication-domain name.
+            span: Source span of the complete scope.
+            attrs: Scope metadata, read on context exit.
+
+        Yields:
+            A builder exposing the completed scope after context exit.
+        """
+        self._builder.begin_scope(ir.ScopeKind.CommDomain, span, name_hint=name_hint)
+        builder_obj = ScopeBuilder(self)
+        try:
+            yield builder_obj
+        finally:
+            builder_obj._result = self._builder.end_scope(span, devices, slots, attrs)
 
     @contextmanager
     def program(self, name: str, span: ir.Span | None = None) -> Iterator["ProgramBuilder"]:
@@ -999,7 +1033,7 @@ class ForLoopBuilder(_ReturnVarsAccessor):
             builder: Parent IR builder
         """
         self._builder = builder
-        self._result: ir.ForStmt | None = None
+        self._result = None
         self._iter_args: list[ir.IterArg] = []  # Track iter_args for type inference
         self._return_var_count = 0  # Track number of return_vars added
 
@@ -1040,7 +1074,7 @@ class ForLoopBuilder(_ReturnVarsAccessor):
         inferred_type = init_expr.type
 
         # If explicit type is provided, validate it matches the inferred type
-        if type is not None and type != inferred_type:
+        if type is not None and ir._without_type_memref(type) != ir._without_type_memref(inferred_type):
             raise ValueError(
                 f"Type mismatch in iter_arg for '{name}':\n"
                 f"  Inferred type: {inferred_type}\n"
@@ -1092,8 +1126,12 @@ class ForLoopBuilder(_ReturnVarsAccessor):
                 )
             final_type = inferred_type
         else:
+            if inferred_type is not None:
+                type = _merge_annotation_metadata(type, inferred_type)
             # Validate provided type if we have inferred type
-            if inferred_type is not None and type != inferred_type:
+            if inferred_type is not None and ir._without_type_memref(type) != ir._without_type_memref(
+                inferred_type
+            ):
                 raise ValueError(
                     f"Type mismatch in return_var '{name}':\n"
                     f"  Inferred type (from iter_arg): {inferred_type}\n"
@@ -1113,7 +1151,7 @@ class ForLoopBuilder(_ReturnVarsAccessor):
             ForStmt: The completed for loop IR node
         """
         assert self._result is not None
-        return self._result
+        return cast("ir.ForStmt", self._result)
 
 
 class WhileLoopBuilder(_ReturnVarsAccessor):
@@ -1128,7 +1166,7 @@ class WhileLoopBuilder(_ReturnVarsAccessor):
             builder: Parent IR builder
         """
         self._builder = builder
-        self._result: ir.WhileStmt | None = None
+        self._result = None
         self._iter_args: list[ir.IterArg] = []  # Track iter_args for type inference
         self._return_var_count = 0  # Track number of return_vars added
 
@@ -1169,7 +1207,7 @@ class WhileLoopBuilder(_ReturnVarsAccessor):
         inferred_type = init_expr.type
 
         # If explicit type is provided, validate it matches the inferred type
-        if type is not None and type != inferred_type:
+        if type is not None and ir._without_type_memref(type) != ir._without_type_memref(inferred_type):
             raise ValueError(
                 f"Type mismatch in iter_arg for '{name}':\n"
                 f"  Inferred type: {inferred_type}\n"
@@ -1239,8 +1277,12 @@ class WhileLoopBuilder(_ReturnVarsAccessor):
                 )
             final_type = inferred_type
         else:
+            if inferred_type is not None:
+                type = _merge_annotation_metadata(type, inferred_type)
             # Validate provided type if we have inferred type
-            if inferred_type is not None and type != inferred_type:
+            if inferred_type is not None and ir._without_type_memref(type) != ir._without_type_memref(
+                inferred_type
+            ):
                 raise ValueError(
                     f"Type mismatch in return_var '{name}':\n"
                     f"  Inferred type (from iter_arg): {inferred_type}\n"
@@ -1260,7 +1302,7 @@ class WhileLoopBuilder(_ReturnVarsAccessor):
             WhileStmt: The completed while loop IR node
         """
         assert self._result is not None
-        return self._result
+        return cast("ir.WhileStmt", self._result)
 
 
 class ScopeBuilder:
@@ -1297,7 +1339,7 @@ class IfStmtBuilder(_ReturnVarsAccessor):
             builder: Parent IR builder
         """
         self._builder = builder
-        self._result: ir.IfStmt | None = None
+        self._result = None
 
     def else_(self, span: ir.Span | None = None) -> None:
         """Begin else branch of the if statement.
@@ -1335,7 +1377,7 @@ class IfStmtBuilder(_ReturnVarsAccessor):
             IfStmt: The completed if statement IR node
         """
         assert self._result is not None
-        return self._result
+        return cast("ir.IfStmt", self._result)
 
 
 class ProgramBuilder:

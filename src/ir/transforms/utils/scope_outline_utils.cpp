@@ -56,9 +56,20 @@ std::vector<CallWriteTarget> CallWriteTargets(const CallPtr& call) {
   std::vector<CallWriteTarget> targets;
   if (!call) return targets;
   const auto* entry = LookupOpEntry(call->op_);
-  if (!entry || !entry->WritesAnyArg()) return targets;
+  if (!entry) return targets;
+  const bool buffer_stage = entry->GetIRStage() == OpIRStage::Buffer;
+  if (!buffer_stage && !entry->WritesAnyArg()) return targets;
   for (size_t i = 0; i < call->args_.size(); ++i) {
-    auto effect = entry->GetArgEffect(i, call->kwargs_);
+    ArgEffect effect;
+    if (buffer_stage) {
+      // Direction inference and input-write diagnostics describe data writes.
+      // Mutating valid-shape metadata does not overwrite parameter data.
+      const auto data = entry->GetBufferArgEffect(i).data;
+      if (data != BufferAccess::Write && data != BufferAccess::ReadWrite) continue;
+      effect = data == BufferAccess::Write ? ArgEffect::Write : ArgEffect::ReadWrite;
+    } else {
+      effect = entry->GetArgEffect(i, call->kwargs_);
+    }
     if (!ArgEffectWrites(effect)) continue;
     if (auto var = AsVarLike(call->args_[i])) {
       targets.push_back(CallWriteTarget{var, i, effect});
@@ -604,6 +615,20 @@ class StoreEvalToAssignMutator : public IRMutator {
   std::unordered_set<const Var*> claimed_;
 };
 
+/// Collect tensor operands in shape expressions without traversing their types.
+class TensorTypeDependencyCollector : public IRVisitor {
+ public:
+  std::vector<const Var*> tensors;
+
+ protected:
+  void VisitExpr_(const VarPtr& op) override {
+    if (AsTensorTypeLike(op->GetType())) tensors.push_back(op.get());
+  }
+  void VisitExpr_(const IterArgPtr& op) override {
+    if (AsTensorTypeLike(op->GetType())) tensors.push_back(op.get());
+  }
+};
+
 /**
  * @brief Collect the *upward-exposed* uses of a subtree — variables read
  *        before the subtree (re)defines them.
@@ -622,8 +647,9 @@ class StoreEvalToAssignMutator : public IRMutator {
  * On SSA input the two agree exactly: no Var is defined twice, so a variable
  * defined inside the body can never also be read ahead of that definition.
  * The traversal order deliberately mirrors ``VarDefUseCollector`` so the
- * derived parameter order is unchanged; only *when* a definition is recorded
- * differs (after the assigned value is visited, matching ``SSAVerifier``).
+ * derived parameter order is unchanged except that tensors referenced by a
+ * captured variable's shape precede that variable. Definitions are recorded
+ * after the assigned value is visited, matching ``SSAVerifier``.
  */
 class UpwardExposedUseCollector : public IRVisitor {
  public:
@@ -697,6 +723,14 @@ class UpwardExposedUseCollector : public IRVisitor {
  private:
   void RecordUse(const Var* var) {
     if (var && defined_.count(var) == 0 && live_in_.insert(var).second) {
+      // A retained tensor.dim in a captured type names another tensor. Capture
+      // that tensor before its dependent parameter so the outlined signature
+      // is self-contained. Bare dimension symbols remain signature-bound.
+      if (auto type = AsTensorTypeLike(var->GetType())) {
+        TensorTypeDependencyCollector dependencies;
+        for (const auto& dim : type->shape_) dependencies.VisitExpr(dim);
+        for (const Var* dependency : dependencies.tensors) RecordUse(dependency);
+      }
       ordered.push_back(var);
     }
   }
@@ -1773,6 +1807,7 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
       }
     }
     [[nodiscard]] const std::unordered_map<const Expr*, ExprPtr>& GetVarRemap() const { return var_remap_; }
+    TypePtr RemapType(const TypePtr& type) { return RemapTypeViaVisitor(type); }
   };
   TrackingSubstituteMutator subst_mutator(var_substitution_map);
   auto transformed_body = subst_mutator.VisitStmt(pre_sub_body);
@@ -1912,12 +1947,14 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
       outlined_attrs.emplace_back("split", static_cast<int>(split));
     }
   };
-  // Propagate the optional cross-core ring depth (pl.split(mode, slot_num=N))
-  // from the scope's attrs onto the outlined function, where ExpandMixedKernel
-  // reads it to size the automatic cube->vector pipe.
+  // Propagate transport and optional local depths from pl.cross_core_slot to
+  // the outlined function, where ExpandMixedKernel builds the automatic pipe.
   auto append_slot_num_attr = [&]() {
     if (op->HasAttr("slot_num")) {
       outlined_attrs.emplace_back("slot_num", op->GetAttr<int>("slot_num", 0));
+    }
+    if (op->HasAttr("local_slot_num")) {
+      outlined_attrs.emplace_back("local_slot_num", op->GetAttr<int>("local_slot_num", 0));
     }
   };
   auto append_windowize_attr = [&]() {
@@ -2196,7 +2233,21 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
   // Determine call return type. When ``task_id_var`` is set, append the
   // TaskId element at the tail of the (already flat) return-type tuple so
   // the augmentation matches the ``pl.submit(...)`` shape.
-  std::vector<TypePtr> effective_return_types = return_types;
+  // Callee return types refer to fresh parameter identities. Instantiate them
+  // with caller arguments before attaching them to a Call or Submit; otherwise
+  // dynamic shapes leak callee-local Vars into caller assignments and uses.
+  std::unordered_map<const Var*, VarPtr> caller_var_map;
+  for (size_t i = 0; i < input_params.size(); ++i) {
+    auto caller_var = AsVarLike(call_args[i]);
+    INTERNAL_CHECK_SPAN(caller_var, op->span_) << "Internal error: outlined argument is not a variable";
+    caller_var_map.emplace(input_params[i].get(), caller_var);
+  }
+  TrackingSubstituteMutator caller_type_mutator(caller_var_map);
+  std::vector<TypePtr> effective_return_types;
+  effective_return_types.reserve(return_types.size() + (scope_task_id_var ? 1 : 0));
+  for (const auto& return_type : return_types) {
+    effective_return_types.push_back(caller_type_mutator.RemapType(return_type));
+  }
   if (scope_task_id_var) {
     effective_return_types.push_back(std::make_shared<ScalarType>(DataType::TASK_ID));
   }

@@ -108,6 +108,42 @@ A library of real-world models and primitive tensor functions built **on top of*
 
 **Interface with pypto:** pypto-lib programs are standard pypto programs — they use the same `@pl.program`/`@pl.function` DSL and compile through the same pipeline. No special API exists between them; pypto-lib is a consumer of the pypto framework.
 
+**Compiler CI coverage:** The `pypto-lib-compile` job compiles all formal runnable
+entries selected by pypto-lib's `.github/scripts/detect_changes.py --all`, using
+its platform ownership rules for A2/A3 and A5. Drafts and non-runnable helpers are
+excluded, including the CPU-only GLM weights round-trip and prefill reference
+self-tests; helpers are exercised through their callers. Device-only entries are
+included because compilation needs no NPU. The adapter forces `golden.run` into
+compile-only mode, records direct compile calls, and requires PTOAS. Coverage
+includes frontend, passes, verification, codegen, and PTOAS.
+This does not build device binaries or check numerical results; `pypto-lib-model`
+provides the separate device smoke tests.
+
+The A2/A3 compile leg runs on a CANN-equipped `npu` host and activates the
+toolkit so external CCE wrappers can resolve devkit headers at import time.
+It does not acquire or execute on an NPU. The A5 leg runs on a `cpu` host.
+
+To reproduce after activating a built PyPTO environment with the pinned PTOAS:
+
+```bash
+python tests/ci/compile_pypto_lib.py --lib /path/to/pypto-lib \
+  --platform a2a3 --jobs 4 --output build/lib-compile-a2a3
+```
+
+Repeat with `--platform a5`. Each entry has a 1200-second timeout (override with
+`--timeout`). Compilation failures, process failures, timeouts, and zero recorded
+compilations fail the job. Malformed or unreadable receipts fail their entry
+without aborting the remaining entries or losing the matrix summary.
+When an entry dispatches cases by launching its own script with the current
+Python interpreter, each child runs through the same compile-only adapter.
+Child arguments, environment, working directory, and process isolation are
+preserved, and the parent combines their compilation records. A child failure
+or missing, empty, or malformed child receipt fails the entry even if the
+parent exits successfully. This interception applies to the current entry
+script launched by the same Python interpreter.
+CI uploads per-entry logs, results, and a manifest
+containing the tested library revision and selected entries.
+
 ### PTOAS — PTO Assembler & Optimizer
 
 An MLIR-based assembler that consumes `.pto` files produced by pypto's codegen and produces optimized C++ kernel code.
@@ -165,6 +201,51 @@ Executes compiled programs on Ascend hardware. Manages the three-program executi
 - Handle device memory, synchronization, and handshake protocols
 
 **Interface with pypto:** The orchestration C++ code that pypto generates uses the simpler runtime API (`rt_submit_task`, `make_tensor_external`, etc.), which simpler implements. The runtime API is the contract between pypto's orchestration codegen and simpler.
+
+#### The runtime pin
+
+`runtime/` *is* the simpler submodule, so PyPTO's pin on it is the gitlink —
+`git rev-parse HEAD:runtime`. There is no second pin file to drift, for the same reason
+`toolchain/versions.env` declines to restate the pto-isa revision.
+
+The installed side carries no version that tracks it: simpler's `pyproject.toml` says
+`0.1.0` and always will. Its only revision identity is `_task_interface.__build_commit__`,
+stamped by `runtime/python/bindings/CMakeLists.txt` at build time from `git rev-parse HEAD`.
+
+`pypto.runtime.runtime_pin.check_runtime_pin()` compares the two. It runs at import of the
+two PyPTO modules that import simpler at module scope — `pypto.runtime.task_interface` and
+`pypto.runtime.kernel_compiler` — and a mismatch raises `RuntimePinMismatch` (an
+`ImportError`) naming both revisions and the reinstall command.
+
+Simpler carries its own equivalent guard
+(`simpler.task_interface._assert_bindings_match_source_tree`), but that one compares the
+extension against *its own* source tree and returns early when there is no `.git` beside
+it. A wheel, or a `pip install ./runtime` that copies into `site-packages`, is therefore
+never checked — and that install is where staleness is hardest to see, because a changed
+struct layout makes fields read as 0 with no error.
+
+Two comparisons, two severities:
+
+| Comparison | Meaning | Result |
+| ---------- | ------- | ------ |
+| `__build_commit__` vs `git -C runtime rev-parse HEAD` | the installed simpler was not built from this tree | error |
+| `git -C runtime rev-parse HEAD` vs `git rev-parse HEAD:runtime` | your runtime checkout is off PyPTO's pin | warning (`RuntimePinWarning`) |
+
+The second is only a warning: working on a runtime branch is legitimate.
+
+Everything else is a **skip**, never a failure — a wheel-installed PyPTO with no
+`runtime/`, an uninitialized `runtime/` submodule (empty, so it has no revision of its
+own), no git available, or a simpler built without git (empty stamp). Refusing to
+run because the question is unanswerable would break every legitimate install. An
+importable `_task_interface` with *no* `__build_commit__` attribute is not a skip: the
+attribute only disappears on an extension compiled before the stamp existed, which is by
+definition a different revision.
+
+Check it by hand with `pypto-runtime-pin`, which prints both sides and exits non-zero on a
+mismatch; `pypto-runtime-pin --fix` reinstalls `runtime/` and re-verifies in a fresh
+interpreter. `PYPTO_SKIP_RUNTIME_PIN_CHECK=1` bypasses the check. The unit suite sets it in
+`tests/ut/conftest.py` because it stubs simpler and must not be gated on the installed
+revision; system tests run real kernels and are deliberately not exempted.
 
 ## Interface Summary
 

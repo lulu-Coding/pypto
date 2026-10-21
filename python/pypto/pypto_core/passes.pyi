@@ -11,8 +11,9 @@
 from collections.abc import Callable
 from enum import Enum
 from types import TracebackType
-from typing import overload
+from typing import Any, overload
 
+from pypto.pypto_core.backend import Backend
 from pypto.pypto_core.ir import Function, Program, Span, Stmt
 
 class IRProperty(Enum):
@@ -59,11 +60,16 @@ class IRProperty(Enum):
     HardSyncallOccupancyValid = ...
     IterArgCarryClassified = ...
     AccToGmStoreValid = ...
+    FixpipeEpilogueValid = ...
     AtomicAddDtypeValid = ...
     AccCompactValid = ...
     GraphBoundaryLegalized = ...
     AccStorePhaseValid = ...
     NoScalarKernelReturn = ...
+    AivSplitLoweredValid = ...
+    BufferIR = ...
+    TileStorageLegalized = ...
+    TileStorageAllocated = ...
 
 class IRPropertySet:
     """A set of IR properties backed by a bitset."""
@@ -292,6 +298,7 @@ class PassContext:
         memory_planner: MemoryPlanner = MemoryPlanner.PYPTO,
         enable_pypto_l0c_double_buffer: bool = False,
         runtime: RuntimeKind = RuntimeKind.TENSORMAP_AND_RINGBUFFER,
+        enable_buffer_ir: bool = True,
     ) -> None:
         """Create a PassContext with instruments and pass configuration (incl. memory planner).
 
@@ -304,6 +311,9 @@ class PassContext:
         what lands in ``RUNTIME_CONFIG["runtime"]`` in the generated
         ``kernel_config.py``. Passes that legalize runtime-specific IR read it
         from the context.
+
+        ``enable_buffer_ir`` defaults to true and selects supported whole kernels
+        for Buffer IR. Unsupported kernels retain Tile; false selects Tile for all.
         """
         ...
 
@@ -326,12 +336,20 @@ class PassContext:
         """Get the diagnostic checks suppressed by this context."""
         ...
 
+    def get_backend(self) -> Backend:
+        """Return the configured backend; raise ValueError when none is configured."""
+        ...
+
     def get_memory_planner(self) -> MemoryPlanner:
         """Get the memory planner selection for this context."""
         ...
 
     def get_runtime(self) -> RuntimeKind:
         """Get the target Simpler runtime ABI for this context."""
+        ...
+
+    def get_enable_buffer_ir(self) -> bool:
+        """Whether supported whole kernels use Buffer IR."""
         ...
 
     def get_enable_pypto_l0c_double_buffer(self) -> bool:
@@ -372,6 +390,9 @@ def init_mem_ref() -> Pass:
 
 def materialize_semantic_aliases() -> Pass:
     """Create the semantic must-alias materialization pass (loop-carry / in-place)."""
+
+def verify_tile_storage(allocated: bool = False) -> Pass:
+    """Verify canonical storage; allocated=True also checks effective address overlap."""
 
 def memory_reuse() -> Pass:
     """Create a memory reuse pass."""
@@ -419,6 +440,8 @@ class TypeCheckErrorType(Enum):
     TENSOR_PADDING_MISMATCH = ...
     DISTRIBUTED_WINDOW_IDENTITY_MISMATCH = ...
     TILE_VIEW_MISMATCH = ...
+    BUFFER_DESCRIPTOR_MISMATCH = ...
+    TENSOR_LAYOUT_MISMATCH = ...
 
 def unroll_loops() -> Pass:
     """Create a loop unrolling pass that expands ForKind.Unroll loops at compile time."""
@@ -500,6 +523,9 @@ def convert_to_ssa() -> Pass:
 def outline_incore_scopes() -> Pass:
     """Create a pass that outlines InCore scopes."""
 
+def deduplicate_outlined_kernels() -> Pass:
+    """Reuse closed outlined kernels and exclusive Group bundles; preserve every dispatch."""
+
 def outline_cluster_scopes() -> Pass:
     """Create a pass that outlines Cluster scopes to Group and standalone Spmd scopes to Spmd."""
 
@@ -518,10 +544,12 @@ def optimize_orch_tensors() -> Pass:
 def block_nz_tensor_views() -> Pass:
     """Create a pass that rewrites logical ``pl.NZ`` tensors into blocked NZ form.
 
-    An NZ ``TensorType`` shape ``[..., R, C]`` becomes ``[..., C/c0, R/16, 16, c0]``,
-    where ``c0`` is the number of elements in a 32-byte C0 line (``256 / dtype
-    bits``) — the blocked rank-(r+2) form pto-isa's ``Layout::NZ`` GlobalTensor
-    requires. Every consuming ``tile.load`` has its offsets / shapes / valid_shape
+    An NZ ``TensorType`` shape ``[B, R, C]`` becomes ``[B, C/c0, R/16, 16, c0]``
+    and ``[R, C]`` becomes ``[1, C/c0, R/16, 16, c0]``, where ``c0`` is the
+    number of elements in a 32-byte C0 line (``256 / dtype bits``) — the blocked
+    rank-5 form pto-isa's ``Layout::NZ`` GlobalTensor requires. The leading slot
+    is always present, so a rank-2 tensor gets a batch extent of 1 rather than a
+    shorter shape. Every consuming ``tile.load`` has its offsets / shapes / valid_shape
     rewritten into blocked coordinates while its logical 2-D destination
     ``TileType`` is preserved.
 
@@ -660,7 +688,7 @@ def lower_auto_vector_split() -> Pass:
 def inject_gm_pipe_buffer() -> Pass:
     """Create a backend-gated pass that injects ``__gm_pipe_buffer`` for cross-core pipes.
 
-    On backends whose cross-core pipe rides through GM (currently Ascend910B), adds a
+    On backends whose cross-core pipe rides through GM (currently Ascend910), adds a
     ``__gm_pipe_buffer`` Out-tensor parameter to functions that issue ``initialize_pipe``
     ops and propagates it through callers. Orchestration functions materialize the
     buffer locally via ``tensor.create`` instead of receiving it as a parameter. No-op
@@ -765,6 +793,10 @@ def materialize_comm_domain_scopes() -> Pass:
 def lower_host_tensor_collectives() -> Pass:
     """Lower host-level ``pld.tensor.allreduce`` calls to builtin collective dispatches."""
 
+def legalize_spmd_launches() -> Pass:
+    """Guard potentially empty SPMD launches, requiring preallocated outputs."""
+    ...
+
 def lower_l2_tensor_collectives() -> Pass:
     """Lower managed collectives written in a CHIP/L2 orchestration body.
 
@@ -775,9 +807,11 @@ def lower_l2_tensor_collectives() -> Pass:
     joins the caller's own task DAG, so ``compute -> collective -> consume`` is
     ordered by ordinary TensorMap dependencies.
 
-    Runs immediately before :func:`derive_call_directions` so the emitted call
+    Runs before :func:`derive_call_directions` so the emitted call
     gets its argument directions and task edges derived like any kernel call.
-    Today only ``pld.tensor.all_to_all_v`` with ``core_num=1`` is supported.
+    ``pld.tensor.all_to_all_v`` accepts a compile-time ``core_num``: the admitted
+    block count ``B = CalAllToAllVBlocks(P, L)`` is folded and ``B`` blocks are
+    launched; a runtime ``core_num`` is rejected.
     """
 
 def materialize_dist_tensor_ctx() -> Pass:
@@ -787,9 +821,9 @@ def legalize_graph_boundary() -> Pass:
     """Make every ``FunctionType.Graph`` function legal to record and replay.
 
     Hoists each boundary scalar a Graph body *derives* out to its call sites.
-    Under ``host_build_graph`` a boundary scalar is tracked by the address of its
-    argument slot, so a value computed inside the region has no slot and would be
-    frozen at its first-call value on every later replay, with no warning.
+    Under ``host_build_graph`` a boundary scalar carries its parameter origin.
+    A value computed inside the region loses that origin and would be frozen at
+    its first-call value on every later replay.
 
     Also rejects, at compile time, the boundary shapes the runtime would decline
     to cache — an oversized or empty tensor boundary, runtime-allocated outputs,
@@ -806,6 +840,20 @@ def materialize_valid_shape_symbols() -> Pass:
     scalar parameter, so a precompiled kernel never receives it. Adds the symbol
     as a leading ``Scalar[INDEX]`` parameter and passes the caller's actual extent
     at every call/submit site.
+    """
+
+def select_buffer_ir_functions() -> Pass:
+    """Select supported whole kernels before Buffer storage legalization."""
+    ...
+
+def lower_tile_to_buffer() -> Pass:
+    """Replace planned device Tile storage with explicit Buffer IR.
+
+    Runs last, after storage legalization, address placement and signature materialization.
+    The initial recipe covers dense static rank-2 Vec FP32 allocations, GM transfers,
+    add/mul and copies in straight-line kernels, branches and loops. Unsupported recipes fail explicitly.
+    Verifies storage closure even when automatic verification is disabled, and verifies
+    BufferIR after conversion.
     """
 
 def stamp_tfree_split() -> Pass:
@@ -1061,6 +1109,7 @@ __all__ = [
     "convert_to_ssa",
     "outline_incore_scopes",
     "outline_cluster_scopes",
+    "deduplicate_outlined_kernels",
     "outline_hierarchy_scopes",
     "outline_graph_scopes",
     "convert_tensor_to_tile_ops",
@@ -1069,6 +1118,7 @@ __all__ = [
     "block_mx_scale_tensor_views",
     "flatten_tile_nd_to_2d",
     "legalize_tile_cast",
+    "legalize_spmd_launches",
     "auto_tile_matmul_l0",
     "canonicalize_tile_slice",
     "infer_tile_memory_space",
@@ -1085,6 +1135,8 @@ __all__ = [
     "materialize_dist_tensor_ctx",
     "legalize_graph_boundary",
     "materialize_valid_shape_symbols",
+    "lower_tile_to_buffer",
+    "select_buffer_ir_functions",
     "flatten_call_expr",
     "inline_functions",
     "normalize_stmt_structure",
@@ -1123,7 +1175,7 @@ class PassProperties:
         produced: IRPropertySet,
         invalidated: IRPropertySet,
     ) -> None: ...
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         """Create pass properties, optionally with required/produced/invalidated sets."""
 
 def create_function_pass(

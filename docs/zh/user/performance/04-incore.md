@@ -1,5 +1,9 @@
 # InCore 函数调优
 
+> **旧 Python 接口示例：** 本页为兼容现有用法保留 `platform=` 调用，
+> 这些调用会发出 `DeprecationWarning`；新代码应使用 `backend_type` 和
+> `execution_mode`。参见[目标映射](../../dev/08-entry-points.md#迁移旧-platform-示例)。
+
 把条本身变短：让搬运与计算重叠、换算法、迎合硬件的粒度，以及——当别的都赢不了时——干脆不用 PyPTO 写这个 kernel。
 
 > **前置**：前面几页。如果条与条之间的间隙仍然是主要开销，本页为时过早。
@@ -101,7 +105,7 @@ check(explicit_slots)
 | `PYPTO`（默认） | 烘焙地址（`alloc_tile`） | 支持 |
 | `PTOAS` | 一个 `alloc_multi_tile` 区域 + 每次使用一个 `multi_tile_get` | **codegen 拒绝** |
 
-PTOAS 的这个拒绝是刻意的，在你围绕它做设计之前值得理解：ptoas 只保护一次迭代里的**第一个** `multi_tile_get`，于是第二个 slot 会在下一次迭代覆盖它的同时被读。这件事在 codegen 开始拒绝之前，是在设备上被实测出错的。**一次迭代一个 slot 存活**才是区域形式存在的目的，也是你如果可能换规划器时该写的形状。
+PTOAS 的这个拒绝是刻意的，在你围绕它做设计之前值得理解：ptoas 在循环里同步两个同时存活的 slot 时出过错。较早的版本不保护第二个 slot 的 load，使它与下一次迭代的写入竞争，这在设备上被实测出错。当前固定的版本仍会把这种形状中的一种——比读取提前一轮迭代填充的 slot——同步错，结果是算错或设备挂死（[PTOAS#1519](https://github.com/hw-native-sys/PTOAS/issues/1519)，ptoas 0.63 修复，0.64 起又回退）。**一次迭代一个 slot 存活**才是区域形式存在的目的，也是你如果可能换规划器时该写的形状。
 
 ## 看清片上预算
 

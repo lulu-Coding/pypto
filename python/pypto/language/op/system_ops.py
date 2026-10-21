@@ -47,6 +47,8 @@ __all__ = [
     "SyncAllMode",
     "sync_src",
     "sync_dst",
+    "set_flag",
+    "wait_flag",
     "sync_set",
     "sync_wait",
     "set_ffts",
@@ -85,6 +87,37 @@ def _kernel_or_none(core_type: KernelType | None, op_name: str) -> KernelType | 
         allowed=_SYNC_EVENT_KERNELS,
         hint=_SYNC_EVENT_MIX_HINT,
     )
+
+
+def set_flag(
+    src_pipe: PipeType,
+    dst_pipe: PipeType,
+    event_id: IntLike = 0,
+    *,
+    core_type: KernelType | None = None,
+    span: Span | None = None,
+) -> Call:
+    """Signal an intra-core event after ``src_pipe`` work completes.
+
+    Pair with :func:`wait_flag` using the same source, destination and event ID.
+    ``core_type`` selects AIC or AIV when a mixed InCore function is split.
+    A dynamic event ID must be an INDEX scalar and evaluate to 0 through 7.
+    """
+    event = event_id.unwrap() if isinstance(event_id, Scalar) else event_id
+    return _ir_ops.set_flag(src_pipe, dst_pipe, event, core_type=core_type, span=span)
+
+
+def wait_flag(
+    src_pipe: PipeType,
+    dst_pipe: PipeType,
+    event_id: IntLike = 0,
+    *,
+    core_type: KernelType | None = None,
+    span: Span | None = None,
+) -> Call:
+    """Block ``dst_pipe`` until the matching source event is signalled."""
+    event = event_id.unwrap() if isinstance(event_id, Scalar) else event_id
+    return _ir_ops.wait_flag(src_pipe, dst_pipe, event, core_type=core_type, span=span)
 
 
 def sync_set(
@@ -137,7 +170,7 @@ def sync_wait(
     return _ir_ops.sync_wait(event_expr, pipe=pipe, core_type=kernel, span=span)
 
 
-def set_ffts(workspace: Tensor, *, span: Span | None = None) -> Call:
+def set_ffts(workspace: object, *, span: Span | None = None) -> Call:
     """Declare the A3 FFTS setup operand for explicit cross-core synchronization."""
     if not isinstance(workspace, Tensor):
         raise TypeError(f"set_ffts workspace must be a Tensor, got {type(workspace).__name__}")
@@ -151,8 +184,8 @@ def syncall(
     *,
     core_type: KernelType = KernelType.MIX,
     mode: SyncAllMode = SyncAllMode.HARD,
-    gm_workspace: Tensor | None = None,
-    used_cores: IntLike | None = None,
+    gm_workspace: object = None,
+    used_cores: object = None,
     span: Span | None = None,
 ) -> Call:
     """Cross-core all-participant barrier (``pto::SYNCALL``).

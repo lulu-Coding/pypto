@@ -27,7 +27,7 @@ Covers the InCore PTO codegen for ``pld.tile.remote_load``,
 - ``pto.addptr`` and ``pto.make_tensor_view`` MUST live at the call site
   regardless: PTOAS verifies per-function that ``addptr`` directly feeds
   ``make_tensor_view`` / ``initialize_l2g2l_pipe(gm_addr)`` /
-  ``load|store_scalar``, AND ``make_tensor_view`` lowers to a strided
+  ``load|store``, AND ``make_tensor_view`` lowers to a strided
   memref whose layout cannot be encoded in a ``!pto.tensor_view<…>``
   return type — so the view could not be returned across a func boundary
   either.
@@ -49,7 +49,9 @@ from pypto import DataType, backend, codegen, ir, passes
 from pypto.backend import BackendType
 from pypto.ir.builder import IRBuilder
 from pypto.ir.instruments import make_roundtrip_instrument
+from pypto.ir.op import tile as tile_ops
 from pypto.ir.op.distributed import system_ops as dist_system
+from pypto.ir.op.distributed import tile_ops as dist_tile_ops
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 from pypto.pypto_core import passes as _core_passes
 
@@ -57,7 +59,7 @@ from pypto.pypto_core import passes as _core_passes
 @pytest.fixture(autouse=True)
 def _setup_backend():
     backend.reset_for_testing()
-    backend.set_backend_type(BackendType.Ascend910B)
+    backend.set_backend_type(BackendType.Ascend910)
     yield
     backend.reset_for_testing()
 
@@ -726,7 +728,7 @@ def test_remote_load_emits_inline_offset_arithmetic_with_addptr_at_call_site():
     # chain within a single func.func.
     kernel = funcs["kernel"]
     # Inline body: load_scalar reads (rankId + 2 window slots) + divsi.
-    assert kernel.count("pto.load_scalar") >= 3, kernel
+    assert kernel.count("pto.load ") >= 3, kernel
     assert "arith.divsi" in kernel, kernel
     assert "pto.addptr" in kernel, "addptr must live at the call site"
     # The addptr's direct downstream is a make_tensor_view in the same func —
@@ -766,7 +768,7 @@ def test_remote_store_emits_tstore_with_partition_view_pattern():
     assert "_peer_pview" in kernel, kernel
     # Address translation lives at the call site (same constraints as remote_load).
     assert "CommRemoteOffset" not in mlir, mlir
-    assert kernel.count("pto.load_scalar") >= 3, kernel
+    assert kernel.count("pto.load ") >= 3, kernel
     assert "pto.addptr" in kernel, kernel
     assert "pto.make_tensor_view" in kernel, kernel
 
@@ -1000,9 +1002,7 @@ def test_remote_load_uses_comm_layout_constants():
     # bare `arith.constant 2 : index` may equally be an unrelated shape or
     # stride. Matching the *uses* keeps the comm_layout pin load-bearing.
     rank_slot_reads = [
-        line
-        for line in kernel.splitlines()
-        if "pto.load_scalar" in line and f"[%c{rank_idx_unit}_index]" in line
+        line for line in kernel.splitlines() if "pto.load " in line and f"[%c{rank_idx_unit}_index]" in line
     ]
     assert rank_slot_reads, kernel
     assert f"arith.addi %c{win_idx_unit}_index," in kernel, kernel
@@ -1466,11 +1466,11 @@ def test_if_merged_distributed_metadata_rejects_conflicting_contexts():
         _generate_mlir(P)
 
 
-def test_rank_emits_pto_load_scalar_at_slot_2_plus_trunci():
+def test_rank_emits_pto_load_at_slot_2_plus_trunci():
     """``pld.system.rank(ctx)`` reads slot 2 (= kRankIdOffset /
     kWindowSlotStride = 16/8) then truncates to signless ``i32`` for PTOAS.
 
-    Asserts that the emitted MLIR contains ``pto.load_scalar %argN[%cK] :
+    Asserts that the emitted MLIR contains ``pto.load %argN[%cK] :
     !pto.ptr<i64> -> i64`` and ``arith.trunci`` — no ``arith.shrui`` (that
     is the nranks path).
     """
@@ -1486,14 +1486,14 @@ def test_rank_emits_pto_load_scalar_at_slot_2_plus_trunci():
     mlir = _generate_mlir(P)
     body = mlir.split("func.func @kernel", 1)[1]
     # rank lowering line.
-    assert "pto.load_scalar" in body and "!pto.ptr<i64> -> i64" in body, body
+    assert "pto.load " in body and "!pto.ptr<i64> -> i64" in body, body
     assert "arith.trunci" in body and "to i32" in body, body
     assert "to ui32" not in body, body
     # rank does not shrui — only nranks does.
     assert "arith.shrui" not in body, body
 
 
-def test_nranks_emits_pto_load_scalar_plus_shrui_32_plus_trunci():
+def test_nranks_emits_pto_load_plus_shrui_32_plus_trunci():
     """``pld.system.nranks(ctx)`` reads the SAME slot 2 then
     ``arith.shrui ..., 32`` (high 32 bits = rankNum) then ``arith.trunci``.
 
@@ -1512,8 +1512,8 @@ def test_nranks_emits_pto_load_scalar_plus_shrui_32_plus_trunci():
 
     mlir = _generate_mlir(P)
     body = mlir.split("func.func @kernel", 1)[1]
-    # nranks lowering: pto.load_scalar + arith.shrui + arith.trunci.
-    assert "pto.load_scalar" in body and "!pto.ptr<i64> -> i64" in body, body
+    # nranks lowering: pto.load + arith.shrui + arith.trunci.
+    assert "pto.load " in body and "!pto.ptr<i64> -> i64" in body, body
     assert "arith.shrui" in body, body
     assert "arith.trunci" in body and "to i32" in body, body
     assert "to ui32" not in body, body
@@ -1592,7 +1592,7 @@ def test_put_emits_comm_tput_with_attr_and_staging_tile():
     # addptr needed for its own view).
     assert "CommRemoteOffset" not in mlir, mlir
     # Pin the element-size divisor, not just "some scalar read happened":
-    # pto.load_scalar alone is emitted by unrelated lowerings (pld.system.rank,
+    # pto.load alone is emitted by unrelated lowerings (pld.system.rank,
     # tensor.read), so it would not catch a wrong dtype reaching the inline
     # peer-offset arithmetic. FP16 => 2 bytes.
     assert "arith.constant 2 : i64" in mlir, mlir
@@ -1998,9 +1998,9 @@ def test_split_aiv_region_keeps_notify_off_the_cube_lane():
     it splits. On the cube lane that is a real hazard: the AIC copy can publish
     the signal before the AIV lane's TPUT has landed the data the signal
     releases, so the peer reads stale bytes. Writing the comm phase inside a
-    ``pl.split_aiv`` region is what prevents it — LowerAutoVectorSplit stamps
-    the region's no-duplicate calls with ``core_placement="aiv"`` and
-    ClassifyCallAffinity resolves that to VECTOR.
+    ``pl.split_aiv`` region is what prevents it. LowerAutoVectorSplit retains
+    the region, and ExpandMixedKernel consumes its no-duplicate SHARED calls
+    into pass-local AIV placement.
 
     The kernel must be GENUINELY mixed at the InCore level for this to be under
     test at all: the ``pl.at(level=pl.Level.CORE_GROUP)`` block holds both the
@@ -2082,6 +2082,69 @@ def test_split_aiv_region_keeps_notify_off_the_cube_lane():
     incore = [f for f in optimized.functions.values() if ir.is_incore_type(f.func_type)]
     mlir = codegen.PTOCodegen().generate(ir.Program(incore, "kernel", optimized.span))
     assert mlir.count("pto.comm.tnotify(") == 1, mlir
+
+
+def test_remote_load_fp16_tail_padding_widens_the_peer_view_not_its_strides():
+    """The peer view must declare the reserved tail its own slice reaches into.
+
+    An FP16 ``remote_load`` carrying ``allow_physical_tail_padding`` is the
+    allreduce chunk loop rounding its read up to a 32-byte boundary, so the
+    partition it takes may reach up to 15 elements past the window's logical
+    width — into the block the comm domain reserves for exactly this. The op's
+    type deducer already widens the source that way.
+
+    Codegen used to build the peer ``make_tensor_view`` from the logical width
+    alone, so the emitted view was narrower than the ``partition_view`` sliced
+    out of it. PTOAS >= 0.61 verifies a partition against its source and
+    rejects that:
+
+        error: 'pto.partition_view' op size at dim 1 (32) exceeds static
+               source dim (17)
+
+    The widening applies to the declared extent only. Strides are the real
+    memory layout and must not move.
+    """
+    ty = ir.DistributedTensorType([1, 17], DataType.FP16)
+
+    ib = IRBuilder()
+    with ib.function("tail_pad", type=ir.FunctionType.InCore) as f:
+        data = f.param("data", ty)
+        f.param("data_ctx", ir.CommCtxType.get())
+        peer = f.param("peer", ir.ScalarType(DataType.INT32))
+        out = f.param("out", ir.TensorType([1, 32], DataType.FP16))
+        tile = ib.let(
+            "recv",
+            dist_tile_ops._remote_load_with_physical_tail_padding(
+                data, peer, [0, 0], [1, 32], [1, 32], span=ir.Span.unknown()
+            ),
+        )
+        ib.let("stored", tile_ops.store(tile, [0, 0], out))
+        ib.return_stmt()
+
+    program = ir.Program([f.get_result()], "tail_pad", ir.Span.unknown())
+    # Hand-built IR carries no memory space; codegen requires one on every tile.
+    program = passes.infer_tile_memory_space()(program)
+    mlir = codegen.PTOCodegen().generate(program)
+
+    peer_partition = next(
+        line for line in mlir.splitlines() if "pto.partition_view" in line and "_peer" in line
+    )
+    assert "sizes = [%c1_index, %c32_index]" in peer_partition, peer_partition
+
+    # The peer view itself is an anonymous temp, so find it by the SSA name the
+    # partition slices from.
+    source_ssa = peer_partition.split("pto.partition_view", 1)[1].split(",", 1)[0].strip()
+    peer_view = next(
+        line
+        for line in mlir.splitlines()
+        if "pto.make_tensor_view" in line and line.strip().startswith(f"{source_ssa} =")
+    )
+    # 17 logical + 15 reserved: the partition above asks for 32, so the source
+    # has to be at least that wide or it is out of bounds.
+    assert "shape = [%c1_index, %c32_index]" in peer_view, peer_view
+    # Row stride stays the logical width — widening the declared extent must
+    # not relocate row 1.
+    assert "strides = [%c17_index, %c1_index]" in peer_view, peer_view
 
 
 if __name__ == "__main__":

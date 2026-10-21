@@ -10,8 +10,10 @@
 """Type annotation resolution for IR parsing."""
 
 import ast
+import warnings
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Any, cast
+from functools import partial
+from typing import TYPE_CHECKING, Any, TypeGuard, cast
 
 from pypto.language.typing.dynamic import DynVar
 from pypto.language.typing.scalar import Scalar
@@ -19,6 +21,27 @@ from pypto.pypto_core import DataType, ir
 
 from .diagnostics import ParserError, ParserTypeError
 from .expr_evaluator import ExprEvaluator
+
+
+def _is_dump_call(node: object, name: str | None = None) -> TypeGuard[ast.Call]:
+    """Match private dump calls under the printer's configurable module prefix."""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and (name is None or node.func.attr == name)
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == "_dump"
+        and isinstance(node.func.value.value, ast.Name)
+    )
+
+
+def _warn_incomplete_fp4() -> None:
+    warnings.warn(
+        "PyPTO's FP4 support is incomplete in the current release; "
+        "use with caution. Prefer FP4E2M1X2 instead.",
+        UserWarning,
+        stacklevel=3,
+    )
 
 
 def _const_int_value(value: object) -> int | None:
@@ -119,8 +142,9 @@ def _is_pl_yield_call(node: ast.expr) -> bool:
 # None of the raw names is exported by `pl` / `pld`, so they resolve here but
 # cannot be evaluated as attributes. Python does not evaluate local-variable
 # annotations, so a raw name still works in an `x: pl.AsyncEventType = ...`
-# binding; in a *parameter* annotation it raises AttributeError before the
-# parser ever sees it. Emit the wrapper name — that is what the printer does.
+# binding; ordinary Python execution of a parameter annotation needs a wrapper.
+# Text parsing defers annotation evaluation, but the printer still uses wrapper
+# names so existing scripts can also evaluate their signatures normally.
 _MARKER_TYPE_GETTERS: dict[str, Callable[[], ir.Type]] = {
     "PrefetchAsyncContextType": ir.PrefetchAsyncContextType.get,
     "PrefetchAsyncContext": ir.PrefetchAsyncContextType.get,
@@ -130,6 +154,7 @@ _MARKER_TYPE_GETTERS: dict[str, Callable[[], ir.Type]] = {
     "AsyncSession": ir.AsyncSessionType.get,
     "CommCtxType": ir.CommCtxType.get,
     "CommCtx": ir.CommCtxType.get,
+    "Ptr": ir.PtrType,
 }
 
 
@@ -163,6 +188,7 @@ class TypeResolver:
 
     _DTYPE_MAP: dict[str, DataType] = {
         "FP4": DataType.FP4,
+        "FP4E2M1X2": DataType.FP4E2M1X2,
         "FP8E4M3FN": DataType.FP8E4M3FN,
         "FP8E5M2": DataType.FP8E5M2,
         "FP8E8M0": DataType.FP8E8M0,
@@ -234,7 +260,8 @@ class TypeResolver:
                 ensuring the same DynVar produces the same ir.Var across functions
                 in a program.
             parse_expression: Optional callback to the enclosing parser's full
-                expression parser. When set, TileView/TensorView fields accept any
+                expression parser. Restores recorded calls in shape dimensions
+                without repeating type inference. TileView/TensorView fields accept any
                 index expression the DSL itself can parse (matching what the C++
                 ``ir.TileView`` constructor accepts), not just integer constants
                 and bare names.
@@ -244,6 +271,129 @@ class TypeResolver:
         self.span_tracker = span_tracker
         self._dyn_var_cache: dict[str, ir.Var] = dyn_var_cache if dyn_var_cache is not None else {}
         self._parse_expression = parse_expression
+        self._window_buffers: dict[str | int, tuple[str, ir.WindowBuffer]] = {}
+        self._window_buffer_nodes: dict[str | int, ast.Call] = {}
+
+    @staticmethod
+    def is_window_buffer_annotation(node: ast.expr) -> bool:
+        """Recognize the private, lossless window descriptor spelling."""
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"window_buffer", "window_ref"}
+            and isinstance(node.func.value, ast.Attribute)
+            and node.func.value.attr == "_dump"
+            and isinstance(node.func.value.value, ast.Name)
+            and node.func.value.value.id == "pl"
+        )
+
+    def register_window_definitions(self, root: ast.AST) -> None:
+        """Collect definitions before resolving references in a function signature."""
+        for node in ast.walk(root):
+            if (
+                isinstance(node, ast.Call)
+                and self.is_window_buffer_annotation(node)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "window_buffer"
+            ):
+                self.register_window_buffer(node)
+
+    def _window_buffer_key(self, node: ast.expr) -> str | int:
+        """Read a named window reference, accepting earlier numeric IDs as well."""
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, str) and node.value:
+                return node.value
+            if type(node.value) is int and node.value >= 0:
+                return node.value
+        raise ParserTypeError(
+            "Window reference requires a non-empty string or a non-negative integer ID",
+            span=self._get_span(node),
+        )
+
+    def _window_buffer_fields(self, node: ast.expr) -> dict[str, ast.expr]:
+        """Read descriptor fields without resolving body-local expressions."""
+        if (
+            not self.is_window_buffer_annotation(node)
+            or not isinstance(node, ast.Call)
+            or not isinstance(node.func, ast.Attribute)
+            or node.func.attr != "window_buffer"
+            or len(node.args) > 3
+        ):
+            raise ParserTypeError(
+                "Expected window_buffer(key, base=..., size=...) descriptor", span=self._get_span(node)
+            )
+        fields: dict[str, ast.expr] = dict(zip(("key", "base", "size"), node.args))
+        for keyword in node.keywords:
+            if keyword.arg not in {"key", "base", "size", "load_from_host", "store_to_host"}:
+                raise ParserTypeError("Unknown window_buffer keyword", span=self._get_span(keyword))
+            if keyword.arg in fields:
+                raise ParserTypeError(
+                    f"Duplicate window_buffer field '{keyword.arg}'", span=self._get_span(keyword)
+                )
+            fields[keyword.arg] = keyword.value
+        if not {"key", "base", "size"} <= fields.keys():
+            raise ParserTypeError(
+                "window_buffer requires a key, a base name, and a size", span=self._get_span(node)
+            )
+        return fields
+
+    def register_window_buffer(self, node: ast.expr) -> None:
+        """Record a descriptor before its body-local allocation has been parsed."""
+        fields = self._window_buffer_fields(node)
+        identifier = self._window_buffer_key(fields["key"])
+        assert isinstance(node, ast.Call)
+        previous = self._window_buffer_nodes.get(identifier)
+        if previous is not None and ast.dump(previous) != ast.dump(node):
+            raise ParserTypeError(
+                f"Conflicting window_buffer descriptors for ID {identifier}", span=self._get_span(node)
+            )
+        self._window_buffer_nodes[identifier] = node
+
+    def resolve_window_buffer(self, node: ast.expr) -> ir.WindowBuffer:
+        """Intern a printed window descriptor, preserving shared object identity."""
+        span = self._get_span(node)
+        if not self.is_window_buffer_annotation(node) or not isinstance(node, ast.Call):
+            raise ParserTypeError("Expected pl._dump.window_buffer(...) descriptor", span=span)
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "window_ref":
+            if len(node.args) != 1 or node.keywords:
+                raise ParserTypeError("window_ref requires one window key", span=span)
+            identifier = self._window_buffer_key(node.args[0])
+            cached = self._window_buffers.get(identifier)
+            if cached is not None:
+                return cached[1]
+            descriptor = self._window_buffer_nodes.get(identifier)
+            if descriptor is None:
+                raise ParserTypeError(f"Undefined window_buffer ID {identifier!r}", span=span)
+            return self.resolve_window_buffer(descriptor)
+        fields = self._window_buffer_fields(node)
+        identifier = self._window_buffer_key(fields["key"])
+        base_node, size_node = fields["base"], fields["size"]
+        if not isinstance(base_node, ast.Constant) or not isinstance(base_node.value, str):
+            raise ParserTypeError("window_buffer base must be a string", span=span)
+        flags = {"load_from_host": False, "store_to_host": False}
+        for name in flags:
+            value = fields.get(name)
+            if value is not None:
+                if not isinstance(value, ast.Constant) or type(value.value) is not bool:
+                    raise ParserTypeError(f"window_buffer {name} must be a boolean", span=span)
+                flags[name] = value.value
+        signature = ast.dump(node, include_attributes=False)
+        previous = self._window_buffers.get(identifier)
+        if previous is not None:
+            if previous[0] != signature:
+                raise ParserTypeError(
+                    f"Conflicting window_buffer descriptors for ID {identifier!r}", span=span
+                )
+            return previous[1]
+        base = self._intern_base_ptr(base_node.value, span)
+        if self._parse_expression is None:
+            raise ParserTypeError("window_buffer requires an enclosing IR parser", span=span)
+        if _is_pl_yield_call(size_node):
+            raise ParserTypeError("window_buffer size cannot contain pl.yield_()", span=span)
+        size = self._parse_expression(size_node)
+        window = ir.WindowBuffer(base, size, flags["load_from_host"], flags["store_to_host"], span)
+        self._window_buffers[identifier] = (signature, window)
+        return window
 
     def resolve_param_type(self, type_node: ast.expr) -> "tuple[ir.Type, ir.ParamDirection]":
         """Resolve AST type annotation to (ir.Type, ParamDirection) for function parameters.
@@ -378,6 +528,15 @@ class TypeResolver:
         any import alias (``pl.AsyncEvent``, ``pld.CommCtx``, ``lang.AsyncEvent``)
         works.
         """
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == "_dump"
+            and isinstance(node.value.value, ast.Name)
+        ):
+            getters = {"WindowBuffer": ir.WindowBufferType.get, "Unknown": ir.UnknownType}
+            getter = getters.get(node.attr)
+            return getter() if getter is not None else None
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
             name = node.attr
         elif isinstance(node, ast.Name):
@@ -454,14 +613,12 @@ class TypeResolver:
         # with the constraint that MemRef requires explicit MemorySpace.
         is_distributed = type_name == "DistributedTensor"
         is_tensor_like = type_name == "Tensor" or is_distributed
-        tensor_ctor = ir.DistributedTensorType if is_distributed else ir.TensorType
+        tensor_ctor: Callable[..., ir.TensorType] = (
+            ir.DistributedTensorType if is_distributed else ir.TensorType
+        )
 
-        # PassDumpLevel.EXPLICIT appends a `"window_buffer=<name>"` debug marker as
-        # a trailing subscript element on DistributedTensor annotations (issue
-        # #2088). It is informational only — the real back-reference re-derives
-        # from pld.tensor.window — so drop it before validation/resolution to keep
-        # EXPLICIT pass dumps reparseable (validate_ir reloads every dump via
-        # pl.loads).
+        # Older EXPLICIT dumps used an informational string rather than a real
+        # reference. Keep those annotations readable; new dumps use window_ref.
         if is_distributed and isinstance(slice_value, ast.Tuple) and slice_value.elts:
             last = slice_value.elts[-1]
             if (
@@ -470,6 +627,21 @@ class TypeResolver:
                 and last.value.startswith("window_buffer=")
             ):
                 slice_value.elts = slice_value.elts[:-1]
+
+        window = None
+        if (
+            is_distributed
+            and isinstance(slice_value, ast.Tuple)
+            and slice_value.elts
+            and self.is_window_buffer_annotation(slice_value.elts[-1])
+        ):
+            window = self.resolve_window_buffer(slice_value.elts[-1])
+            tensor_ctor = cast(
+                Callable[..., ir.TensorType], partial(ir.DistributedTensorType, window_buffer=window)
+            )
+            slice_value = ast.copy_location(
+                ast.Tuple(elts=slice_value.elts[:-1], ctx=ast.Load()), slice_value
+            )
 
         valid_counts = (2, 3, 4) if is_tensor_like else (2, 3, 4, 5)
         if not isinstance(slice_value, ast.Tuple) or len(slice_value.elts) not in valid_counts:
@@ -503,6 +675,8 @@ class TypeResolver:
 
         shape = self._to_ir_shape(self._parse_shape(shape_node))
         dtype = self.resolve_dtype(dtype_node)
+        if window is not None:
+            shape = self._tile_shape_to_expr_list(shape)
 
         n_elts = len(slice_value.elts)
 
@@ -705,6 +879,7 @@ class TypeResolver:
             return None
         span = self._get_span(node)
 
+        inline = None
         # Two spellings reach here: a reference to a declared variable, and the
         # inline `pl.MemRef("name", slots=N)[k]` the printer emits for a dump.
         if isinstance(node.value, ast.Name):
@@ -744,6 +919,8 @@ class TypeResolver:
                 span=span,
                 hint=f"Subscript within [0, {slot_count}), or declare more slots",
             )
+        if inline is not None:
+            return ir.MemRef(inline.base_, 0, 0, span, is_pinned=True, slots=slot_count, slot=index)
         return self._make_declared_memref(decl_name, span, slots=slot_count, slot=index)
 
     def _resolve_slot_of_resolved_memref(
@@ -915,7 +1092,7 @@ class TypeResolver:
         slice_value = subscript_node.slice
         elts = slice_value.elts if isinstance(slice_value, ast.Tuple) else [slice_value]
 
-        types = []
+        types: list[ir.Type] = []
         for elt in elts:
             resolved = self.resolve_type(elt)
             if isinstance(resolved, list):
@@ -1029,9 +1206,8 @@ class TypeResolver:
     def _resolve_tuple_subscript_type(self, subscript_node: ast.Subscript) -> ir.TupleType:
         """Resolve pl.Tuple[T1, T2, ...] or pl.Tuple[()] annotation to ir.TupleType."""
         slice_value = subscript_node.slice
-        # Handle empty tuple: pl.Tuple[()]
-        if isinstance(slice_value, ast.Constant) and slice_value.value == ():
-            return ir.TupleType([])
+        # Handle empty tuple: pl.Tuple[()] — in parsed source ``()`` is always an
+        # ast.Tuple with zero elements, never an ast.Constant.
         if isinstance(slice_value, ast.Tuple) and len(slice_value.elts) == 0:
             return ir.TupleType([])
         elts = slice_value.elts if isinstance(slice_value, ast.Tuple) else [slice_value]
@@ -1048,11 +1224,11 @@ class TypeResolver:
         return ir.TupleType(self._resolve_tuple_element_types(call_node.args[0].elts))
 
     def _resolve_tuple_element_types(self, elts: Sequence[ast.expr]) -> list[ir.Type]:
-        """Resolve a sequence of AST type nodes into IR types, rejecting nested tuples."""
+        """Resolve tuple value elements; built-in tuple return lists are not value types."""
         types: list[ir.Type] = []
         for elt in elts:
             resolved = self.resolve_type(elt)
-            if isinstance(resolved, (list, ir.TupleType)):
+            if isinstance(resolved, list):
                 raise ParserTypeError(
                     "Nested tuple types are not supported",
                     span=self._get_span(elt),
@@ -1123,7 +1299,7 @@ class TypeResolver:
             )
 
         dims: list[int | ir.Expr] = []
-        for i, elem in enumerate(value):
+        for i, elem in enumerate(cast("Sequence[Any]", value)):
             if isinstance(elem, int):
                 dims.append(elem)
             elif isinstance(elem, DynVar):
@@ -1230,6 +1406,12 @@ class TypeResolver:
         ast.Mult: "mul",
         ast.FloorDiv: "floordiv",
         ast.Mod: "mod",
+        ast.Pow: "pow",
+        ast.BitAnd: "bit_and",
+        ast.BitOr: "bit_or",
+        ast.BitXor: "bit_xor",
+        ast.LShift: "bit_shift_left",
+        ast.RShift: "bit_shift_right",
     }
 
     @staticmethod
@@ -1255,29 +1437,78 @@ class TypeResolver:
     def _rebuild_composite_dim(self, node: ast.expr) -> ir.Expr | None:
         """Rebuild a composite shape dimension as an IR expression, no folding.
 
-        Handles int literals, names (closure/scope), ``pl.const(value, dtype)``
-        and binary +, -, *, //, % over those. Returns None for any other form.
+        Handles int literals, names (closure/scope), ``pl.const(value, dtype)``,
+        ``pl.tensor.dim`` reads, recorded calls, and arithmetic/bitwise integer
+        binary operators over those.
+        Returns None for any other form.
         """
         span = self._get_span(node)
         if isinstance(node, ast.Constant) and isinstance(node.value, int):
             return ir.ConstInt(node.value, DataType.INDEX, span)
+        if (
+            isinstance(node, ast.UnaryOp)
+            and isinstance(node.op, ast.USub)
+            and isinstance(node.operand, ast.Constant)
+            and isinstance(node.operand.value, int)
+        ):
+            return ir.ConstInt(-node.operand.value, DataType.INDEX, span)
         if isinstance(node, ast.Name):
             resolved = self._resolve_shape_dim(node)
             return ir.ConstInt(resolved, DataType.INDEX, span) if isinstance(resolved, int) else resolved
         if self._is_pl_const_call(node):
             call = cast(ast.Call, node)
-            if (
-                len(call.args) == 2
-                and isinstance(call.args[0], ast.Constant)
-                and isinstance(call.args[0].value, int)
-            ):
-                return ir.ConstInt(call.args[0].value, self.resolve_dtype(call.args[1]), span)
+            if len(call.args) == 2:
+                value = self._rebuild_composite_dim(call.args[0])
+                if isinstance(value, ir.ConstInt):
+                    return ir.ConstInt(value.value, self.resolve_dtype(call.args[1]), span)
+        if _is_dump_call(node, "call") and self._parse_expression is not None:
+            # Storage operands make even tensor.dim print as a recorded call.
+            # Restore its exact result type and metadata through the existing
+            # parser; ordinary calls retain the non-folding shape path below.
+            result = self._parse_expression(node)
+            if not _is_index_expr_type(result.type):
+                raise ParserTypeError(
+                    f"Shape dimension must be an integer scalar, got {result.type}: {ast.unparse(node)}",
+                    span=span,
+                )
+            return result
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "dim"
+            and isinstance(node.func.value, ast.Attribute)
+            and node.func.value.attr == "tensor"
+            and isinstance(node.func.value.value, ast.Name)
+            and node.func.value.value.id == "pl"
+        ):
+            return self._rebuild_tensor_dim(node)
         if isinstance(node, ast.BinOp) and type(node.op) in self._SHAPE_BINOPS:
             lhs = self._rebuild_composite_dim(node.left)
             rhs = self._rebuild_composite_dim(node.right)
             if lhs is None or rhs is None:
                 return None
             return getattr(ir, self._SHAPE_BINOPS[type(node.op)])(lhs, rhs, span)
+        return None
+
+    def _rebuild_tensor_dim(self, call: ast.Call) -> ir.Expr | None:
+        """Rebuild a pure dimension read with positional or keyword operands."""
+        if len(call.args) > 2 or self.scope_lookup is None:
+            return None
+        operands: dict[str, ast.expr] = dict(zip(("tensor", "axis"), call.args))
+        for keyword in call.keywords:
+            if keyword.arg not in {"tensor", "axis"} or keyword.arg in operands:
+                return None
+            operands[keyword.arg] = keyword.value
+        tensor_node = operands.get("tensor")
+        axis_node = operands.get("axis")
+        if not isinstance(tensor_node, ast.Name) or axis_node is None:
+            return None
+        # Reconstruct only this pure read, without evaluating arbitrary calls
+        # or applying the statement parser's dynamic-symbol fold.
+        tensor = self.scope_lookup(tensor_node.id)
+        axis = self._rebuild_composite_dim(axis_node)
+        if isinstance(tensor, ir.Expr) and isinstance(axis, ir.ConstInt):
+            return ir.create_op_call("tensor.dim", [tensor, axis], self._get_span(call))
         return None
 
     def _get_span(self, node: ast.AST) -> ir.Span:
@@ -1355,6 +1586,8 @@ class TypeResolver:
         if isinstance(dtype_node, ast.Attribute):
             dtype_name = dtype_node.attr
             if dtype_name in self._DTYPE_MAP:
+                if dtype_name == "FP4":
+                    _warn_incomplete_fp4()
                 return self._DTYPE_MAP[dtype_name]
 
             # Distinguish DataType.UNKNOWN from pl.UNKNOWN for error message quality
@@ -1377,6 +1610,8 @@ class TypeResolver:
         if isinstance(dtype_node, ast.Name):
             dtype_name = dtype_node.id
             if dtype_name in self._DTYPE_MAP:
+                if dtype_name == "FP4":
+                    _warn_incomplete_fp4()
                 return self._DTYPE_MAP[dtype_name]
 
             # Try evaluating via ExprEvaluator for DataType values from closure
@@ -1518,6 +1753,8 @@ class TypeResolver:
         inferred_type: ir.Type,
         var_name: str,
         span: ir.Span | None,
+        *,
+        _visited: dict[tuple[int, int], tuple[ir.Type, ir.Type]] | None = None,
     ) -> None:
         """Validate that a user-written type annotation is consistent with the inferred type.
 
@@ -1529,12 +1766,20 @@ class TypeResolver:
             inferred_type: Type inferred from the RHS expression
             var_name: Variable name for error messages
             span: Source span for error location
+            _visited: Internal memo retaining type pairs while traversing tuple DAGs
 
         Raises:
             ParserTypeError: If the annotation contradicts the inferred type
         """
         if isinstance(inferred_type, ir.UnknownType):
             return
+
+        if _visited is None:
+            _visited = {}
+        key = (id(annotation_type), id(inferred_type))
+        if key in _visited:
+            return
+        _visited[key] = (annotation_type, inferred_type)
 
         ann_kind = type(annotation_type)
         inf_kind = type(inferred_type)
@@ -1547,6 +1792,20 @@ class TypeResolver:
                 span=span,
                 hint=f"Change annotation to: {ir.python_print_type(inferred_type)}",
             )
+
+        if isinstance(annotation_type, ir.TupleType) and isinstance(inferred_type, ir.TupleType):
+            if len(annotation_type.types) != len(inferred_type.types):
+                raise ParserTypeError(
+                    f"Type annotation for '{var_name}' has {len(annotation_type.types)} tuple elements "
+                    f"but expression has {len(inferred_type.types)}",
+                    span=span,
+                    hint=f"Change annotation to: {ir.python_print_type(inferred_type)}",
+                )
+            for index, (ann, inf) in enumerate(zip(annotation_type.types, inferred_type.types)):
+                self.validate_annotation_consistency(
+                    ann, inf, f"{var_name}[{index}]", span, _visited=_visited
+                )
+            return
 
         # Check dtype for types that expose it (ScalarType and ShapedType)
         self._check_dtype_consistency(annotation_type, inferred_type, var_name, span)
@@ -1854,7 +2113,7 @@ class TypeResolver:
 
     def _tile_shape_to_expr_list(self, shape: "Sequence[int | ir.Expr]") -> "list[ir.Expr]":
         """Convert a tile shape (list of int or Expr) to a list of Expr for TileView.valid_shape."""
-        result = []
+        result: list[ir.Expr] = []
         for dim in shape:
             if isinstance(dim, int):
                 result.append(ir.ConstInt(dim, DataType.INDEX, ir.Span.unknown()))
@@ -1881,7 +2140,11 @@ class TypeResolver:
         attribute access, etc.) fall through to the same expression parser
         that the DSL uses everywhere else.
         """
-        val = self._try_resolve_int(node)
+        typed = self._contains_pl_const(node)
+        rebuilt = self._rebuild_composite_dim(node) if typed else None
+        if rebuilt is not None:
+            return rebuilt
+        val = None if typed else self._try_resolve_int(node)
         if val is not None:
             return ir.ConstInt(val, DataType.INDEX, self._get_span(node))
         if isinstance(node, ast.Name):
@@ -1933,8 +2196,10 @@ class TypeResolver:
             # Backstop: the delegated parser may still return non-Expr (e.g. None)
             # or non-index expressions (e.g. pl.tile.create(...) returns a Tile).
             # The C++ TileView contract is index expressions only.
-            if not isinstance(result, ir.Expr) or not _is_index_expr_type(result.type):
-                got = type(result).__name__ if not isinstance(result, ir.Expr) else type(result.type).__name__
+            # The isinstance pair is a deliberate backstop: the delegated parser's
+            # declared return type is a lie for a few DSL constructors.
+            if not isinstance(result, ir.Expr) or not _is_index_expr_type(result.type):  # pyright: ignore[reportUnnecessaryIsInstance]
+                got = type(result).__name__ if not isinstance(result, ir.Expr) else type(result.type).__name__  # pyright: ignore[reportUnnecessaryIsInstance]
                 raise ParserTypeError(
                     f"TileView field must be an index expression, got {got}: {ast.unparse(node)}",
                     span=self._get_span(node),
@@ -2064,6 +2329,12 @@ class TypeResolver:
         # multi-slot declaration so the dump reparses.
         if len(node.args) == 1 and all(kw.arg == "slots" for kw in node.keywords):
             name_node = node.args[0]
+            if isinstance(name_node, ast.Name) and self.scope_lookup is not None:
+                base = self.scope_lookup(name_node.id)
+                if isinstance(base, ir.Var) and isinstance(base.type, ir.PtrType):
+                    return ir.MemRef(
+                        base, 0, 0, span, is_pinned=True, slots=self._resolve_slots_kwarg(node, span)
+                    )
             if not (
                 isinstance(name_node, ast.Constant) and isinstance(name_node.value, str) and name_node.value
             ):
@@ -2180,9 +2451,13 @@ class TypeResolver:
 
     def _resolve_memref_byte_offset(self, node: ast.expr) -> "ir.Expr":
         """Resolve a MemRef byte_offset to an IR expression (int, variable, or arithmetic)."""
+        # Runtime pl.const returns a Python number. Rebuild explicitly typed
+        # offsets from syntax before constant evaluation loses their dtype.
+        if self._contains_pl_const(node):
+            return self._parse_tileview_expr(node)
         value = self._try_resolve_int(node)
         if value is not None:
-            return ir.ConstInt(value, DataType.INDEX, self._get_span(node))
+            return ir.ConstInt(value, DataType.INT64, self._get_span(node))
 
         # Try resolving as a variable reference (for symbolic offsets)
         if isinstance(node, ast.Name) and self.scope_lookup is not None:

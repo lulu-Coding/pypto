@@ -24,8 +24,11 @@ torch_codegen(node: _ir.Program | _ir.Function, check_shapes: bool = False) -> s
 
 - 保持 IR 到 Python 表达式/语句的可读映射
 - 尽量覆盖 tensor/tile 常见算子
+- 为 `kernel.lower()` 和 `CompiledProgram.validate_ir()` 执行默认稠密 Vec Buffer 传输与已开放的向量/标量算术（含 full），包括目标写入和存储别名；结构化控制流保留标量 yield 的同时赋值和已规划的 Tile carry 复制；普通 cube 操作模拟分形布局与共享物理存储，包括转置及较宽累加器的视图。 Buffer Pass dump 同时保留可读 Python 文本和无损 `.msgpack` 文件；Buffer 文本不是可执行 DSL，因此 `validate_ir()` 从后者重放。
 - 支持 cross-core `tpush/tpop` 的并发语义模拟
 - 对可疑输入提供可定位的错误信息（超时、split 维度不合法等）
+
+已寻址的 Vec 与 cube 分配在每个函数调用、每个内存空间中共享一个字节存储池。不同分配句柄的地址重叠时也会共享数据；不带地址的分配保持独立。窗口视图保留父行距，且各自持有独立的 valid 元数据。
 
 ### 非目标
 
@@ -125,7 +128,7 @@ preamble 中的辅助函数，为所有累加型 matmul 共用，因此它们都
 
 奇数 code 按 tile 的**运行时** valid extent 校验，而非物理 box：偶数 box 配奇数 valid
 extent（box 16、`valid_shape` 15）正是它们存在的场景。只有
-[LowerAutoVectorSplit](../passes/23-lower_auto_vector_split.md) 对 ragged 边界做了均分时
+[LowerAutoVectorSplit](../passes/24-lower_auto_vector_split.md) 对 ragged 边界做了均分时
 才会带上 `lane_stride`，此时运行时按该步长切分而不是按 box 折半。`push_to_aic` /
 `pop_from_aiv` 拒绝奇数 code，与 PTO codegen 一致——pto-isa 没有奇数的 Vector→Cube 传输。
 

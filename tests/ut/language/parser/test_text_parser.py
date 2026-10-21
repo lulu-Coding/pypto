@@ -29,7 +29,9 @@ def _span_begin(err: ParserError) -> tuple[int, int]:
     """
     sp = err.span
     assert sp is not None, "expected a span on the parser error"
-    return sp["begin_line"], sp["begin_column"]
+    begin_line, begin_column = sp["begin_line"], sp["begin_column"]
+    assert isinstance(begin_line, int) and isinstance(begin_column, int)
+    return begin_line, begin_column
 
 
 def _span_char_index(begin_column: int) -> int:
@@ -583,7 +585,9 @@ def bad(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
             pl.parse(code)
         err = exc_info.value
         assert err.span is not None
-        assert err.span["column"] > 0  # Not column 0 — points at 'BadType'
+        span = err.span
+        column = span["column"]
+        assert isinstance(column, int) and column > 0  # Not column 0 — points at 'BadType'
 
     def test_exec_error_column_points_at_non_ascii_attribute(self):
         """The bad-attribute column must survive a non-ASCII identifier.
@@ -604,9 +608,13 @@ def bad(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
             pl.parse(code)
         err = exc_info.value
         assert err.span is not None
-        line = code.split("\n")[err.span["begin_line"] - 1]
-        assert line[err.span["begin_column"] - 1 :].startswith("Bad_é_Type"), (
-            f"column {err.span['begin_column']} does not land on the attribute in {line!r}"
+        span = err.span
+        begin_line = span["begin_line"]
+        begin_column = span["begin_column"]
+        assert isinstance(begin_line, int) and isinstance(begin_column, int)
+        line = code.split("\n")[begin_line - 1]
+        assert line[begin_column - 1 :].startswith("Bad_é_Type"), (
+            f"column {begin_column} does not land on the attribute in {line!r}"
         )
 
     def test_exec_error_hint_lists_valid_values(self):
@@ -803,7 +811,9 @@ class Prog:
         begin_line, begin_column = _span_begin(err)
 
         # Module indexing: the span's line must resolve to the with pl.at line.
-        error_line = err.source_lines[begin_line - 1]
+        source_lines = err.source_lines
+        assert source_lines is not None
+        error_line = source_lines[begin_line - 1]
         assert "deps=" in error_line
         # The column must point exactly at the rejected `[seed_tid] + ...` value.
         assert error_line[_span_char_index(begin_column) :].startswith("[seed_tid]")
@@ -829,11 +839,78 @@ class Prog:
         err = exc_info.value
         begin_line, begin_column = _span_begin(err)
 
-        error_line = err.source_lines[begin_line - 1]
+        source_lines = err.source_lines
+        assert source_lines is not None
+        error_line = source_lines[begin_line - 1]
         assert "this_op_does_not_exist" in error_line
         assert error_line[_span_char_index(begin_column) :].startswith("pl.this_op_does_not_exist")
 
         _assert_caret_on_line(err, expected_substring="this_op_does_not_exist")
+
+
+@pytest.mark.parametrize("extent", ["8", "N"])
+@pytest.mark.parametrize("axis", [0, -2])
+@pytest.mark.parametrize("arguments", ["x, {axis}", "x, axis={axis}", "tensor=x, axis={axis}"])
+def test_tensor_dim_parameter_shape_roundtrips(extent, axis, arguments):
+    """Dependent annotations are parsed as IR, never evaluated as Python."""
+    dim_arguments = arguments.replace("{axis}", f"pl.const({axis}, pl.INDEX)")
+    source = f"""
+N = pl.dynamic("N")
+
+@pl.program
+class Before:
+    @pl.function(type=pl.FunctionType.InCore)
+    def main(self, x: pl.Tensor[[{extent}, 32], pl.FP32],
+             view: pl.Tensor[[pl.tensor.dim({dim_arguments}) * 2, 16], pl.FP32]):
+        return view
+"""
+    before = pl.parse(source)
+    printed = ir.python_print(before)
+    assert "pl.tensor.dim(" in printed
+    after = pl.parse(printed)
+    ir.assert_structural_equal(before, after)
+
+
+@pytest.mark.parametrize(
+    "setup, extent",
+    [
+        ("", "8"),
+        ("", "rows"),
+        ("n = pl.tensor.dim(x, 0)", "n * 3"),
+        ("n = pl.tensor.dim(x, 0)\n    n = rows", "n * 2"),
+    ],
+)
+def test_tensor_dim_annotation_keeps_unproven_inferred_shape(setup, extent):
+    """An annotation cannot replace a different or unproven runtime extent."""
+    source = f"""
+@pl.function(type=pl.FunctionType.InCore)
+def main(x: pl.Tensor[[8, 16], pl.FP32], rows: pl.Scalar[pl.INDEX]):
+    {setup}
+    view: pl.Tensor[[pl.tensor.dim(x, 0) * 2, 16], pl.FP32] = pl.reshape(x, [{extent}, 16])
+    return view
+"""
+    func = pl.parse(source)
+    assert isinstance(func, ir.Function)
+    assert isinstance(func.body, ir.SeqStmts)
+    assign = next(s for s in func.body.stmts if isinstance(s, ir.AssignStmt) and s.var.name_hint == "view")
+    ir.assert_structural_equal(assign.var.type, assign.value.type)
+
+
+@pytest.mark.parametrize("extent", ["8", "N"])
+def test_tensor_dim_annotation_recovers_flattened_read(extent):
+    """A direct dimension temporary proves the declarative shape unchanged."""
+    source = f"""
+N = pl.dynamic("N")
+@pl.function(type=pl.FunctionType.InCore)
+def main(x: pl.Tensor[[{extent}, 16], pl.FP32]):
+    n = pl.tensor.dim(x, 0)
+    view: pl.Tensor[[pl.tensor.dim(x, 0) * 2, 16], pl.FP32] = pl.reshape(x, [n * 2, 16])
+    return view
+"""
+    before = pl.parse(source)
+    printed = ir.python_print(before)
+    assert "view: pl.Tensor[[pl.tensor.dim(" in printed
+    ir.assert_structural_equal(before, pl.parse('N = pl.dynamic("N")\n' + printed))
 
 
 if __name__ == "__main__":

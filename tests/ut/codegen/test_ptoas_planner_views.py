@@ -10,7 +10,7 @@
 """PTO codegen under memory_planner=PTOAS: reserved buffers and view def/use types.
 
 With the PTOAS planner, `MemoryReuse` + `AllocateMemoryAddr` are skipped and ptoas
-`PlanMemory` owns on-chip placement (--pto-level=level2). Two things that the
+`PlanMemory` owns on-chip placement (--pto-level=level2). Contracts that the
 default PyPTO planner hides then have to be emitted correctly:
 
 * `system.reserve_buffer(base=AUTO)` never gets a resolved base, so PTO must emit
@@ -18,23 +18,29 @@ default PyPTO planner hides then have to be emitted correctly:
 * A view chain (`tile.slice` -> `tile.reshape`) no longer folds into per-variable
   `pto.alloc_tile` re-views at one baked address, so it survives as a real
   `pto.subview` + `pto.treshape` pair whose def/use type strings must agree.
+* Scratch-backed A2/A3 casts need static-valid views even when PlanMemory
+  materializes the scratch implicitly from a one-input `pto.tcvt`.
 """
 
 import re
+from pathlib import Path
 
 import pypto.language as pl
 import pytest
 from _pto_loc_common import strip_loc
 from pypto import ir as _ir
-from pypto.backend import BackendType, reset_for_testing, set_backend_type
+from pypto.backend import BackendType, pto_backend, reset_for_testing, set_backend_type
+from pypto.backend._ptoas_locate import find_ptoas_binary
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 from pypto.pypto_core import codegen, passes
 
 
 def _run_passes(program, planner: passes.MemoryPlanner):
     reset_for_testing()
-    set_backend_type(BackendType.Ascend910B)
-    with passes.PassContext([], memory_planner=planner):
+    set_backend_type(BackendType.Ascend910)
+    # These regressions exercise the legacy Tile emitter's planner-dependent
+    # alias forms. Default Buffer views have separate selection/native tests.
+    with passes.PassContext([], memory_planner=planner, enable_buffer_ir=False):
         return PassManager.get_strategy(OptimizationStrategy.Default).run_passes(program)
 
 
@@ -159,26 +165,254 @@ class InplaceFillPadProgram:
         return pl.store(padded, [0, 0], out)
 
 
-def test_inplace_alias_keeps_shared_handle_definition_type():
-    """An alias result must not re-type the already-defined shared tile_buf SSA.
-
-    PTOAS mode collapses ``src`` and ``padded`` onto one handle because
-    ``tile.fillpad_inplace`` reuses its input MemRef. The result TileType carries
-    new pad metadata, but MLIR SSA types are fixed by the original alloc_tile
-    definition, so every later use of that handle must retain the definition's
-    annotation.
-    """
-    mlir = _emit_pto(InplaceFillPadProgram, passes.MemoryPlanner.PTOAS)
-    alloc = _sole_line(mlir, "= pto.alloc_tile")
+def _assert_fillpad_view(mlir: str, pad: int) -> None:
+    """The input handle stays immutable; a typed alias carries the full result."""
     fillpad = _sole_line(mlir, "pto.tfillpad")
+    src_type, dst_type = _tile_buf_types(fillpad)
+    assert "pad=0>" in src_type, fillpad
+    assert f"pad={pad}>" in dst_type, fillpad
+    assert "v_row=?, v_col=?" in dst_type, fillpad
+    src = re.search(r"ins\((%[\w.$]+)", fillpad)
+    dst = re.search(r"outs\((%[\w.$]+)", fillpad)
+    assert src and dst, fillpad
+    assert src[1] != dst[1], fillpad
+    view = _sole_line(mlir, f"{dst[1]} = pto.treshape")
+    assert f"pto.treshape {src[1]} : {src_type} -> {dst_type}" in view, view
+    initialized = f"pto.set_validshape {dst[1]}, %c64_index, %c64_index : {dst_type}"
+    assert initialized in mlir and mlir.index(initialized) < mlir.index(fillpad.strip()), mlir
     store = _sole_line(mlir, "pto.tstore")
+    assert f"ins({dst[1]} : {dst_type})" in store, store
+    assert mlir.count("= pto.alloc_tile") == 1, mlir
 
-    alloc_types = _tile_buf_types(alloc)
-    fillpad_types = _tile_buf_types(fillpad)
-    store_types = _tile_buf_types(store)
-    assert len(alloc_types) == 1 and len(fillpad_types) == 2 and len(store_types) == 1, mlir
-    assert fillpad_types == [alloc_types[0], alloc_types[0]], f"{alloc}\n{fillpad}"
-    assert store_types == alloc_types, f"{alloc}\n{store}"
+
+@pytest.mark.ptoas_compile
+def test_inplace_alias_preserves_output_view(tmp_path: Path):
+    """Dynamic input validity must not erase the padded result's type (#2869)."""
+    mlir = _emit_pto(InplaceFillPadProgram, passes.MemoryPlanner.PTOAS)
+    fillpad = _sole_line(mlir, "pto.tfillpad")
+    src_type, dst_type = _tile_buf_types(fillpad)
+    assert "pad=0>" in src_type, fillpad
+    assert "pad=1>" in dst_type, fillpad
+    assert "v_row=?, v_col=?" in src_type, fillpad
+    assert "v_row=?, v_col=?" in dst_type, fillpad
+    view = _sole_line(mlir, "= pto.treshape")
+    assert view.endswith(f"-> {dst_type}"), view
+    dst = re.search(r"outs\((%[\w.$]+)", fillpad)
+    assert dst and f"pto.set_validshape {dst[1]}, %c16_index, %c16_index" in mlir, mlir
+    store = _sole_line(mlir, "pto.tstore")
+    assert _tile_buf_types(store) == [dst_type], store
+    assert mlir.count("= pto.alloc_tile") == 1, mlir
+    _compile_fillpad(mlir, tmp_path, passes.MemoryPlanner.PTOAS)
+
+
+def _compile_fillpad(mlir: str, tmp_path: Path, planner: passes.MemoryPlanner) -> None:
+    if find_ptoas_binary() is None:
+        pytest.skip("PTOAS is not available")
+    cpp = pto_backend._compile_pto_module(mlir, "kernel", str(tmp_path), memory_planner=planner)
+    assert "TFILLPAD<pto::TFillPadMode::InPlace>" in cpp, cpp
+
+
+@pytest.mark.ptoas_compile
+@pytest.mark.parametrize("pad_value", [pl.PadValue.zero, pl.PadValue.max, pl.PadValue.min])
+@pytest.mark.parametrize("backend_type", [BackendType.Ascend910B, BackendType.Ascend950])
+@pytest.mark.parametrize(
+    "planner", [passes.MemoryPlanner.PTOAS, passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.DSA_RP]
+)
+def test_fillpad_inplace_native(
+    tmp_path: Path, pad_value: pl.PadValue, backend_type: BackendType, planner: passes.MemoryPlanner
+):
+    """The original partial-row fill compiles to the in-place ISA form."""
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self, x: pl.Tensor[[48, 64], pl.FP32], out: pl.Out[pl.Tensor[[64, 64], pl.FP32]]
+        ) -> pl.Tensor[[64, 64], pl.FP32]:
+            src = pl.load(x, [0, 0], [64, 64], valid_shape=[48, 64])
+            padded = pl.tile.fillpad_inplace(src, pad_value=pad_value)
+            return pl.store(padded, [0, 0], out)
+
+    reset_for_testing()
+    set_backend_type(backend_type)
+    with passes.PassContext([], memory_planner=planner):
+        optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Program)
+    mlir = codegen.PTOCodegen().generate(optimized, emit_tile_addr=planner != passes.MemoryPlanner.PTOAS)
+    if planner == passes.MemoryPlanner.PTOAS:
+        _assert_fillpad_view(mlir, pad_value.value)
+    _compile_fillpad(mlir, tmp_path, planner)
+
+
+@pl.program
+class FillpadSubviewProgram:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(
+        self,
+        x: pl.Tensor[[128, 64], pl.FP32],
+        rows: pl.Scalar[pl.INDEX],
+        cols: pl.Scalar[pl.INDEX],
+        out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+    ) -> pl.Tensor[[64, 64], pl.FP32]:
+        src = pl.load(x, [0, 0], [128, 64])
+        window = pl.tile.slice(src, [64, 64], [32, 0], valid_shape=[rows, cols])
+        padded = pl.tile.fillpad_inplace(window, pad_value=pl.PadValue.zero)
+        alias = padded
+        return pl.store(alias, [0, 0], out)
+
+
+@pl.program
+class FillpadLoopProgram:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(
+        self,
+        x: pl.Tensor[[16, 16], pl.FP32],
+        rows: pl.Scalar[pl.INDEX],
+        cols: pl.Scalar[pl.INDEX],
+        out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+    ) -> pl.Tensor[[16, 16], pl.FP32]:
+        src = pl.load(x, [0, 0], [16, 16], valid_shape=[rows, cols])
+        seed = pl.tile.fillpad_inplace(src, pad_value=pl.PadValue.zero)
+        for i, (carry,) in pl.range(2, init_values=(seed,)):
+            padded = pl.tile.fillpad_inplace(carry, pad_value=pl.PadValue.zero)
+            result = pl.yield_(padded)
+        return pl.store(result, [0, 0], out)
+
+
+@pl.program
+class FillpadBranchProgram:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(
+        self,
+        x: pl.Tensor[[16, 16], pl.FP32],
+        rows: pl.Scalar[pl.INDEX],
+        cols: pl.Scalar[pl.INDEX],
+        out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+    ) -> pl.Tensor[[16, 16], pl.FP32]:
+        src = pl.load(x, [0, 0], [16, 16], valid_shape=[rows, cols])
+        if rows < 8:
+            padded = pl.tile.fillpad_inplace(src, pad_value=pl.PadValue.zero)
+            result = pl.yield_(padded)
+        else:
+            narrowed = pl.tile.set_validshape(src, 8, cols)
+            other = pl.tile.fillpad_inplace(narrowed, pad_value=pl.PadValue.zero)
+            result = pl.yield_(other)
+        return pl.store(result, [0, 0], out)
+
+
+@pytest.mark.ptoas_compile
+@pytest.mark.parametrize("program", [FillpadSubviewProgram, FillpadLoopProgram, FillpadBranchProgram])
+def test_fillpad_inplace_composed_views(tmp_path: Path, program):
+    """Rebound padded handles survive subviews, valid updates, and control flow."""
+    mlir = _emit_pto(program, passes.MemoryPlanner.PTOAS)
+    fillpads = [line for line in mlir.splitlines() if "pto.tfillpad" in line]
+    assert fillpads, mlir
+    for line in fillpads:
+        dst_type = _tile_buf_types(line)[1]
+        assert "pad=1>" in dst_type, line
+        if "v_row=?" in dst_type:
+            dst = re.search(r"outs\((%[\w.$]+)", line)
+            assert dst and f"pto.set_validshape {dst[1]}, %c16_index, %c16_index" in mlir, mlir
+        else:
+            assert "v_col=?" not in dst_type, line
+    _compile_fillpad(mlir, tmp_path, passes.MemoryPlanner.PTOAS)
+
+
+@pytest.mark.ptoas_compile
+@pytest.mark.parametrize("dynamic_bounds", [False, True])
+@pytest.mark.parametrize("backend_type", [BackendType.Ascend910B, BackendType.Ascend950])
+@pytest.mark.parametrize(
+    "planner", [passes.MemoryPlanner.PTOAS, passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.DSA_RP]
+)
+def test_fillpad_inplace_then_set_validshape(tmp_path: Path, dynamic_bounds, backend_type, planner):
+    """Narrowing the padded handle must also affect uses of its original alias."""
+
+    @pl.program
+    class DynamicBounds:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            x: pl.Tensor[[48, 64], pl.FP32],
+            rows: pl.Scalar[pl.INDEX],
+            cols: pl.Scalar[pl.INDEX],
+            out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+        ) -> pl.Tensor[[64, 64], pl.FP32]:
+            src = pl.load(x, [0, 0], [64, 64], valid_shape=[48, 64])
+            padded = pl.tile.fillpad_inplace(src, pad_value=pl.PadValue.zero)
+            _narrowed = pl.tile.set_validshape(padded, rows, cols)
+            # Use the pre-update alias: set_validshape mutates that same handle.
+            repadded = pl.tile.fillpad_inplace(padded, pad_value=pl.PadValue.max)
+            return pl.store(repadded, [0, 0], out)
+
+    @pl.program
+    class StaticBounds:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self, x: pl.Tensor[[48, 64], pl.FP32], out: pl.Out[pl.Tensor[[64, 64], pl.FP32]]
+        ) -> pl.Tensor[[64, 64], pl.FP32]:
+            src = pl.load(x, [0, 0], [64, 64], valid_shape=[48, 64])
+            padded = pl.tile.fillpad_inplace(src, pad_value=pl.PadValue.zero)
+            _narrowed = pl.tile.set_validshape(padded, 32, 48)
+            repadded = pl.tile.fillpad_inplace(padded, pad_value=pl.PadValue.max)
+            return pl.store(repadded, [0, 0], out)
+
+    reset_for_testing()
+    set_backend_type(backend_type)
+    with passes.PassContext([], memory_planner=planner):
+        optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(
+            DynamicBounds if dynamic_bounds else StaticBounds
+        )
+    mlir = codegen.PTOCodegen().generate(optimized, emit_tile_addr=planner != passes.MemoryPlanner.PTOAS)
+    fillpads = [line for line in mlir.splitlines() if "pto.tfillpad" in line]
+    assert len(fillpads) == 2, mlir
+    first_dst = re.search(r"outs\((%[\w.$]+)", fillpads[0])
+    second_src = re.search(r"ins\((%[\w.$]+)", fillpads[1])
+    assert first_dst and second_src and first_dst[1] == second_src[1], mlir
+    assert "v_row=?, v_col=?" in _tile_buf_types(fillpads[0])[1], mlir
+    assert f"pto.set_validshape {first_dst[1]}," in mlir, mlir
+    _compile_fillpad(mlir, tmp_path, planner)
+
+
+@pytest.mark.ptoas_compile
+@pytest.mark.parametrize("backend_type", [BackendType.Ascend910B, BackendType.Ascend950])
+@pytest.mark.parametrize(
+    "planner", [passes.MemoryPlanner.PTOAS, passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.DSA_RP]
+)
+def test_fillpad_branch_result_then_set_validshape(tmp_path: Path, backend_type, planner):
+    """A phi buffer declared at function entry must retain mutable validity."""
+
+    @pl.program
+    class BranchResult:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            x: pl.Tensor[[48, 64], pl.FP32],
+            rows: pl.Scalar[pl.INDEX],
+            out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+        ) -> pl.Tensor[[64, 64], pl.FP32]:
+            if rows < 32:
+                left = pl.load(x, [0, 0], [64, 64], valid_shape=[48, 64])
+                merged = pl.yield_(left)
+            else:
+                right = pl.load(x, [0, 0], [64, 64], valid_shape=[48, 64])
+                merged = pl.yield_(right)
+            padded = pl.tile.fillpad_inplace(merged, pad_value=pl.PadValue.zero)
+            _narrowed = pl.tile.set_validshape(padded, rows, 48)
+            repadded = pl.tile.fillpad_inplace(padded, pad_value=pl.PadValue.max)
+            return pl.store(repadded, [0, 0], out)
+
+    reset_for_testing()
+    set_backend_type(backend_type)
+    with passes.PassContext([], memory_planner=planner):
+        optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(BranchResult)
+    mlir = codegen.PTOCodegen().generate(optimized, emit_tile_addr=planner != passes.MemoryPlanner.PTOAS)
+    assert "scf.if" in mlir, mlir
+    fillpads = [line for line in mlir.splitlines() if "pto.tfillpad" in line]
+    assert len(fillpads) == 2, mlir
+    first_dst = re.search(r"outs\((%[\w.$]+)", fillpads[0])
+    second_src = re.search(r"ins\((%[\w.$]+)", fillpads[1])
+    assert first_dst and second_src and first_dst[1] == second_src[1], mlir
+    assert "v_row=?, v_col=?" in _tile_buf_types(fillpads[0])[1], mlir
+    _compile_fillpad(mlir, tmp_path, planner)
 
 
 # Reshape of a subview: def/use tile_buf types must agree
@@ -261,7 +495,7 @@ def test_dsa_rp_writeback_preserves_nonzero_view_offset():
     """Physical placement shifts a view by its original relative byte offset."""
 
     reset_for_testing()
-    set_backend_type(BackendType.Ascend910B)
+    set_backend_type(BackendType.Ascend910)
     with passes.PassContext([], memory_planner=passes.MemoryPlanner.DSA_RP):
         optimized = passes.allocate_memory_addr()(
             passes.materialize_semantic_aliases()(passes.init_mem_ref()(NonzeroSubviewProgram))
@@ -446,6 +680,114 @@ def test_transposed_matmul_operand_is_a_re_view_under_pypto_planner():
     assert "blayout=row_major, slayout=col_major" in decl, decl
 
 
+# ── a transposed operand may not come from a Mat *window* ────────────────────
+
+PARENT_ROWS, WINDOW_ROWS = 512, 64
+
+
+@pl.program
+class MatmulBTransOverSliceProgram:
+    """`b_trans=True` on a `tile.slice` of a Mat-resident parent.
+
+    The window is selected per iteration, so its offset is a runtime value and the
+    slice reaches codegen as a `pto.subview`.
+    """
+
+    @pl.function
+    def kernel(
+        self,
+        query: pl.Tensor[[PARENT_ROWS, QK], pl.INT8],
+        key: pl.Tensor[[QM, QK], pl.INT8],
+        out: pl.Out[pl.Tensor[[QM, WINDOW_ROWS], pl.INT32]],
+    ) -> pl.Tensor[[QM, WINDOW_ROWS], pl.INT32]:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="qk_window"):
+            query_all = pl.slice(query, [PARENT_ROWS, QK], [0, 0])
+            for q in pl.range(PARENT_ROWS // WINDOW_ROWS):
+                window = pl.slice(query_all, [WINDOW_ROWS, QK], [q * WINDOW_ROWS, 0])
+                out[:, :] = pl.matmul(key[:, :], window, out_dtype=pl.INT32, b_trans=True)
+        return out
+
+
+@pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.PTOAS])
+def test_transposed_matmul_operand_over_a_mat_slice_is_rejected(planner):
+    """A transposed view of a Mat window has no lowering, and must not be aliased.
+
+    `tile.transpose_view` is a zero-copy relabel of a whole buffer. Its source
+    here is a `pto.subview`, which carries a runtime offset and the *parent's* row
+    pitch — and neither of the op's two lowerings can express that. ptoas refuses
+    a mat-source `pto.tmov` on a view ("matching src/dst shapes") and refuses a
+    `pto.treshape` on one at every destination size ("same total byte size").
+
+    Left alone, the PyPTO planner took the no-op branch and the result's own
+    `pto.alloc_tile` landed at the *parent's base* with the *window's* extent: a
+    dynamic slice offset cannot fold into a constant `addr`, and the parent pitch
+    is absent from the alloc's type. The matmul then read the same wrong bytes on
+    every iteration, silently. Reject at codegen instead, under both planners.
+    """
+    with pytest.raises(ValueError, match="cannot be taken from a slice of an on-chip Mat tile"):
+        _emit_incore_pto(MatmulBTransOverSliceProgram, planner)
+
+
+@pl.program
+class MatmulBTransOverIdentitySliceProgram:
+    """`b_trans=True` on a slice covering its Mat parent's FULL extent at [0, 0].
+
+    Same bytes, same pitch, same address as the parent — the one window a
+    transpose loses nothing on.
+    """
+
+    @pl.function
+    def kernel(
+        self,
+        query: pl.Tensor[[KN, QK], pl.INT8],
+        key: pl.Tensor[[QM, QK], pl.INT8],
+        out: pl.Out[pl.Tensor[[QM, KN], pl.INT32]],
+    ) -> pl.Tensor[[QM, KN], pl.INT32]:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="qk_identity"):
+            query_all = pl.slice(query, [KN, QK], [0, 0])
+            key_tile = pl.slice(key, [QM, QK], [0, 0])
+            window = pl.slice(query_all, [KN, QK], [0, 0])
+            out[:, :] = pl.matmul(key_tile, window, out_dtype=pl.INT32, b_trans=True)
+        return out
+
+
+@pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.PTOAS])
+def test_transposed_matmul_operand_over_an_identity_mat_slice_is_folded(planner):
+    """An identity window keeps working, and folds back to its parent.
+
+    A full-extent slice at a constant `[0, 0]` offset names exactly the source's
+    bytes with the source's own pitch, so the guard above must not reject it --
+    `FlattenTileNdTo2D` emits one per page for a leading-dim-1 batch, making this
+    ordinary input rather than a degenerate case.
+
+    Folding to the parent (rather than merely exempting the window) is what keeps
+    the PTOAS planner correct too: with no baked address the transpose falls back
+    to `pto.treshape`, which ptoas refuses against a `pto.subview` source however
+    identity it is, but accepts against the parent's dense handle.
+    """
+    mlir = _emit_incore_pto(MatmulBTransOverIdentitySliceProgram, planner)
+
+    right_mov = _tmov_into(mlir, "loc=right")
+    transposed = "blayout=row_major, slayout=col_major"
+
+    if planner is passes.MemoryPlanner.PTOAS:
+        treshape = _sole_line(mlir, "pto.treshape")
+        # Reads the parent's own handle, never the `pto.subview` SSA.
+        source = treshape.split("pto.treshape ", 1)[1].split(" ", 1)[0]
+        assert not source.startswith("%slice_view"), (
+            f"the identity window must fold back to its parent, got {source}:\n{mlir}"
+        )
+        assert "blayout=col_major, slayout=row_major" in _operand_type(treshape), treshape
+        assert transposed in _result_type(treshape), treshape
+        assert f"ins({treshape.split('=', 1)[0].strip()} " in right_mov, f"{treshape}\n{right_mov}"
+    else:
+        # Default planner: the transposed alias is a second alloc_tile, as for a
+        # whole Mat load — no reinterpret is needed at all.
+        assert "pto.treshape" not in mlir, mlir
+        src = right_mov.split("ins(", 1)[1].split(" ", 1)[0]
+        assert transposed in _sole_line(mlir, f"{src} = pto.alloc_tile"), mlir
+
+
 # ── pto.treshape results must carry STATIC valid dims ────────────────────────
 
 COLVEC_ROWS = 16
@@ -518,6 +860,270 @@ def test_colvec_reshape_folds_away_under_pypto_planner():
     mlir = _emit_incore_pto(ColVectorMulProgram, passes.MemoryPlanner.PYPTO)
     assert "pto.treshape" not in mlir, mlir
     assert "= pto.alloc_tile addr = " in mlir, mlir
+
+
+# ── lane-1 replay sentinel: a static zero valid has no pto-isa overload ──────
+
+SENTINEL_ROWS, SENTINEL_COLS = 16, 8
+
+
+@pl.program
+class ZeroValidSentinelReinterpretProgram:
+    """A view over SplitVectorKernel's lane-1 sentinel, whose valid dims are both 0.
+
+    `WithZeroValidShape` stamps that `[0, 0]` onto every cloned lane-1 op, so any
+    view taken in the replay lane reaches codegen with an all-zero valid_shape.
+    """
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(
+        self,
+        out: pl.Out[pl.Tensor[[SENTINEL_ROWS, SENTINEL_COLS], pl.INT32]],
+    ) -> pl.Tensor[[SENTINEL_ROWS, SENTINEL_COLS], pl.INT32]:
+        sentinel: pl.Tile[
+            [SENTINEL_ROWS, SENTINEL_COLS], pl.FP32, pl.MemorySpace.Vec, pl.TileView(valid_shape=[0, 0])
+        ] = pl.tile.create([SENTINEL_ROWS, SENTINEL_COLS], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+        view: pl.Tile[[SENTINEL_ROWS, SENTINEL_COLS], pl.INT32] = pl.tile.reinterpret_view(sentinel, pl.INT32)
+        return pl.store(view, [0, 0], out)
+
+
+def test_zero_valid_sentinel_treshape_keeps_a_dynamic_valid():
+    """Regression for #2870: a `pto.treshape` view must not bake the lane-1 zero.
+
+    ptoas accepts a static `v_row=0, v_col=0` and default-constructs the tile from
+    the result type, which lands in the generated C++ as `pto::Tile<..., 0, 0, ...>`.
+    pto-isa declares `GetValidRow` / `GetValidCol` only for a static mask `> 0` and
+    for `DYNAMIC`, so that instantiation matches no overload and ccec cannot compile
+    it. Rendering the valid dynamic gives a runtime-zero extent that compiles, and
+    the replay lane discards the result either way.
+
+    The physical `rows` / `cols` must stay static — only the valid extent defers.
+    """
+    mlir = _emit_pto(ZeroValidSentinelReinterpretProgram, passes.MemoryPlanner.PTOAS)
+    treshape = _sole_line(mlir, "pto.treshape")
+    result = _result_type(treshape)
+
+    assert "v_row=0" not in result and "v_col=0" not in result, (
+        "the lane-1 [0, 0] sentinel must not become a static zero valid on the "
+        f"treshape result (pto-isa has no GetValidRow overload for it); got:\n{treshape}"
+    )
+    assert "v_row=?" in result and "v_col=?" in result, (
+        f"expected a dynamic valid on the sentinel view; got:\n{treshape}"
+    )
+    assert f"rows={SENTINEL_ROWS}, cols={SENTINEL_COLS}" in result, (
+        f"the physical shape must stay static; got:\n{treshape}"
+    )
+
+
+@pytest.mark.ptoas_compile
+@pytest.mark.parametrize("backend_type", [BackendType.Ascend910B, BackendType.Ascend950])
+def test_fillpad_same_mode_after_validshape_update(tmp_path: Path, backend_type: BackendType):
+    """Equal tile types must not merge independently initialized valid extents."""
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self, x: pl.Tensor[[48, 64], pl.FP32], out: pl.Out[pl.Tensor[[64, 64], pl.FP32]]
+        ) -> pl.Tensor[[64, 64], pl.FP32]:
+            src = pl.load(x, [0, 0], [64, 64], valid_shape=[48, 64])
+            padded = pl.tile.fillpad_inplace(src, pad_value=pl.PadValue.zero)
+            _narrowed = pl.tile.set_validshape(padded, 32, 48)
+            # The source handle is still narrowed even though its SSA type did
+            # not change. A second zero fill needs its own full-valid result.
+            repadded = pl.tile.fillpad_inplace(padded, pad_value=pl.PadValue.zero)
+            return pl.store(repadded, [0, 0], out)
+
+    reset_for_testing()
+    set_backend_type(backend_type)
+    with passes.PassContext([], memory_planner=passes.MemoryPlanner.PTOAS):
+        optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Program)
+    mlir = codegen.PTOCodegen().generate(optimized, emit_tile_addr=False)
+    fillpads = [strip_loc(line) for line in mlir.splitlines() if "pto.tfillpad" in line]
+    assert len(fillpads) == 2, mlir
+    first_dst = re.search(r"outs\((%[\w.$]+)", fillpads[0])
+    second_src = re.search(r"ins\((%[\w.$]+)", fillpads[1])
+    second_dst = re.search(r"outs\((%[\w.$]+)", fillpads[1])
+    assert first_dst and second_src and second_dst, mlir
+    assert first_dst[1] == second_src[1] != second_dst[1], mlir
+    src_type, dst_type = _tile_buf_types(fillpads[1])
+    assert src_type == dst_type, fillpads[1]
+    assert "pad=1>" in dst_type and "v_row=?, v_col=?" in dst_type, dst_type
+    narrowed = f"pto.set_validshape {second_src[1]}, %c32_index, %c48_index : {src_type}"
+    initialized = f"pto.set_validshape {second_dst[1]}, %c64_index, %c64_index : {dst_type}"
+    assert narrowed in mlir and initialized in mlir, mlir
+    assert mlir.index(narrowed) < mlir.index(initialized) < mlir.index(fillpads[1]), mlir
+    assert f"ins({second_dst[1]} : {dst_type})" in _sole_line(mlir, "pto.tstore"), mlir
+    assert mlir.count("= pto.alloc_tile") == 1, mlir
+    _compile_fillpad(mlir, tmp_path, passes.MemoryPlanner.PTOAS)
+
+
+@pytest.mark.parametrize("backend_type", [BackendType.Ascend910B, BackendType.Ascend950], ids=["a2a3", "a5"])
+@pytest.mark.parametrize("planner", list(passes.MemoryPlanner), ids=lambda planner: planner.name)
+@pytest.mark.parametrize(
+    "src_dtype,dst_dtype",
+    [(pl.FP32, pl.INT16), (pl.FP16, pl.INT16), (pl.FP16, pl.INT8), (pl.FP16, pl.UINT8)],
+    ids=["f32-i16", "f16-i16", "f16-i8", "f16-u8"],
+)
+@pytest.mark.parametrize("saturation_mode", ["off", "on"])
+@pytest.mark.parametrize("rows,valid_rows,valid_cols", [(1, 1, 128), (4, 3, 96)], ids=["full", "partial"])
+def test_tcvt_planner_scratch_views(
+    tmp_path, backend_type, planner, src_dtype, dst_dtype, saturation_mode, rows, valid_rows, valid_cols
+):
+    """Implicit scratch needs the same static validity as explicit level-3 scratch.
+
+    The original regression is the full f16-i8/OFF case on A2/A3 with PTOAS.
+    Partial tiles distinguish actual validity from physical capacity; neither
+    padding nor a larger physical extent may become input to the conversion.
+    """
+
+    @pl.program
+    class CastProgram:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self, src: pl.Tensor[[rows, 128], src_dtype], out: pl.Out[pl.Tensor[[rows, 128], dst_dtype]]
+        ):
+            tile = pl.load(src, [0, 0], [rows, 128], valid_shape=[valid_rows, valid_cols])
+            converted = pl.cast(tile, dst_dtype, mode="trunc", saturation_mode=saturation_mode)
+            return pl.store(converted, [0, 0], out)
+
+    native = find_ptoas_binary() is not None
+    with passes.PassContext([], memory_planner=planner):
+        _ir.compile(
+            CastProgram,
+            output_dir=str(tmp_path),
+            backend_type=backend_type,
+            skip_ptoas=not native,
+            dump_passes=False,
+        )
+    # Without PTOAS, compile writes raw MLIR as the kernel output rather than
+    # an assembler intermediate. Keep the structural assertions in both modes.
+    mlir_path = "ptoas/kernel.pto" if native else "kernels/aiv/kernel.pto"
+    mlir = (tmp_path / mlir_path).read_text()
+    tcvt = _sole_line(mlir, "pto.tcvt")
+    needs_scratch = backend_type == BackendType.Ascend910B and saturation_mode == "off"
+    explicit = needs_scratch and planner != passes.MemoryPlanner.PTOAS
+    assert ("tcvt_tmp_view" in tcvt) == explicit, tcvt
+    assert ("tcvt_src_view" in tcvt) == needs_scratch, tcvt
+    assert mlir.count("pto.alloc_tile") == (3 if explicit else 2), mlir
+    assert (" addr = " in mlir) == (planner != passes.MemoryPlanner.PTOAS), mlir
+    if needs_scratch:
+        assert "v_row=?" not in tcvt and "v_col=?" not in tcvt, tcvt
+        types = _tile_buf_types(tcvt)
+        for tile_type in (types[0], types[-1]):
+            assert f"v_row={valid_rows}, v_col={valid_cols}" in tile_type, tcvt
+    if native:
+        assert "TCVT(" in (tmp_path / "ptoas/kernel.cpp").read_text()
+
+
+@pytest.mark.ptoas_compile
+@pytest.mark.parametrize(
+    "planner", [passes.MemoryPlanner.PTOAS, passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.DSA_RP]
+)
+@pytest.mark.parametrize("valid_cols", [128, 96])
+def test_tcvt_rank_one_with_explicit_scratch(tmp_path: Path, planner, valid_cols):
+    """Caller-owned scratch must not inherit compiler scratch's 2D restriction."""
+
+    @pl.program
+    class CastProgram:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            src: pl.Tensor[[128], pl.FP16],
+            out: pl.Out[pl.Tensor[[1, 128], pl.INT8]],
+        ) -> pl.Tensor[[1, 128], pl.INT8]:
+            tile = pl.tile.load(src, [0], [128], valid_shape=[valid_cols], target_memory=pl.Mem.Vec)
+            # Deliberately larger and a different dtype than synthesized INT8 scratch.
+            tmp = pl.tile.create([1, 256], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+            converted = pl.tile.cast(tile, pl.INT8, mode="trunc", tmp=tmp, saturation_mode="off")
+            # Store requires 2D validity; normalize only after the rank-one cast.
+            converted_2d = pl.tile.reshape(converted, [1, 128])
+            return pl.tile.store(converted_2d, [0, 0], out)
+
+    reset_for_testing()
+    set_backend_type(BackendType.Ascend910B)
+    # Keep rank-one tiles at codegen entry; the default pipeline would first
+    # normalize their geometry and conceal this explicit-scratch regression.
+    with passes.PassContext([], memory_planner=planner):
+        optimized = passes.init_mem_ref()(CastProgram)
+        if planner != passes.MemoryPlanner.PTOAS:
+            optimized = passes.allocate_memory_addr()(optimized)
+
+    casts: list[_ir.Call] = []
+
+    class CastCollector(_ir.IRVisitor):
+        def visit_call(self, op: _ir.Call) -> None:
+            if op.op.name == _ir.get_op("tile.cast").name:
+                casts.append(op)
+            super().visit_call(op)
+
+    CastCollector().visit_program(optimized)
+    assert len(casts) == 1 and len(casts[0].args) == 2
+    source_type = casts[0].args[0].type
+    assert isinstance(source_type, _ir.TileType) and source_type.shape == [128]
+    mlir = codegen.PTOCodegen().generate(optimized, emit_tile_addr=planner != passes.MemoryPlanner.PTOAS)
+    tcvt = _sole_line(mlir, "pto.tcvt")
+    assert "tcvt_tmp_view" in tcvt, tcvt
+    scratch_allocs = [line for line in mlir.splitlines() if "pto.alloc_tile" in line and "dtype=f32" in line]
+    assert len(scratch_allocs) == 1, mlir
+    src_type, tmp_type, dst_type = _tile_buf_types(tcvt)
+    for tile_type in (src_type, dst_type):
+        assert "rows=1, cols=128" in tile_type, tcvt
+        assert f"v_row=1, v_col={valid_cols}" in tile_type, tcvt
+    assert "dtype=f32" in tmp_type and "rows=1, cols=256" in tmp_type, tcvt
+    assert "v_row=1, v_col=256" in tmp_type, tcvt
+    if find_ptoas_binary() is None:
+        pytest.skip("PTOAS is not available")
+    cpp = pto_backend._compile_pto_module(mlir, "kernel", str(tmp_path), memory_planner=planner)
+    assert "TCVT(" in cpp, cpp
+
+
+@pytest.mark.parametrize(
+    "backend_type,dst_dtype,saturation_mode",
+    [
+        (BackendType.Ascend910B, pl.INT8, "on"),
+        (BackendType.Ascend910B, pl.FP32, "off"),
+        (BackendType.Ascend950, pl.INT8, "off"),
+        (BackendType.Ascend910B, pl.INT8, "off"),
+    ],
+    ids=["a2a3-saturating", "a2a3-widening", "a5-nonsaturating", "a2a3-scratch"],
+)
+def test_tcvt_dynamic_validity_contract(tmp_path, backend_type, dst_dtype, saturation_mode):
+    """Casts without A2/A3 scratch must not acquire a static-validity restriction."""
+
+    @pl.program
+    class DynamicCast:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            src: pl.Tensor[[4, 128], pl.FP16],
+            out: pl.Out[pl.Tensor[[4, 128], dst_dtype]],
+            cols: pl.Scalar[pl.INDEX],
+        ):
+            tile = pl.load(src, [0, 0], [4, 128], valid_shape=[4, cols])
+            converted = pl.cast(tile, dst_dtype, mode="trunc", saturation_mode=saturation_mode)
+            return pl.store(converted, [0, 0], out)
+
+    if backend_type == BackendType.Ascend910B and dst_dtype == pl.INT8 and saturation_mode == "off":
+        # Runtime validity cannot size A2/A3's implicit scratch. Fail at the
+        # source cast with a useful diagnostic, rather than inside PTOAS.
+        with pytest.raises(ValueError, match="requires compile-time static valid_shape"):
+            _emit_pto(DynamicCast, passes.MemoryPlanner.PTOAS)
+        return
+
+    native = find_ptoas_binary() is not None
+    with passes.PassContext([], memory_planner=passes.MemoryPlanner.PTOAS):
+        _ir.compile(
+            DynamicCast,
+            output_dir=str(tmp_path),
+            backend_type=backend_type,
+            skip_ptoas=not native,
+            dump_passes=False,
+        )
+    mlir_path = "ptoas/kernel.pto" if native else "kernels/aiv/kernel.pto"
+    mlir = (tmp_path / mlir_path).read_text()
+    tcvt = _sole_line(mlir, "pto.tcvt")
+    assert "v_col=?" in tcvt and "tcvt_src_view" not in tcvt, tcvt
 
 
 if __name__ == "__main__":

@@ -21,6 +21,242 @@ float_type = ir.ScalarType(DataType.FP32)
 >
 > **Note:** `TASK_ID` is an opaque 64-bit handle (type code `0x50`) representing a runtime `TaskId`. It is **not** a numeric type — no arithmetic is defined on it. A `Scalar[TASK_ID]` value is produced by `pl.submit(...)` (the second tuple element it returns names the producer task) inside `with pl.manual_scope():` regions. The Python literal `None` is the "no producer yet" sentinel — it seeds a TaskId loop iter_arg and is accepted as a `deps=[None]` entry; in a TaskId position it lowers to the [`system.task_invalid`](05-operators.md#syncop-synchronization-operations) builtin → `TaskId::invalid()`. TaskId values are passed in the `deps=[tid1, tid2]` kwarg of `pl.submit(...)`. Codegen lowers `TASK_ID` to `TaskId`.
 
+### Internal buffer types
+
+`BufferType` describes a mutable on-chip buffer in the final device IR. It
+inherits directly from `Type`: it has no `MemRef`, base pointer, address, or
+runtime expression fields. Storage identity belongs to the defining SSA value;
+ownership is declared by the defining operator.
+
+```python
+buffer_type = ir.BufferType(
+    [32, 64], DataType.FP32, ir.Mem.Vec, valid_shape=[-1, 64]
+)
+multi_type = ir.MultiBufferType(buffer_type, slot_count=2)
+```
+
+Physical extents must currently be static positive integers. `valid_shape`
+contains static extents between zero and the physical extent, or `-1` to mark
+a runtime valid extent supplied as an operator operand. Omitting it means the
+full physical shape. Layout, fractal size in bytes, padding, and compact mode
+are explicit descriptor fields. `MultiBufferType` describes identical slots of
+one multi-buffer allocation; its slot count must be positive. Control-flow
+type checking compares the complete descriptors, including slot counts and
+nested tuple elements, across branch results and loop-carried values.
+
+`VoidType` means a known absence of an SSA result, distinct from `UnknownType`.
+Void calls belong in `EvalStmt`; they cannot be bound to variables, passed as
+operands, packed into tuples, yielded, or returned as values. Allocation-size
+expressions, including `WindowBuffer.size`, must also produce a value.
+Expression values in `Call` and `Submit` attrs and kwargs follow the same
+rule at construction, including when attributes are attached with
+`ir.set_call_attrs`.
+
+These are initial buffer IR building blocks. Automatic tile-to-buffer lowering
+is not yet enabled; the public Tile DSL and default pipeline still use
+`TileType`. Direct PTO emission accepts explicitly constructed buffer programs
+with dense row-major Vec FP16/BF16/FP32/INT32 descriptors of rank one or two,
+scalar parameters and control flow, and the buffer operations below. Ordinary GM
+parameters support dense ND rank-2 FP16/BF16/FP32/INT32 tensors with static
+physical shapes and more than one column. Arithmetic recipes impose their own
+narrower dtype contracts. Normalized Tensor returns alias those parameters;
+the native kernel still returns void. Buffer parameter ABI, native function
+results, boxed subviews, mutable view metadata at allocation, slots, helpers, and other physical layouts are not yet supported
+and produce explicit errors. Buffer type dumps use native
+`pypto.ir.BufferType(...)` constructors; binary serialization preserves their
+complete descriptors. Reparsing complete buffer-program dumps through the
+DSL parser is not yet supported.
+
+#### Buffer operator contracts
+
+Registrations default to `OpIRStage::Functional`. Internal buffer operators
+explicitly select `OpIRStage::Buffer` and `set_internal_only()`. Their output
+arity is declared: zero requires `VoidType`, one a native result, and multiple
+results a matching `TupleType`. Functional registrations still require at least
+one result under the existing contract.
+
+Every buffer operand declares data and metadata access separately with
+`set_buffer_arg_effect(i, data, metadata)`; scalar operands use
+`set_buffer_non_memory_arg(i)`. Both access dimensions use `BufferAccess`
+(`None`, `Read`, `Write`, `ReadWrite`). No declaration defaults to read access.
+`set_buffer_result_behavior(...)` classifies results as allocation, alias,
+borrowed handle, or native value; void calls declare `None`. Alias and borrowed
+results name their source operand. `Allocate` declares a root handle; an explicit
+address may overlap other roots. It does not prove freshness or initialization.
+Descriptor and memory-space legality remain part of each operator's type
+deduction or explicit result validation.
+
+`buffer.alloc` uses `f_validate_explicit_type(...)` instead of a deducer: its
+physical descriptor exists only in `Call.type`. These mutually exclusive modes
+prevent a second copy of the descriptor in kwargs. The private IR builder
+accepts the result type before the span:
+
+```python
+from pypto.pypto_core import ir as _ir
+
+span = ir.Span.unknown()
+valid_rows = ir.Var("valid_rows", ir.ScalarType(DataType.INDEX), span)
+descriptor = ir.BufferType([32, 64], DataType.FP32, ir.Mem.Vec, valid_shape=[-1, 64])
+allocation = _ir._create_internal_op_call(
+    "buffer.alloc", [ir.MakeTuple([valid_rows], span)], {}, descriptor, span
+)
+```
+
+The first operand is always a `MakeTuple` containing just the runtime valid
+extents, in the order of the descriptor's `-1` dimensions. Static descriptors
+use an empty tuple. The optional second operand is the final effective byte
+address, with no additional base or offset. An omitted address requests fresh
+storage; an explicit zero is a valid addressed allocation. Negative constant
+addresses, including `-1`, are rejected. Both operands are non-memory values.
+Runtime values must be integer or `INDEX` scalars. Constant valid extents must
+lie between zero and their physical extent; runtime bounds and address
+nonnegativity are preconditions when they cannot be checked statically.
+
+`buffer.set_validshape(buffer, valid_extents)` returns `VoidType` and writes
+metadata only. Its `MakeTuple` operand includes **all** dimensions. Dimensions
+marked `-1` may change within their physical bounds; static valid dimensions
+must be supplied as matching constants. The operation changes neither the
+immutable type nor buffer identity. Lowering must select a dynamic descriptor
+in advance for any valid dimension that changes over a handle's lifetime.
+The initial PTO emitter additionally requires rank two and both native valid
+dimensions dynamic (`valid_shape=[-1, -1]`) for `set_validshape`, as required by
+the native instruction. A fixed initial extent can still be a constant operand
+of such a dynamic descriptor. Mixed static/dynamic descriptors remain supported
+for allocation, but cannot be silently promoted when emitting a metadata update.
+
+`OpRegistry::ValidateBufferCall` validates an existing call against the same
+schema as creation, including its original result type and kwargs. The
+`BufferIR` property applies this check in device functions and rejects logical
+tiles, implicit buffer aliases, and buffer-valued control-flow carries. It
+composes SSA, use-after-definition, and assignment-type checks. This establishes
+the representation contract; storage lifetime, overlap, and initialization
+proofs belong to subsequent verification.
+
+The `buffer.copy(src, dst)`, `buffer.mul(lhs, rhs, dst)`, and `buffer.add(lhs, rhs, dst)` operations
+write their explicit destination and return `VoidType`. They currently require
+matching Vec buffer descriptors, except that `buffer.copy` also moves a Mat cube
+operand into Left or Right: the element type and physical/valid extents stay
+the same while the destination descriptor supplies its own fractal layout. A write effect does not imply that all bytes
+are initialized. Exact input/destination aliases are allowed; equality of
+runtime valid extents and legalization of partially overlapping views are
+preconditions for constructing these calls. Existing Functional-stage `ArgEffect` queries deliberately
+reject buffer operators; buffer consumers must use `GetBufferArgEffect`.
+Direct codegen validates `BufferIR` and emits allocation, destination writes,
+and valid-state updates directly from these calls and their `BufferType`.
+Address emission depends only on the allocation operand; the legacy
+`emit_tile_addr` flag cannot remove or invent a buffer address. Dynamic
+operands remain in their lexical scope. No logical `TileType` or `MemRef` is
+reconstructed, and no implicit tile allocation pass runs on this path. The
+pipeline with `enable_buffer_ir=True` converts Tile IR before emission through
+[LowerTileToBuffer](../passes/55-lower_tile_to_buffer.md).
+
+Static storage views use ordinary SSA alias edges in the same Buffer stage:
+
+```text
+%root = buffer.alloc(()) : Buffer<[128, 32], UINT8, Vec>
+%bytes = buffer.subview(%root, (2, 0)) : Buffer<[64, 32], UINT8, Vec>
+%tile = buffer.reshape(%bytes) : Buffer<[16, 32], FP32, Vec>
+```
+
+`buffer.subview(source, (row, col)[, valid])` is a strided window of a dense
+row-major rank-2 Vec buffer: the result keeps the source's element type and row
+pitch, and its static shape must fit the source. Offsets are integer or `INDEX`
+scalars, constant or runtime; constant offsets are bounds-checked. The optional
+valid tuple states every result valid extent (constants for static descriptor
+dimensions) and is required when a result dimension is dynamic or its static
+valid extent is smaller than the physical shape. Constant valid operands must
+be positive and no larger than the corresponding window dimension; zero-valid
+windows are not supported. Full-width
+`UINT8[N,32]` byte windows of a storage root are the static special case. `buffer.reshape` preserves the exact physical byte count and accepts
+static dense row-major rank-2 Vec FP16, BF16, FP32, INT16, INT32 and UINT8 descriptors, with physical
+rows aligned to 32 bytes. In Mat, Left, Right and Acc it only relabels one
+whole fractal window in the same space (for example NZ to ZN) with the same
+element type, byte count and static valid extents. Both operations declare `Alias(0)`, no data access, and
+source-metadata read. They neither allocate storage nor initialize data.
+Every intermediate shape, dtype and valid extent is explicit in its result type.
+`buffer.set_validshape` cannot mutate these static view handles.
+
+A runtime-offset window is only known to lie within its source window, so
+`BufferIR` uses that whole source range when proving disjointness, including
+through subsequent static subviews and reshapes. Equal conservative ranges
+do not prove exact aliasing.
+
+`BufferIR` memoizes root identity, relative offset, byte extent, inherited row
+pitch and offset certainty for these views. Subviews retain their parent's pitch;
+reshapes establish the result layout's pitch. Elementwise recipes, and copies involving views, check source/destination
+windows using relative offsets within one root or effective addresses across
+placed roots. Distinct addressless allocations are disjoint; distinct unproven
+incoming roots are not a disjointness proof. Same-root disjoint windows remain
+provable even with a runtime base address. This does not establish initialization
+or lifetime safety. Legacy copies between incoming non-view buffers retain their
+existing overlap precondition. Placed addresses are compared only within one
+memory space; windows in different spaces never overlap.
+
+Cube operations write an explicit Acc destination from Left/Right operands:
+
+```text
+buffer.matmul(lhs_left, rhs_right, acc) : Void        # acc = lhs @ rhs
+buffer.matmul_acc(lhs_left, rhs_right, acc) : Void    # acc = acc + lhs @ rhs
+buffer.extract(src, row, col, dst) : Void             # static-shape window copy
+```
+
+Operands are rank-2 `[M, K] x [K, N] -> [M, N]` physical descriptors with
+identical FP16, BF16, FP32 or INT8 operand types and the matching FP32/INT32
+accumulator. Static rhs valid K must cover lhs valid K. Both forms write exactly
+the product rectangle (lhs valid rows by rhs valid columns), and a static
+destination's valid extents must equal it, as PTOAS requires. `buffer.matmul`
+overwrites that rectangle; `buffer.matmul_acc` adds to it in place and has no
+separate accumulator input. A wider accumulator is written through a
+product-shaped view of the same storage. The cube writes whole fractal boxes
+(16x16 in Acc): boxes outside the product keep their data, but the rest of a
+partially covered box is not preserved (zeros were measured on a2a3, as on the
+legacy path). `buffer.extract` copies a
+destination-shaped window at integer or `INDEX` offsets from Mat into Left/Right,
+or within Vec; constant offsets are bounds-checked and the offsets are
+non-memory operands.
+
+GM transfers expose their complete window as ordinary operands:
+
+```text
+buffer.load(tensor, offsets_tuple, valid_extents_tuple, dst_buffer) : Void
+buffer.store(src_buffer, offsets_tuple, valid_extents_tuple, tensor) : Void
+```
+
+These transfer schemas require ordinary rank-2 Tensor/Vec Buffer operands
+with matching FP16, BF16, FP32 or INT32 element types. `buffer.load` may also
+fill a Mat cube operand (FP16, BF16, FP32 or INT8; the transfer converts ND to
+the fractal layout). `buffer.store` may also drain an Acc accumulator through
+the fix-pipe, whose only unscaled conversions keep the accumulator type or turn
+FP32 into FP16/BF16. Offsets are nonnegative element indices. The tuples contain two
+integer or `INDEX` scalars. Each transfer extent must equal the buffer's current
+valid extent; a static descriptor axis requires that exact constant. Constant
+extents and windows are checked against buffer capacity, GM physical shape,
+and the tensor's effective valid region (`TensorView.valid_shape`, or the full
+shape when omitted). Transfers cannot expand the tensor's valid metadata.
+Dynamic equality, nonnegativity, and bounds are lowering/runtime preconditions.
+Neither transfer changes buffer valid metadata or initializes untouched data.
+The source has data-read/metadata-read effects and the destination has
+data-write/metadata-read effects; both tuples are non-memory operands. A GM
+store writes its selected region without reading the untouched remainder.
+
+Direct emission currently requires the Tensor operand to be a function parameter
+with packed ND strides and no padding. Loads require `In` or `InOut`, stores
+require `Out` or `InOut`. GM pointer parameters precede scalars in the native ABI
+regardless of their IR order. Parameter directions, Tensor return types, and
+normalized output-parameter return values remain intact in IR for orchestration;
+only scalar region results/carries are accepted. Dynamic physical shapes,
+non-parameter GM views, cache-policy/atomic kwargs, and other transfer layouts
+require later recipes and are rejected explicitly.
+
+The initial emitter accepts unsigned scalar values directly as allocation
+addresses, GM offsets, or valid extents, preserving their unsigned value when widening.
+Unsigned arithmetic and casts other than index-to-integer and same-width
+integer conversions require a future native recipe and are rejected before
+emission. For loops require an `INDEX` induction variable and `INDEX` or signed
+integer bounds, with a provably positive constant step. Runtime-valued, zero,
+and negative steps are rejected before emission. These are emitter limits, not restrictions on the Buffer IR
+representation itself.
+
 ### TensorType
 
 Multi-dimensional tensor with optional memory reference.
@@ -168,7 +404,7 @@ The packed canonical formulas (`BuildLogicalStridesFromLayout` in
 | ------ | ---------------- |
 | `ND` | `stride[n-1] = 1; stride[k] = stride[k+1] * shape[k+1]` |
 | `DN` (`n ≥ 2`) | `stride[n-2] = 1`; `stride[n-1] = shape[n-2]`; `stride[n-3] = shape[n-2] * shape[n-1]`; outer dims row-major |
-| `NZ` | row-major over the *blocked* rank-(r+2) shape `[..., C/c0, R/16, 16, c0]` — see [BlockNzTensorViews](../passes/15-block_nz_tensor_views.md) |
+| `NZ` | row-major over the *blocked* rank-5 shape `[B, C/c0, R/16, 16, c0]` — see [BlockNzTensorViews](../passes/16-block_nz_tensor_views.md) |
 
 **Two ways to spell the same canonical TensorView**:
 
@@ -177,7 +413,7 @@ The packed canonical formulas (`BuildLogicalStridesFromLayout` in
   canonical for the carried layout.
 - **Explicit** — every dimension's stride is spelled out.
 
-The [`MaterializeTensorStrides`](../passes/33-materialize_tensor_strides.md)
+The [`MaterializeTensorStrides`](../passes/34-materialize_tensor_strides.md)
 pass rewrites every implicit form to its explicit packed canonical so
 codegen sees a single contract. The `TensorViewCanonical` `IRProperty` +
 verifier enforces this:
@@ -512,6 +748,9 @@ tile_type = ir.TileType(shape, DataType.FP16, memref, tile_view, ir.Mem.Left)
 | **ScalarType** | 0 | - | Single values |
 | **TensorType** | N (any) | Optional MemRef | General tensors |
 | **TileType** | N (any)* | Optional MemRef + TileView | Hardware-optimized tiles |
+| **BufferType** | Static physical dimensions | Defining SSA handle | Explicit device storage |
+| **MultiBufferType** | Element BufferType | Native slot group | Uniform buffer slots |
+| **VoidType** | - | - | Known absence of an SSA result |
 | **TupleType** | - | - | Multiple return values |
 | **PipeType** | - | - | Hardware synchronization |
 | **UnknownType** | - | - | Type inference placeholder |

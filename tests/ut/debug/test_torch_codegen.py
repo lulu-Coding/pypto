@@ -787,7 +787,14 @@ def test_if_else_with_return_vars():
 
 @pytest.mark.parametrize(
     "op_name",
-    ["system.sync_src", "system.sync_set", "system.sync_wait", "system.set_ffts"],
+    [
+        "system.sync_src",
+        "system.sync_set",
+        "system.sync_wait",
+        "system.set_flag",
+        "system.wait_flag",
+        "system.set_ffts",
+    ],
 )
 def test_system_ops_are_noops(op_name):
     """System ops should emit no-op comments."""
@@ -796,6 +803,12 @@ def test_system_ops_are_noops(op_name):
         call = _op_call(op_name, [], {"set_pipe": 4, "wait_pipe": 5, "event_id": 0})
     elif op_name in ("system.sync_set", "system.sync_wait"):
         call = _op_call(op_name, [], {"pipe": ir.PipeType.MTE2, "event_id": 0})
+    elif op_name in ("system.set_flag", "system.wait_flag"):
+        call = _op_call(
+            op_name,
+            [],
+            {"src_pipe": ir.PipeType.MTE2, "dst_pipe": ir.PipeType.V, "event_id": 0},
+        )
     else:
         workspace = _tensor_var("workspace", [256], DataType.INT64)
         params = [workspace]
@@ -1335,6 +1348,34 @@ def test_binary_ir_expressions():
     func = _simple_function("f", [a, b], assign)
     code = torch_codegen(func)
     assert "(a + b)" in code
+
+
+@pytest.mark.parametrize("kind", ["if", "for", "while"])
+@pytest.mark.parametrize("body_kind", ["empty", "yield", "nested_yield"])
+def test_regions_with_no_emitted_statements_execute(kind, body_kind):
+    if body_kind == "empty":
+        body = ir.SeqStmts([], _span())
+    elif body_kind == "yield":
+        body = ir.YieldStmt([], _span())
+    else:
+        body = ir.SeqStmts([ir.SeqStmts([ir.YieldStmt([], _span())], _span())], _span())
+    flag = _scalar("flag", DataType.BOOL)
+    if kind == "if":
+        region = ir.IfStmt(flag, body, body, [], _span())
+    elif kind == "for":
+        region = ir.ForStmt(_scalar("i"), _int(0), _int(3), _int(1), [], body, [], _span())
+    else:
+        region = ir.WhileStmt(ir.ConstBool(False, _span()), [], body, [], _span())
+    function = _simple_function(
+        "kernel",
+        [flag],
+        ir.SeqStmts([region, ir.ReturnStmt([_int(7)], _span())], _span()),
+        [ir.ScalarType(DataType.INT64)],
+    )
+    namespace = {}
+    exec(torch_codegen(function), namespace)  # noqa: S102
+    assert namespace["kernel"](False) == 7
+    assert namespace["kernel"](True) == 7
 
 
 def test_break_continue():

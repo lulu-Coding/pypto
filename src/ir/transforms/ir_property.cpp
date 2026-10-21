@@ -105,6 +105,8 @@ std::string IRPropertyToString(IRProperty prop) {
       return "IterArgCarryClassified";
     case IRProperty::AccToGmStoreValid:
       return "AccToGmStoreValid";
+    case IRProperty::FixpipeEpilogueValid:
+      return "FixpipeEpilogueValid";
     case IRProperty::AtomicAddDtypeValid:
       return "AtomicAddDtypeValid";
     case IRProperty::AccCompactValid:
@@ -115,6 +117,14 @@ std::string IRPropertyToString(IRProperty prop) {
       return "AccStorePhaseValid";
     case IRProperty::NoScalarKernelReturn:
       return "NoScalarKernelReturn";
+    case IRProperty::AivSplitLoweredValid:
+      return "AivSplitLoweredValid";
+    case IRProperty::BufferIR:
+      return "BufferIR";
+    case IRProperty::TileStorageLegalized:
+      return "TileStorageLegalized";
+    case IRProperty::TileStorageAllocated:
+      return "TileStorageAllocated";
     default:
       return "Unknown";
   }
@@ -149,9 +159,16 @@ std::string IRPropertySet::ToString() const {
   return oss.str();
 }
 
+// InlineFunctionsEliminated is listed here, not merely declared by
+// InlineFunctions' `produced` set: the pipeline verifies a produced property
+// only when it also appears in this set. Without it, a Call the pass could not
+// splice survives as a reference to the function it then drops, and the failure
+// surfaces ~40 passes later as OrchestrationReferencesResolved's "references
+// undefined function" instead of at the call site's own line after pass 01.
 const IRPropertySet& GetVerifiedProperties() {
   static const IRPropertySet props{IRProperty::SSAForm,
                                    IRProperty::TypeChecked,
+                                   IRProperty::InlineFunctionsEliminated,
                                    IRProperty::MixedKernelExpanded,
                                    IRProperty::AllocatedMemoryAddr,
                                    IRProperty::BreakContinueValid,
@@ -161,6 +178,7 @@ const IRPropertySet& GetVerifiedProperties() {
                                    IRProperty::ManualDepsOnSubmitOnly,
                                    IRProperty::ReturnParamsExplicit,
                                    IRProperty::AivSplitValid,
+                                   IRProperty::AivSplitLoweredValid,
                                    IRProperty::TileMemoryInferred,
                                    IRProperty::TileOps2D,
                                    IRProperty::HardSyncallOccupancyValid,
@@ -169,6 +187,7 @@ const IRPropertySet& GetVerifiedProperties() {
                                    IRProperty::DistTensorCtxMaterialized,
                                    IRProperty::GraphBoundaryLegalized,
                                    IRProperty::AccToGmStoreValid,
+                                   IRProperty::FixpipeEpilogueValid,
                                    IRProperty::AccCompactValid,
                                    IRProperty::AtomicAddDtypeValid,
                                    IRProperty::AccStorePhaseValid};
@@ -200,7 +219,8 @@ const IRPropertySet& GetStructuralProperties() {
                                    IRProperty::OutParamNotShadowed, IRProperty::NoNestedInCore,
                                    IRProperty::InOutUseValid,       IRProperty::PipelineLoopValid,
                                    IRProperty::ArrayNotEscaped,     IRProperty::ManualDepsOnSubmitOnly,
-                                   IRProperty::AtomicAddDtypeValid, IRProperty::NoScalarKernelReturn};
+                                   IRProperty::AtomicAddDtypeValid, IRProperty::NoScalarKernelReturn,
+                                   IRProperty::AssignTypeSymmetry};
   return props;
 }
 

@@ -1,5 +1,9 @@
 # Functions and Program Structure
 
+> **Legacy Python API examples:** `platform=` calls on this page are retained for
+> compatibility. They emit `DeprecationWarning`; new code should use
+> `backend_type` and `execution_mode`. See the [target mapping](../08-entry-points.md#legacy-platform-examples).
+
 Function declaration forms, parameter directions, cross-module reuse, and how to
 print IR back to Python syntax.
 
@@ -10,9 +14,11 @@ holding only `pl` and `pld`, so any name it inherits from its own module or an
 enclosing function must be replaced, at its use site, by source text that
 evaluates back to the same value. That covers literals (`int`, `float`, `bool`,
 `str`, `None`), the `pl` dtype and enum constants (`pl.INT8`, `pl.Mem.Vec`,
-`pl.PadValue.zero`, `pl.NZ`), and lists/tuples nested from those — a shape or a
-rounding mode held in a constant, for instance. A value with no source form is
-left alone, so the name survives and the parser reports it.
+`pl.PadValue.zero`, `pl.NZ`), distributed enum constants (`pld.ReduceOp.Max`,
+`pld.NotifyOp.AtomicAdd`, `pld.WaitCmp.Ge`), and lists/tuples nested from those —
+a shape, rounding mode, or collective reduction selected by a factory, for instance.
+A value with no source form is left alone, so the name survives and the parser
+reports it.
 
 Every name that folds is also in the compilation key, including constants used by
 transitive JIT helpers and source annotations. The key hashes the *emitted text*
@@ -55,8 +61,8 @@ source dependency hash without a separate closure-key component.
 
 The snapshot copies bindings only: mutating arbitrary configuration objects
 or editing compiler/source files during compilation is not supported by this
-constant-tracking mechanism. This behavior does not enable persistent artifact
-caching; compiled objects are still reused within the process.
+constant-tracking mechanism. Persistent reuse additionally requires the full
+[artifact identity and cache policy](../10-jit-cache.md).
 
 ### Compile options and diagnostic requests
 
@@ -95,6 +101,61 @@ cached = slice_kernel.compile()
 slice_kernel.compile(config=RunConfig(dump_passes=True, save_kernels_dir="debug_kernel"))
 assert slice_kernel.compile() is cached
 ```
+
+### Prepare binaries without executing
+
+`kernel.warmup()` uses the same specialization, configuration, and in-process
+object cache as `kernel.compile()`, and also prepares every kernel and
+orchestration binary before returning. It initializes no NPU and creates no
+runtime worker. The build host still needs the target compiler, SDK, and runtime
+Python/native dependencies.
+
+```python
+import pypto.language as pl
+from pypto.runtime import RunConfig
+
+@pl.jit
+def add_three(
+    x: pl.Tensor[[16, 16], pl.FP32],
+    out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+):
+    with pl.at(level=pl.Level.CORE_GROUP):
+        tile = pl.load(x, [0, 0], [16, 16])
+        pl.store(pl.add(tile, 3.0), [0, 0], out)
+    return out
+
+config = RunConfig(platform="a2a3")
+prepared = add_three.warmup(config=config)  # No sample tensor allocation.
+# Later, on a host with an available NPU:
+# prepared(x, out, config=config)
+```
+
+You can supply sample tensors as with `compile()`; warmup reads their metadata,
+not their contents. With complete tensor annotations, omit the tensors entirely:
+scalar parameters are runtime values, so they need no value here, and dynamic
+extents retain the existing compile rules. A `pl.constexpr` parameter is the
+exception: its value selects the artifact, so it must be supplied as a keyword
+or a signature default. When calling the returned compiled object, supply its
+full parameter list, including scalar arguments — that is where each scalar's
+value is read. A constexpr parameter is absent from that list; the artifact
+already resolved it.
+Execution-only settings such as `codegen_only` do not suppress binary preparation.
+
+The result is the same compiled object selected by `compile()`, with live IR
+retained for fresh compilation. Warmup prepares every chip-level child of a
+`DistributedCompiledProgram` and every orchestration sub-build of a
+multi-orchestration `CompiledProgram`. It does not call the distributed object's
+`prepare()`: that method creates a live worker for execution. Compilation errors
+propagate to the caller; a failed binary build can be retried by calling warmup
+again. Diagnostic/output requests still compile afresh as described above.
+
+With [persistent caching](../10-jit-cache.md) enabled, warmup automatically
+publishes or reuses READY artifacts through the [runtime protocol](../09-artifact-store.md).
+Persistence is disabled by default. Read-only misses, unsupported inputs and
+storage failures can prepare private results. A restored result has
+`.program is None`; disable persistence or use `specialize()`/`lower()` to require IR.
+The public cache policy, statistics and metadata-only warmup CLI are documented
+in [Persistent JIT Cache](../10-jit-cache.md).
 
 ## Functions
 
@@ -389,6 +450,14 @@ Use `as_python()` on any IR node to get its Python representation:
 print(stmt.as_python())          # "x: pl.Scalar[pl.INT64] = a + b" (default "pl" prefix)
 print(stmt.as_python("ir"))      # "x: ir.Scalar[ir.INT64] = a + b" (custom prefix)
 ```
+
+Generic Function attrs print as `pl.func_attr({...})` directives in the body
+prologue. They remain Function metadata when parsed, including on HOST
+SubWorkers: the captured Python `InlineStmt.body` excludes these directives
+while preserving the implementation and its docstring. Parameter-valued attrs
+resolve to the function's own parameters. The prologue must precede executable
+statements (a leading docstring is allowed); misplaced directives and duplicate
+keys are errors, also for SubWorkers.
 
 ### Concise Mode
 

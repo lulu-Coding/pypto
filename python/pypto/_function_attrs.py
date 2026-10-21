@@ -20,14 +20,14 @@ disagree, so a key added or renamed on one side cannot silently drift from the
 other.
 """
 
+# Immutable whole-kernel selection, retained through storage and lowering (bool).
+BUFFER_IR_SELECTED_ATTR = "buffer_ir_selected"
+
 # AIV kernel running on BOTH vector sub-lanes of a mixed kernel (bool).
 DUAL_AIV_DISPATCH_ATTR = "dual_aiv_dispatch"
 
 # InCore function outlined from a scope holding ``pl.split_aiv`` region(s) (bool).
 SPLIT_AIV_ATTR = "split_aiv"
-
-# ``pl.split_aiv`` regions already transpose-hazard-checked per region (bool).
-SPLIT_AIV_REGION_VALIDATED_ATTR = "split_aiv_region_validated"
 
 # Absolute path to a hand-written external C++ kernel source (str). When present
 # on an AIC/AIV function the DSL body is empty (``...``): the compiler assigns the
@@ -53,10 +53,10 @@ AUTO_SCOPE_ATTR = "auto_scope"
 
 __all__ = [
     "AUTO_SCOPE_ATTR",
+    "BUFFER_IR_SELECTED_ATTR",
     "BUILTIN_TEMPLATE_DIR_ATTR",
     "BUILTIN_TEMPLATE_VARS_ATTR",
     "DUAL_AIV_DISPATCH_ATTR",
     "EXTERNAL_SOURCE_ATTR",
     "SPLIT_AIV_ATTR",
-    "SPLIT_AIV_REGION_VALIDATED_ATTR",
 ]

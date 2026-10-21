@@ -22,6 +22,7 @@ The Ascend950 backend (where the V->C direction needs an NZ fractal adapter) is
 configured by the directory-level ``conftest.py``.
 """
 
+import pypto
 import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
@@ -160,7 +161,7 @@ def test_aiv_shard_folds_into_cube_to_vector_boundary():
 
 
 def _build_aic_gather_program():
-    """half2[64,128]Vec --aic_gather(split=1)--> full[128,128], move->Left, matmul."""
+    """half2[64,128]Vec --aic_gather(split=1)--> full[128,128]Mat, move->Left, matmul."""
     span = ir.Span.unknown()
     a = ir.Var("a", _tile([64, 128], mem=MS.Vec), span)
     b = ir.Var("b", _tile([128, 128], mem=MS.Right), span)
@@ -171,7 +172,7 @@ def _build_aic_gather_program():
     half2 = ir.Var("half2", _tile(add.type.shape, add.type.tile_view, MS.Vec), span)
     gather = T.aic_gather(half2, split=1, span=span)
     assert isinstance(gather.type, ir.TileType)
-    full = ir.Var("full", _tile(gather.type.shape, gather.type.tile_view, MS.Vec), span)
+    full = ir.Var("full", _tile(gather.type.shape, gather.type.tile_view, MS.Mat), span)
     move_left = T.move(full, MS.Left, span=span)
     assert isinstance(move_left.type, ir.TileType)
     full_left = ir.Var("full_left", _tile(move_left.type.shape, move_left.type.tile_view, MS.Left), span)
@@ -484,20 +485,29 @@ def _build_cube_produced_gather_program():
     return ir.Program([func], "test_cube_produced_gather", span)
 
 
-def test_shard_of_a_vector_produced_value_is_rejected():
-    """A vector-produced shard operand is an authoring error, not a lane-local halve.
+def test_shard_of_a_vector_produced_value_hits_the_backstop():
+    """A vector-produced shard operand would lower into a tpush the cube lane
+    cannot satisfy, so the pass still refuses it.
 
-    ``pl.aiv_shard`` MEANS "cross the AIC/AIV boundary"; a value the AIV lane
-    already produced has no crossing to name. Reject it with the boundary op's
-    span rather than lowering it into a tpush the cube lane cannot satisfy.
+    The AUTHORING report for this shape now comes from the AivSplitValid verifier
+    (check (m)), 14 passes earlier and in the author's own pl.* spelling. What is
+    left here is a compiler backstop: reaching it means verification was off, or
+    a pass built the bad pairing itself. So it raises an INTERNAL error with no
+    fix advice.
     """
-    with pytest.raises(ValueError, match=r"is produced on the VECTOR lane by 'tile\.full'"):
+    with (
+        passes.PassContext([]),
+        pytest.raises(pypto.InternalError, match=r"is defined on the VECTOR lane by 'tile\.full'"),
+    ):
         _expand(_build_vector_produced_shard_program())
 
 
-def test_gather_of_a_cube_produced_value_is_rejected():
-    """The V->C mirror: a cube-produced gather operand is rejected the same way."""
-    with pytest.raises(ValueError, match=r"is produced on the CUBE lane by 'tile\.matmul'"):
+def test_gather_of_a_cube_produced_value_hits_the_backstop():
+    """The V->C mirror, refused by the same backstop."""
+    with (
+        passes.PassContext([]),
+        pytest.raises(pypto.InternalError, match=r"is defined on the CUBE lane by 'tile\.matmul'"),
+    ):
         _expand(_build_cube_produced_gather_program())
 
 
@@ -594,22 +604,28 @@ def _build_inline_operand_shard_program():
     return ir.Program([func], "test_inline_operand_shard", span)
 
 
-def test_chained_same_direction_shard_is_rejected():
+def test_chained_same_direction_shard_hits_the_backstop():
     """A boundary result cannot cross again in the same direction.
 
     Before the MIXED case was resolved through the producer's direction, the cube
     half emitted ``pl.tile.tpush_to_aiv(half1__FREE_VAR, split=1)``.
     """
-    with pytest.raises(ValueError, match=r"is produced on the VECTOR lane by 'tile\.aiv_shard'"):
+    with (
+        passes.PassContext([]),
+        pytest.raises(pypto.InternalError, match=r"is defined on the VECTOR lane by 'tile\.aiv_shard'"),
+    ):
         _expand(_build_chained_shard_program())
 
 
-def test_inline_vector_call_operand_is_rejected():
+def test_inline_vector_call_operand_hits_the_backstop():
     """An unbound vector Call operand is caught too, not skipped for lack of a Var.
 
     Before this, the cube half emitted the ``tile.full`` inline inside its tpush.
     """
-    with pytest.raises(ValueError, match=r"operand \(inline\) is produced on the VECTOR lane"):
+    with (
+        passes.PassContext([]),
+        pytest.raises(pypto.InternalError, match=r"operand \(inline\) is defined on the VECTOR lane"),
+    ):
         _expand(_build_inline_operand_shard_program())
 
 
@@ -740,26 +756,14 @@ def test_aic_gather_folds_into_vector_to_cube_boundary():
 
 
 # ---------------------------------------------------------------------------
-# Region placement: core_placement="aiv" keeps a comm op off the cube lane
+# Region placement keeps a no-duplicate SHARED comm op off the cube lane.
 #
-# A mixed kernel is split into an AIC and an AIV function, and a statement whose
-# affinity is SHARED is copied onto BOTH. ``pld.system.notify`` is SHARED — its
-# TNOTIFY is core-agnostic by ISA, so declaring a core affinity for it would be
-# a false claim — and its atomic-add form is NOT idempotent, so the copy makes
-# the waiting rank observe the signal twice.
-#
-# ``pl.split_aiv`` is how the author says "this runs on the vector lane".
-# LowerAutoVectorSplit erases the region node, so it leaves the placement behind
-# as ``attrs["core_placement"] = "aiv"`` on the calls whose lane the region
-# decides, and ClassifyCallAffinity resolves that to VECTOR. These tests pin the
-# consuming end: the stamp, and only the stamp, is what keeps the notify off the
-# cube lane. The pass ALSO strips the stamp once it has consumed it, so it never
-# reaches a downstream pass or a printed dump.
-# ---------------------------------------------------------------------------
-
-# The two Before programs differ ONLY in the region placement stamp, so the pair
-# of structural comparisons below isolates the stamp as the cause of every
-# difference between their expanded forms.
+# A plain SHARED notify is duplicated into AIC and AIV. Its atomic-add form
+# would then signal the peer twice. LowerAutoVectorSplit retains the lexical
+# region; ExpandMixedKernel consumes it into pass-local AIV placement for
+# no-duplicate SHARED calls. Stated lanes and intrinsically placed ops retain
+# their own affinity. These golden comparisons isolate region presence as the
+# cause of the different notify placement; no serialized placement stamp exists.
 #
 # Note the two programs must not share a class name: `@pl.program` resolves the
 # decorated class from source, so two same-named classes in one scope collapse
@@ -778,7 +782,7 @@ class _PlacedNotifyBefore:
     ) -> pl.Tensor[[64, 128], pl.FP32]:
         half: pl.Tile[[64, 128], pl.FP32, pl.Mem.Vec] = pl.tile.aiv_shard(qk, split=1)
         y: pl.Tile[[64, 128], pl.FP32, pl.Mem.Vec] = pl.tile.add(half, half)
-        pld.system.notify(sig, peer, [0, 0], 1, op=pld.NotifyOp.AtomicAdd, attrs={"core_placement": "aiv"})
+        pld.system.notify(sig, peer, [0, 0], 1, op=pld.NotifyOp.AtomicAdd)
         out_store = pl.tile.store(y, [0, 0], out_0)
         return out_store
 
@@ -800,16 +804,34 @@ class _UnplacedNotifyBefore:
         return out_store
 
 
+class _WrapNotifyBody(ir.IRMutator):
+    """Model pass 23 output using a region, preserving the existing golden body."""
+
+    def visit_function(self, func):
+        assert isinstance(func.body, ir.SeqStmts)  # the pass models a multi-stmt body
+        stmts = list(func.body.stmts)
+        region = ir.SplitAivScopeStmt(
+            split=ir.SplitMode.UP_DOWN, body=ir.SeqStmts(stmts[:-1], func.span), span=func.span
+        )
+        return ir.Function(
+            func.name,
+            list(zip(func.params, func.param_directions)),
+            func.return_types,
+            ir.SeqStmts([region, stmts[-1]], func.span),
+            func.span,
+            func.func_type,
+            attrs=dict(func.attrs),
+        )
+
+
 def test_region_placed_notify_lands_on_aiv_lane_only():
     """A region-placed notify is emitted on the AIV lane and NOT on the AIC one.
 
     This is the fix for the double-signal bug: one notify survives the split, on
     the vector lane the author chose with ``pl.split_aiv``.
 
-    ``Expected`` also pins the two facts that used to be separate tests: no
-    expanded function still carries the ``core_placement`` stamp (its lifetime
-    ends at this pass, and a leftover would show up as an attrs mismatch), and
-    the stamp moved nothing but the notify — the vector add stays on AIV and the
+    ``Expected`` also checks that no region or placement attribute survives
+    expansion. The region changes only the notify placement: the vector add stays on AIV and the
     cross-core boundary keeps its tpush on AIC and its tpop on AIV, exactly as
     in the unplaced expansion below.
     """
@@ -876,7 +898,7 @@ def test_region_placed_notify_lands_on_aiv_lane_only():
             self.split_aiv_aiv(qk, sig, peer, out_0)
             return out_0
 
-    after = _expand(_PlacedNotifyBefore)
+    after = _expand(_WrapNotifyBody().visit_program(_PlacedNotifyBefore))
     ir.assert_structural_equal(after, Expected)
     _assert_no_free_var(after)
 
@@ -1048,6 +1070,55 @@ def test_boundary_tpop_type_binds_the_cloned_lane_index():
     assert "pl.dynamic(" not in printed, printed
     # The extent itself must survive the repair, not be dropped to make it bind.
     assert "aiv_id" in printed, printed
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_consumed_region_preserves_comments_without_mutating_input(nested):
+    span = ir.Span.unknown()
+    source = ir.Var("source", _tile([16, 16], mem=MS.Vec), span)
+    call = T.add(source, source, span=span)
+    stmt = ir.AssignStmt(ir.Var("result", call.type, span), call, span)
+    ir.attach_leading_comments(stmt, ["body comment"])
+    region = ir.SplitAivScopeStmt(split=ir.SplitMode.NONE, body=stmt, span=span)
+    ir.attach_leading_comments(region, ["inner comment"])
+    body = region
+    if nested:
+        body = ir.SplitAivScopeStmt(split=ir.SplitMode.NONE, body=region, span=span)
+        ir.attach_leading_comments(body, ["outer comment"])
+    func = ir.Function(
+        "comments", [(source, _IN)], [], body, span, ir.FunctionType.InCore, attrs={"split_aiv": True}
+    )
+    with passes.PassContext([]):
+        expanded = _expand(ir.Program([func], "comments", span))
+    output = next(iter(expanded.functions.values()))
+    expected = (["outer comment"] if nested else []) + ["inner comment", "body comment"]
+    assert output.body.leading_comments == expected
+    assert stmt.leading_comments == ["body comment"]
+    assert region.leading_comments == ["inner comment"]
+
+
+def test_expansion_without_regions_reuses_the_body():
+    span = ir.Span.unknown()
+    body = ir.SeqStmts([ir.ReturnStmt([], span)], span)
+    func = ir.Function("plain", [], [], body, span, ir.FunctionType.InCore)
+    with passes.PassContext([]):
+        expanded = _expand(ir.Program([func], "plain", span))
+    assert next(iter(expanded.functions.values())).body is body
+
+
+def test_consumed_region_comments_survive_boundary_expansion():
+    program = _WrapNotifyBody().visit_program(_PlacedNotifyBefore)
+    function = next(iter(program.functions.values()))
+    assert isinstance(function.body, ir.SeqStmts)
+    region = function.body.stmts[0]
+    ir.attach_leading_comments(region, ["communication phase"])
+    with passes.PassContext([]):
+        expanded = _expand(program)
+    for function in expanded.functions.values():
+        if function.func_type in (ir.FunctionType.AIC, ir.FunctionType.AIV):
+            text = ir.python_print(ir.Program([function], "lane", function.span))
+            assert "# communication phase" in text
+    assert region.leading_comments == ["communication phase"]
 
 
 if __name__ == "__main__":

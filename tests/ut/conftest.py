@@ -11,15 +11,28 @@
 
 import importlib
 import os
+import subprocess
 import sys
+from collections.abc import Callable
 from types import ModuleType, SimpleNamespace
 from typing import Final
 from unittest.mock import MagicMock, patch
+
+# The unit suite stubs simpler wherever it needs it — `simpler_setup` and
+# `pypto.runtime.task_interface` are monkeypatched in sys.modules — so it never runs
+# against the installed runtime, and must not be gated on that runtime matching
+# `runtime/`. Set before the first `pypto` import below, so no import path can reach a
+# guarded module ahead of it; a developer can re-enable the guard for a run with
+# PYPTO_SKIP_RUNTIME_PIN_CHECK=0. The guard's own logic is covered directly in
+# tests/ut/runtime/test_runtime_pin.py, and system tests (tests/st) run real kernels
+# and are deliberately not exempted.
+os.environ.setdefault("PYPTO_SKIP_RUNTIME_PIN_CHECK", "1")
 
 import pytest
 from pypto import LogLevel, get_log_level, set_log_level
 from pypto import backend as _backend
 from pypto.backend import BackendType
+from pypto.backend._ptoas_locate import check_ptoas_version, find_ptoas_binary
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 from pypto.pypto_core import _clear_thread_log_level, passes
 
@@ -27,6 +40,90 @@ from pypto.pypto_core import _clear_thread_log_level, passes
 # mutate it — so every unit test starts from whatever PYPTO_LOG_LEVEL / the
 # build-type default selected for this session. See `_reset_log_level`.
 _INITIAL_LOG_LEVEL: Final[LogLevel] = get_log_level()
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--require-ptoas",
+        action="store_true",
+        help="Fail before running tests if a supported PTOAS compiler is unavailable.",
+    )
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Register compilation coverage and fail CI before optional checks can skip."""
+    config.addinivalue_line(
+        "markers",
+        "ptoas_compile: invokes PTOAS compilation to check generated-code regressions",
+    )
+    if not config.getoption("--require-ptoas"):
+        return
+    binary = find_ptoas_binary()
+    if binary is None:
+        raise pytest.UsageError("--require-ptoas requires PTOAS; set PTOAS_ROOT to its installation.")
+    try:
+        check_ptoas_version(binary)
+    except RuntimeError as exc:
+        raise pytest.UsageError(str(exc)) from exc
+
+
+@pytest.fixture
+def run_without_optional_runtime() -> Callable[[str], subprocess.CompletedProcess[str]]:
+    """Run source in a fresh process that rejects optional runtime import attempts.
+
+    The import finder covers statements and importlib alike. Tracking attempts
+    also makes a caught ImportError fail the check. PyTorch backend autoload is
+    disabled to test PyPTO's imports independently of installed torch plugins.
+    """
+
+    def run(source: str) -> subprocess.CompletedProcess[str]:
+        """Execute source with import enforcement and return captured diagnostics."""
+        bootstrap = f"""
+import importlib.abc
+import sys
+
+blocked = ('torch_npu', 'simpler', 'simpler_setup', '_task_interface', 'pypto._torch_npu')
+
+def is_blocked(name):
+    'Match an optional runtime root or one of its submodules.'
+    return any(name == root or name.startswith(root + '.') for root in blocked)
+
+if any(is_blocked(name) for name in sys.modules):
+    raise AssertionError('Optional runtime already loaded')
+
+class RejectOptionalRuntime(importlib.abc.MetaPathFinder):
+    'Record and reject optional imports before any loader runs.'
+    def __init__(self):
+        'Keep evidence even when the caller catches an import failure.'
+        self.attempts = []
+
+    def find_spec(self, fullname, path=None, target=None):
+        'Reject optional runtimes and defer all other imports.'
+        if is_blocked(fullname):
+            self.attempts.append(fullname)
+            raise ModuleNotFoundError('Blocked optional runtime import: ' + fullname, name=fullname)
+        return None
+
+guard = RejectOptionalRuntime()
+sys.meta_path.insert(0, guard)
+try:
+    exec(compile({source!r}, '<optional-runtime-check>', 'exec'))
+finally:
+    if guard.attempts:
+        raise AssertionError('Optional runtime imports attempted: ' + repr(guard.attempts))
+    if any(is_blocked(name) for name in sys.modules):
+        raise AssertionError('Optional runtime was loaded')
+"""
+        return subprocess.run(
+            [sys.executable, "-c", bootstrap],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+            env=os.environ | {"TORCH_DEVICE_BACKEND_AUTOLOAD": "0"},
+        )
+
+    return run
 
 
 @pytest.fixture
@@ -94,13 +191,13 @@ def stub_device_runner():
 def ascend_backend(request):
     """Configure an Ascend backend for the duration of a test, then reset.
 
-    Use either as a plain fixture (defaults to ``Ascend910B``) or via
+    Use either as a plain fixture (defaults to ``Ascend910``) or via
     ``pytest.mark.parametrize("ascend_backend", [...], indirect=True)`` to
     cycle through multiple backends. Replaces the per-test
     ``backend.reset_for_testing()`` + ``backend.set_backend_type(...)`` pair
     that is otherwise duplicated across pass / codegen tests.
     """
-    backend_type = getattr(request, "param", BackendType.Ascend910B)
+    backend_type = getattr(request, "param", BackendType.Ascend910)
     _backend.reset_for_testing()
     _backend.set_backend_type(backend_type)
     try:
@@ -178,7 +275,7 @@ def _redirect_prog_build_dir(tmp_path, monkeypatch):
     """Redirect ir.compile() / @pl.jit artifacts into pytest's per-test tmp dir.
 
     Without an explicit ``output_dir``, ``ir.compile()`` writes generated
-    kernels and pass dumps to ``build_output/<name>_<timestamp>`` relative to
+    kernels and pass dumps to ``build_output/<name>_<timestamp>_<random>`` relative to
     the working directory. Under pytest that accumulates stale directories in
     the repo / build tree. Pointing ``PYPTO_PROG_BUILD_DIR`` at a
     ``build_output`` dir inside pytest's per-test ``tmp_path`` keeps every
@@ -187,14 +284,14 @@ def _redirect_prog_build_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("PYPTO_PROG_BUILD_DIR", str(tmp_path / "build_output"))
 
 
-@pytest.fixture(autouse=True)
-def pass_verification_context():
-    """Enable pass verification and optional roundtrip checking for all pass executions.
+@pytest.fixture
+def pass_verification_instruments():
+    """Create shared pass verification and roundtrip instruments.
 
     The behavior is controlled by the PYPTO_VERIFY_LEVEL environment variable:
 
     - ``roundtrip`` (default) — BEFORE_AND_AFTER property verification + print→parse
-      roundtrip structural-equality check after every pass.
+      roundtrip structural-equality and structural-hash checks after every pass.
     - ``basic`` — BEFORE_AND_AFTER property verification only (faster, no roundtrip).
     - ``none`` — no pass verification at all (fastest, for debugging only).
     """
@@ -210,5 +307,11 @@ def pass_verification_context():
 
         instruments.append(make_roundtrip_instrument())
 
-    with passes.PassContext(instruments):
+    return instruments
+
+
+@pytest.fixture(autouse=True)
+def pass_verification_context(pass_verification_instruments):
+    """Enable the configured checks for all pass executions."""
+    with passes.PassContext(pass_verification_instruments):
         yield

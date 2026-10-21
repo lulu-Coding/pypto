@@ -94,6 +94,23 @@ std::string CodegenBase::GenerateExprString(const ir::ExprPtr& expr) const {
   if (auto ge = As<Ge>(expr)) {
     return "(" + GenerateExprString(ge->left_) + " >= " + GenerateExprString(ge->right_) + ")";
   }
+  // IR logical operators evaluate both operands. Normalize to bool before
+  // applying bitwise operators so C++ preserves eager evaluation and truth values.
+  if (auto logical_and = As<And>(expr)) {
+    return "static_cast<bool>(static_cast<bool>(" + GenerateExprString(logical_and->left_) +
+           ") & static_cast<bool>(" + GenerateExprString(logical_and->right_) + "))";
+  }
+  if (auto logical_or = As<Or>(expr)) {
+    return "static_cast<bool>(static_cast<bool>(" + GenerateExprString(logical_or->left_) +
+           ") | static_cast<bool>(" + GenerateExprString(logical_or->right_) + "))";
+  }
+  if (auto logical_xor = As<Xor>(expr)) {
+    return "(static_cast<bool>(" + GenerateExprString(logical_xor->left_) + ") != static_cast<bool>(" +
+           GenerateExprString(logical_xor->right_) + "))";
+  }
+  if (auto logical_not = As<Not>(expr)) {
+    return "(!" + GenerateExprString(logical_not->operand_) + ")";
+  }
   if (auto const_float = As<ConstFloat>(expr)) {
     return std::to_string(const_float->value_);
   }
@@ -130,7 +147,7 @@ std::string CodegenBase::GetRuntimeDataTypeString(const DataType& dtype) const {
   if (dtype == DataType::FP8E4M3FN) return "DataType::FP8E4M3FN";
   if (dtype == DataType::FP8E5M2) return "DataType::FP8E5M2";
   if (dtype == DataType::FP8E8M0) return "DataType::FP8E8M0";
-  if (dtype == DataType::FP4) return "DataType::FP4E2M1";
+  if (dtype == DataType::FP4 || dtype == DataType::FP4E2M1X2) return "DataType::FP4E2M1";
   // INDEX is a semantic type in the IR; the runtime represents it as INT64
   if (dtype == DataType::INDEX) return "DataType::INT64";
   if (dtype == DataType::INT64) return "DataType::INT64";

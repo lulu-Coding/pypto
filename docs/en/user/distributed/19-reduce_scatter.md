@@ -107,14 +107,17 @@ The reveal replaces phases 2–3 with one call:
     return pl.store(acc, [0, 0], y)
 ```
 
-- **`op=` picks the reduction, but only `Sum` is implemented.** The parameter
-  exists and defaults to `pld.ReduceOp.Sum`; `Max`, `Min` and `Prod` are
-  *reserved* on this collective and are rejected up front, at type deduction:
-  `pld.tensor.reduce_scatter op must be ReduceOp.Sum (got int N); Max / Min /
-  Prod lowerings are not yet implemented`. This is
-  narrower than `pld.tensor.allreduce`, which does take the whole family —
-  don't carry that assumption across from step 11
-  ([16-allreduce_reveal](16-allreduce_reveal.md)).
+- **`op=` picks the reduction — the full family on this path.** The parameter
+  defaults to `pld.ReduceOp.Sum`; on the InCore composite rail this example
+  uses, `Max`, `Min`, and `Prod` are supported too, the same dispatch
+  `pld.tensor.allreduce` uses. The restriction is narrower elsewhere: the
+  **HOST builtin** rail (a different lowering, not exercised by this step)
+  lowers `Sum`/FP32 only. A non-Sum op is rejected with
+  `builtin.tensor.reduce_scatter op must be ReduceOp.Sum (got int N)`;
+  `Sum` with a non-FP32 dtype is rejected with
+  `builtin.tensor.reduce_scatter currently supports only (op=ReduceOp.Sum, dtype=FP32)`.
+  Don't carry that HOST-only restriction across to the InCore form you're
+  writing here.
 - **Row `my_rank` of the window is your reduced chunk** — the same
   row-per-chunk layout the hand-rolled version used.
 
@@ -156,7 +159,7 @@ second half (allgather) you built in step 13.
 | Every rank gets the same chunk | Reduced row fixed to `[0, 0]` | Reduce row `my_rank` |
 | Wrong chunk boundaries | Chunk offset arithmetic wrong | Chunk `c` at `[0, c*SIZE]` in `x`, row `c` in `data` |
 | Result differs from torch (tolerance ok) | Reduction order differs per rank | Compare with a tolerance, not exact equality |
-| `pld.tensor.reduce_scatter op must be ReduceOp.Sum` | `op=Max`/`Min`/`Prod` — reserved, not implemented on this collective | Use `pld.ReduceOp.Sum`; for a non-Sum reduction use `pld.tensor.allreduce`, which takes the full family |
+| `builtin.tensor.reduce_scatter op must be ReduceOp.Sum` | Called the **HOST builtin** path with `op=Max`/`Min`/`Prod` | Use `pld.ReduceOp.Sum` on the HOST path, or use the InCore composite path (this step's example), which supports the full family |
 
 ## See also
 

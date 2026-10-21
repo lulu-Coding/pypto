@@ -38,6 +38,7 @@
 #include "pypto/ir/memory_space.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/phase.h"
+#include "pypto/ir/pipe.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/tile_view_semantics.h"
@@ -189,6 +190,12 @@ TypePtr DeduceTileLoadType(const std::vector<ExprPtr>& args,
       break;
     }
   }
+  if (tensor_type->dtype_.IsFp4Family() && target_memory_opt.has_value()) {
+    CHECK_SPAN(!IsCubeMemorySpace(*target_memory_opt), args[0]->span_)
+        << "The operator " << op_name
+        << " cannot load FP4/FP4E2M1X2 into cube memory (Mat/Left/Right/Acc/Bias/scale); "
+           "load to Vec, cast to FP8, then move into cube";
+  }
   const bool is_mx_load =
       tensor_type->tensor_view_.has_value() && IsMxTensorLayout(tensor_type->tensor_view_->layout);
   if (is_mx_load) {
@@ -255,9 +262,9 @@ TypePtr DeduceTileLoadType(const std::vector<ExprPtr>& args,
           << "The operator " << op_name
           << " of a blocked MX-layout tensor requires physical valid_shape to equal shapes";
     }
-    // MX cube scale loads are Mat-only (TLoadMxCube*) and require the caller to
-    // spell the target explicitly. The public load interface keeps its ordinary
-    // Vec default, so an omitted target fails instead of being silently changed.
+    // MX cube scale loads are Mat-only (TLoadMxCube*). The public load builder
+    // normalizes an omitted target to Mat; raw tile.load IR must carry that
+    // explicit Mat target.
     CHECK_SPAN(target_memory_opt.has_value() && *target_memory_opt == MemorySpace::Mat, args[0]->span_)
         << "The operator " << op_name << " of an MX-layout tensor requires target_memory=MemorySpace.Mat";
   }
@@ -411,9 +418,43 @@ TypePtr DeduceTileStoreType(const std::vector<ExprPtr>& args,
       << "The operator " << op_name
       << " requires third argument to be a TensorType or DistributedTensorType, but got "
       << args[2]->GetType()->TypeName();
-  CHECK_SPAN(!output_tensor_type->tensor_view_ || !IsMxTensorLayout(output_tensor_type->tensor_view_->layout),
-             args[2]->span_)
-      << "The operator " << op_name << " does not support MX-layout output tensors";
+  // MX scale tensors are written in their logical 2-D coordinates here. The
+  // BlockMxScaleTensorViews pass converts both the destination and these
+  // coordinates to the packed rank-5 SFractal representation before codegen.
+  // Validate the hardware-facing source contract here so malformed authored
+  // stores remain user errors rather than surfacing as pass/codegen invariants.
+  if (output_tensor_type->tensor_view_ && IsMxTensorLayout(output_tensor_type->tensor_view_->layout)) {
+    const TensorLayout destination_layout = output_tensor_type->tensor_view_->layout;
+    const TileView source_view = tile_view_semantics::GetEffectiveTileView(*tile_type);
+    CHECK_SPAN(tile_type->dtype_ == DataType::FP8E8M0, args[0]->span_)
+        << "The operator " << op_name << " into an MX-layout tensor requires an FP8E8M0 source tile, but got "
+        << tile_type->dtype_.ToString();
+    CHECK_SPAN(source_view.fractal == tile_view_semantics::kMXScaleFractal, args[0]->span_)
+        << "The operator " << op_name << " into an MX-layout tensor requires a fractal-32 source tile";
+
+    const bool is_a = destination_layout == TensorLayout::MX_A_ZZ;
+    const TileLayout required_layout = is_a ? TileLayout::row_major : TileLayout::col_major;
+    CHECK_SPAN(source_view.blayout == required_layout && source_view.slayout == required_layout,
+               args[0]->span_)
+        << "The operator " << op_name << " requires source "
+        << (is_a ? "row_major/row_major/32" : "col_major/col_major/32") << " for "
+        << TensorLayoutToString(destination_layout) << " destination";
+
+    CHECK_SPAN(source_view.valid_shape.size() == 2, args[0]->span_)
+        << "The operator " << op_name << " into an MX-layout tensor requires a 2D source tile";
+    auto rows = As<ConstInt>(source_view.valid_shape[0]);
+    auto cols = As<ConstInt>(source_view.valid_shape[1]);
+    CHECK_SPAN(rows && cols && rows->value_ > 0 && cols->value_ > 0, args[0]->span_)
+        << "The operator " << op_name
+        << " into an MX-layout tensor requires static positive source valid dimensions";
+    const int64_t row_alignment =
+        is_a ? tile_view_semantics::kMXSFractalRows : tile_view_semantics::kMXSFractalCols;
+    const int64_t col_alignment =
+        is_a ? tile_view_semantics::kMXSFractalCols : tile_view_semantics::kMXSFractalRows;
+    CHECK_SPAN(rows->value_ % row_alignment == 0 && cols->value_ % col_alignment == 0, args[0]->span_)
+        << "The operator " << op_name << " requires complete " << row_alignment << "x" << col_alignment
+        << " MX scale boxes, but got source valid shape [" << rows->value_ << ", " << cols->value_ << "]";
+  }
 
   // Optional fourth argument (when 4 args total) must be a shapes tuple
   MakeTuplePtr shapes_tuple;
@@ -438,7 +479,7 @@ TypePtr DeduceTileStoreType(const std::vector<ExprPtr>& args,
       << " atomic kwarg must be AtomicType.None_ or AtomicType.Add, but got int " << atomic;
   if (atomic == static_cast<int>(AtomicType::kAdd)) {
     const DataType& dt = tile_type->dtype_;
-    // Hardware atomic-add dtypes. bf16 is honoured on the A2/A3 (Ascend910B) and
+    // Hardware atomic-add dtypes. bf16 is honoured on the A2/A3 (Ascend910) and
     // kirinX90 profiles (pto-isa SetAtomicAdd<bfloat16_t> -> set_atomic_bf16);
     // it is NOT supported on the A5/kirin9030 store path, where a bf16 atomic
     // store is rejected downstream by the pto-isa static_assert.
@@ -462,17 +503,22 @@ TypePtr DeduceTileStoreType(const std::vector<ExprPtr>& args,
   const std::vector<ExprPtr>& dest_shape = output_tensor_type->shape_;
   const size_t dest_rank = dest_shape.size();
 
-  // The optional ``shapes`` operand carries FlattenTileNdTo2D's ND partition,
-  // which is a *collapsed-dims* descriptor rather than a rectangle in
-  // destination coordinates: it is built as leading 1s followed by the
-  // pre-flatten tile shape, whose leading extent may be the product of several
-  // destination axes. A [2, 3, 8] gather, for one, stores its collapsed [6, 8]
-  // tile as partition [1, 6, 8], where 6 spans two axes of a destination whose
-  // own axis 1 is only 3. Codegen consumes that through pto.partition_view,
-  // which understands the collapse; reading it as an origin-anchored rectangle
-  // here would both mis-bound the write and place the union on the wrong axes.
-  // So the ND form keeps the destination type it had — recovering the written
-  // region on ND axes is the ND-to-2D mapping problem, not this rule's.
+  // The optional ``shapes`` operand carries FlattenTileNdTo2D's ND partition
+  // window. It IS a rectangle in destination coordinates: a box the destination
+  // contains, anchored at the store's own offsets. It used to be a
+  // *collapsed-dims* descriptor instead — leading 1s followed by the pre-flatten
+  // tile shape, so a [2, 3, 8] gather stored its collapsed [6, 8] tile as
+  // [1, 6, 8], where 6 spanned two axes of a destination whose own axis 1 is
+  // only 3. That form was not lowerable: pto.partition_view describes a box and
+  // nothing else, and PTOAS >= 0.61 rejects an out-of-bounds size outright. The
+  // pass now emits [2, 3, 8] there and refuses the stores that have no box at
+  // all. See ComputeStorePartitionShape.
+  //
+  // Deriving the valid-region union from that rectangle is now possible in
+  // principle, but it is a separate change: the union below is written against
+  // the tile's own extent, and an ND partition covers a window the 2D tile only
+  // describes after the flatten mapping. So the ND form still keeps the
+  // destination type it had.
   if (shapes_tuple) {
     return output_tensor_type;
   }
@@ -540,6 +586,10 @@ TypePtr DeduceTileMoveType(const std::vector<ExprPtr>& args,
 
   // Extract MemorySpace
   MemorySpace space = GetKwarg<MemorySpace>(kwargs, "target_memory");
+  CHECK_SPAN(!tile_type->dtype_.IsFp4Family() || !IsCubeMemorySpace(space), args[0]->span_)
+      << "The operator " << op_name
+      << " cannot move FP4/FP4E2M1X2 into cube memory (Mat/Left/Right/Acc/Bias/scale); "
+         "cast to FP8 on Vec first";
 
   const auto& input_shape = tile_type->shape_;
 
@@ -596,19 +646,22 @@ TypePtr DeduceTileMoveType(const std::vector<ExprPtr>& args,
   tile_view.slayout = requested_slayout;
 
   // TQUANT produces its exponent bytes as row/row/32 and the MX_B_NN path
-  // materializes col/col/32 with a Vec-to-Vec TMOV.  Vec's ordinary implicit
-  // fractal is 512, so retaining the source's MX-scale marker here keeps the
-  // moved result type consistent with the physical 32-byte scale boxes.  Keep
-  // this exception deliberately narrow: byte-valued scale payloads, complete
-  // row/row or col/col layouts, and a Vec destination.
+  // materializes col/col/32 with a Vec-to-Vec TMOV. Preserve that scale boxing
+  // while staging a public FP8E8M0 scale through Mat for a cross-core transfer.
   const bool source_is_complete_box =
       source_view.blayout == source_view.slayout && source_view.blayout != TileLayout::none_box;
   const bool destination_is_complete_box =
       requested_blayout == requested_slayout && requested_blayout != TileLayout::none_box;
   const bool is_mx_scale_payload =
       tile_type->dtype_ == DataType::UINT8 || tile_type->dtype_ == DataType::FP8E8M0;
-  if (space == MemorySpace::Vec && source_view.fractal == tile_view_semantics::kMXScaleFractal &&
-      source_is_complete_box && destination_is_complete_box && is_mx_scale_payload) {
+  const bool is_vec_move = space == MemorySpace::Vec;
+  const bool is_vec_to_mat_staging =
+      space == MemorySpace::Mat &&
+      (!tile_type->memory_space_.has_value() || tile_type->memory_space_ == MemorySpace::Vec);
+  const bool preserves_mx_scale_boxes = (is_vec_move && is_mx_scale_payload) ||
+                                        (is_vec_to_mat_staging && tile_type->dtype_ == DataType::FP8E8M0);
+  if (preserves_mx_scale_boxes && source_view.fractal == tile_view_semantics::kMXScaleFractal &&
+      source_is_complete_box && destination_is_complete_box) {
     tile_view.fractal = tile_view_semantics::kMXScaleFractal;
   }
 
@@ -713,6 +766,12 @@ TypePtr DeduceTileCreateTileType(const std::vector<ExprPtr>& args,
       << "The operator " << op_name
       << " does not support target_memory=LeftScale/RightScale; create the scale tile with tile.load "
          "to Mat followed by tile.move";
+  if (dtype.IsFp4Family() && target_memory_opt.has_value()) {
+    CHECK_SPAN(!IsCubeMemorySpace(*target_memory_opt), args[0]->span_)
+        << "The operator " << op_name
+        << " cannot create an FP4/FP4E2M1X2 tile on cube memory (Mat/Left/Right/Acc/Bias/scale); "
+           "create on Vec, cast to FP8, then move into cube";
+  }
 
   TileView tile_view;
   // `transpose=true` requests the transposed Mat (ZN) fractal layout
@@ -1271,6 +1330,12 @@ REGISTER_OP("tile.store")
                   "Injected by FlattenTileNdTo2D for ND tensors.")
     .set_attr<int>("atomic")
     .set_attr<int>("st_phase")
+    // FIXPIPE pre-ops on an Acc->GM writeback (`pto.tstore`): `pre_quant` is an
+    // FP32 scale the accumulator is multiplied by on the way out, `pre_relu` an
+    // activation applied after that multiply and the destination clamp. Both are
+    // meaningless for a Vec source and rejected there by `AccToGmStoreValid`.
+    .set_attr<double>("pre_quant")
+    .set_attr<bool>("pre_relu")
     .set_input_memory(0, {MemorySpace::Vec, MemorySpace::Acc})
     .set_output_reuses_input(2)
     // A plain store overwrites the region it lands on: the untouched remainder

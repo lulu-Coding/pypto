@@ -1,5 +1,9 @@
 # Mixed Kernels
 
+> **Legacy Python API examples:** `platform=` calls on this page are retained for
+> compatibility. They emit `DeprecationWarning`; new code should use
+> `backend_type` and `execution_mode`. See the [target mapping](../../dev/08-entry-points.md#legacy-platform-examples).
+
 Cube and vector working at the same time, inside one scope.
 
 > **Prerequisites:** [Tiled matmul](02-matmul.md).
@@ -151,7 +155,7 @@ a gather that only one lane can compute, or a region that mixes split and unspli
 Otherwise stay on `pl.split` — it inserts the same operators and gets the pairing right.
 
 For the machine-level contract see [TPUSH/TPOP](../../reference/pto-isa/01-tpush_tpop.md);
-for what the pass does, [ExpandMixedKernel](../../dev/passes/24-expand_mixed_kernel.md).
+for what the pass does, [ExpandMixedKernel](../../dev/passes/25-expand_mixed_kernel.md).
 
 ## Edge Cases
 

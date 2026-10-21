@@ -13,6 +13,7 @@ import os
 import re
 from collections.abc import Callable
 from enum import Enum, unique
+from pathlib import Path
 
 from pypto.compile_profiling import CompileProfiler
 from pypto.pypto_core import ir as core_ir
@@ -80,6 +81,20 @@ def _format_warnings(
             out.append(f"{dump_filename}: warning: {d.message} [{d.rule_name}]")
 
     return "\n".join(out) + "\n" if out else ""
+
+
+def _write_ir_dump(program: core_ir.Program, path: str, prefix: str, explicit_layout: bool) -> str:
+    """Keep readable dumps and lossless Buffer companions together."""
+    content = python_print(program, prefix=prefix, explicit_layout=explicit_layout)
+    Path(path).write_text(content if content.endswith("\n") else content + "\n")
+    binary_path = Path(path).with_suffix(".msgpack")
+    if any(function.ir_stage == core_ir.FunctionIRStage.Buffer for function in program.functions.values()):
+        # Buffer Python text is diagnostic, not executable DSL. Reuse the same
+        # binary boundary as the roundtrip instrument for numerical replay.
+        binary_path.write_bytes(core_ir.serialize(program))
+    else:
+        binary_path.unlink(missing_ok=True)
+    return content
 
 
 PassFactory = Callable[[], passes.Pass]
@@ -171,13 +186,14 @@ class PassManager:
             passes.outline_graph_scopes,
             passes.outline_incore_scopes,
             passes.outline_cluster_scopes,
+            passes.deduplicate_outlined_kernels,
             passes.convert_tensor_to_tile_ops,
             passes.optimize_orch_tensors,
         )
         tile_pto_passes: tuple[PassFactory, ...] = (
             passes.lower_composite_ops,
             passes.flatten_tile_nd_to_2d,
-            # Rewrite `pl.NZ` tensors into pto-isa's blocked rank-(r+2) form and
+            # Rewrite `pl.NZ` tensors into pto-isa's blocked rank-5 form and
             # retarget their tile.load coordinates. Runs immediately after
             # FlattenTileNdTo2D so the destination tile is already the logical 2D
             # operand: blocking a still-ND-rank tile would leave a tile.load whose
@@ -233,20 +249,23 @@ class PassManager:
             # lifetime reuse.
             passes.materialize_semantic_aliases,
             # MemoryReuse coalesces independent tile buffers by lifetime; on
-            # Ascend910B split-AIV it also avoids the load + tpop_from_aic in-place
+            # Ascend910 split-AIV it also avoids the load + tpop_from_aic in-place
             # hazard so a separate legalisation pass is no longer needed.
             passes.memory_reuse,
             passes.allocate_memory_addr,
             passes.fold_no_op_reshape,
             passes.fuse_create_assemble_to_slice,
             # Rewrite a managed collective written in a CHIP/L2 orchestration
-            # body into one local builtin AIV task. It runs here, immediately
+            # body into one local builtin AIV task. It runs here,
             # before DeriveCallDirections, because the emitted call must get its
             # argument directions and TensorMap task edges derived like any
             # other kernel call — that is what orders compute -> collective ->
             # consume inside a single per-rank pipeline. HOST orchestrators are
             # untouched; they keep the per-device fan-out rail below.
             passes.lower_l2_tensor_collectives,
+            # Guard dynamic launches before deriving directions and dependencies
+            # so both branches participate in storage/task lineage analysis.
+            passes.legalize_spmd_launches,
             passes.derive_call_directions,
             lambda: passes.auto_derive_task_dependencies(analyze_auto_scopes=analyze_auto_scopes_for_deps),
             passes.expand_manual_phase_fence,
@@ -361,6 +380,7 @@ class PassManager:
         # MemoryReuse yet still select dbC=2, coalescing the two co-live L0C accumulators
         # into one shrunk single-buffer tile (see _check_planner_consistency).
         self._construction_planner = ctx.get_memory_planner() if ctx else passes.MemoryPlanner.PYPTO
+        self._construction_buffer_ir = ctx.get_enable_buffer_ir() if ctx else True
         skipped_mem_planning_passes: tuple[str, ...]
         if self._construction_planner == passes.MemoryPlanner.PTOAS:
             skipped_mem_planning_passes = ("MemoryReuse", "AllocateMemoryAddr")
@@ -379,9 +399,18 @@ class PassManager:
         )
         for pass_factory in pass_factories:
             pass_obj = pass_factory()
+            if self._construction_buffer_ir and pass_obj.get_name() == "MaterializeSemanticAliases":
+                self._pipeline.add_pass(passes.select_buffer_ir_functions())
+            if self._construction_buffer_ir and pass_obj.get_name() == "AllocateMemoryAddr":
+                self._pipeline.add_pass(passes.verify_tile_storage())
             if pass_obj.get_name() in skipped_mem_planning_passes:
                 continue
             self._pipeline.add_pass(pass_obj)
+            if self._construction_buffer_ir and pass_obj.get_name() == "AllocateMemoryAddr":
+                self._pipeline.add_pass(passes.verify_tile_storage(allocated=True))
+
+        if self._construction_buffer_ir:
+            self._pipeline.add_pass(passes.lower_tile_to_buffer())
 
     @property
     def passes(self) -> tuple[passes.Pass, ...]:
@@ -394,7 +423,7 @@ class PassManager:
         return self._pipeline.get_pass_names()
 
     def _check_planner_consistency(self) -> None:
-        """Fail loud if the run-time memory planner differs from the construction-time one.
+        """Reject memory-planner or Buffer IR mode changes after construction.
 
         The pass list is fixed at construction: DSA_RP drops ``MemoryReuse`` and
         PTOAS also drops ``AllocateMemoryAddr``. Planner-gated pass behaviour,
@@ -402,10 +431,17 @@ class PassManager:
         ``GetMemoryPlanner()`` at execution time. Constructing under one planner
         and running under another would therefore combine the wrong pass list
         with the chosen lowering. ``compile()`` builds and runs under one
-        context, so this guard only catches direct PassManager misuse.
+        context, so this guard only catches direct PassManager misuse. The Buffer
+        IR mode also fixes which storage verifiers are present and must match.
         """
         ctx = passes.PassContext.current()
         run_planner = ctx.get_memory_planner() if ctx else passes.MemoryPlanner.PYPTO
+        run_buffer_ir = ctx.get_enable_buffer_ir() if ctx else True
+        if run_buffer_ir != self._construction_buffer_ir:
+            raise RuntimeError(
+                "PassManager enable_buffer_ir changed after construction. Build and run the "
+                "PassManager inside the same PassContext."
+            )
         if run_planner != self._construction_planner:
             raise RuntimeError(
                 f"PassManager was constructed under memory_planner={self._construction_planner!r} "
@@ -436,8 +472,9 @@ class PassManager:
 
         Raises:
             ValueError: If dumping is enabled but output_dir is None
-            RuntimeError: If the run-time memory planner differs from the one the
-                PassManager was constructed under (see _check_planner_consistency)
+            RuntimeError: If the run-time memory planner or Buffer IR mode differs
+                from the configuration used to construct the PassManager
+                (see _check_planner_consistency).
         """
         self._check_planner_consistency()
         dump_level = coerce_dump_level(dump_ir)
@@ -451,7 +488,7 @@ class PassManager:
         if output_dir is None:
             raise ValueError("output_dir is required when dumping IR")
 
-        if not isinstance(input_ir, core_ir.Program):
+        if not isinstance(input_ir, core_ir.Program):  # type: ignore[reportUnnecessaryIsInstance]  # defensive; the annotation is the contract
             raise ValueError("dump_ir mode only supports Program input")
 
         os.makedirs(output_dir, exist_ok=True)
@@ -462,11 +499,7 @@ class PassManager:
 
         # Save frontend IR
         frontend_path = os.path.join(output_dir, "00_frontend.py")
-        with open(frontend_path, "w") as f:
-            content = python_print(input_ir, prefix=prefix, explicit_layout=explicit_layout)
-            f.write(content)
-            if not content.endswith("\n"):
-                f.write("\n")
+        _write_ir_dump(input_ir, frontend_path, prefix, explicit_layout)
 
         # Use instrument for IR dumping -- verification handled by C++ pipeline.
         # Snapshot the pipeline-derived names for stable callback indexing during
@@ -501,11 +534,7 @@ class PassManager:
 
             # Dump IR
             dump_path = os.path.join(output_dir, f"{stem}.py")
-            with open(dump_path, "w") as f:
-                content = python_print(program, prefix=prefix, explicit_layout=explicit_layout)
-                f.write(content)
-                if not content.endswith("\n"):
-                    f.write("\n")
+            content = _write_ir_dump(program, dump_path, prefix, explicit_layout)
 
             # Dump per-pass warnings alongside the IR
             if not effective_checks.empty():
@@ -551,6 +580,7 @@ class PassManager:
         mplan = ctx.get_memory_planner() if ctx else passes.MemoryPlanner.PYPTO
         dbc_flag = ctx.get_enable_pypto_l0c_double_buffer() if ctx else False
         runtime = ctx.get_runtime() if ctx else passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER
+        buffer_ir = ctx.get_enable_buffer_ir() if ctx else True
         outer_phase = ctx.get_diagnostic_phase() if ctx else passes.get_default_diagnostic_phase()
         if outer_phase == passes.DiagnosticPhase.POST_PASS:
             inner_phase = passes.DiagnosticPhase.PRE_PIPELINE
@@ -558,7 +588,14 @@ class PassManager:
             inner_phase = outer_phase
 
         with passes.PassContext(
-            [*outer_instruments, *extra_instruments], level, inner_phase, disabled, mplan, dbc_flag, runtime
+            [*outer_instruments, *extra_instruments],
+            level,
+            inner_phase,
+            disabled,
+            mplan,
+            dbc_flag,
+            runtime,
+            buffer_ir,
         ):
             try:
                 return self._pipeline.run(input_ir)
@@ -596,6 +633,7 @@ class PassManager:
         mplan = ctx.get_memory_planner() if ctx else passes.MemoryPlanner.PYPTO
         dbc_flag = ctx.get_enable_pypto_l0c_double_buffer() if ctx else False
         runtime = ctx.get_runtime() if ctx else passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER
+        buffer_ir = ctx.get_enable_buffer_ir() if ctx else True
         dphase = ctx.get_diagnostic_phase() if ctx else passes.get_default_diagnostic_phase()
         if ctx:
             disabled = ctx.get_disabled_diagnostics()
@@ -604,7 +642,14 @@ class PassManager:
             disabled.insert(passes.DiagnosticCheck.UnusedControlFlowResult)
 
         with passes.PassContext(
-            [*outer_instruments, timing_instrument], level, dphase, disabled, mplan, dbc_flag, runtime
+            [*outer_instruments, timing_instrument],
+            level,
+            dphase,
+            disabled,
+            mplan,
+            dbc_flag,
+            runtime,
+            buffer_ir,
         ):
             try:
                 return self._pipeline.run(input_ir)

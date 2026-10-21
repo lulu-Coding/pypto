@@ -149,6 +149,7 @@ __all__ = [
     "lrelu",
     "sel",
     "sels",
+    "select",
     "tpush_to_aiv",
     "tpush_to_aic",
     "tpop_from_aic",
@@ -424,8 +425,9 @@ def load(
             be an integer scalar — one extent per dimension, not a nested
             ``[start, extent]`` pair.
         target_memory: Target memory space (MemorySpace.Vec or MemorySpace.Mat).
-            ``None`` (the default) leaves the space unset for the compiler to place.
-            MX-layout tensors require an explicit MemorySpace.Mat.
+            ``None`` (the default) leaves an ordinary load unset for the compiler
+            to place. MX-layout tensors default to MemorySpace.Mat so they can be
+            passed directly to ``matmul_mx`` and placed from its operand position.
         clamp: Sanction a read that runs off the end of the source. By default a
             load asserts ``offsets + valid_shape`` stays inside the source and is
             rejected when that provably fails; ``clamp=True`` cuts the request back
@@ -439,9 +441,11 @@ def load(
             the full contract). An explicit value here always wins over a
             scope-level ``pl.set_cache_policy`` declaration for the same tensor,
             in both directions: ``cache=CachePolicy.DEFAULT`` opts this one read
-            back into the cache inside a bypassing scope. PTOAS has no L2-bypass
-            path yet (https://github.com/hw-native-sys/PTOAS/issues/1356), so a
-            BYPASS request warns and compiles as an ordinary cached access today.
+            back into the cache inside a bypassing scope. Requires PTOAS >= v0.64,
+            where a BYPASS read compiles to a load issued against the page's
+            uncached alias on A2/A3 — the only architecture that maps GM twice,
+            and the only one where the declaration has an effect today; DEFAULT
+            emits nothing.
 
     Returns:
         Tile wrapping the load operation
@@ -474,6 +478,8 @@ def store(
     *,
     atomic: AtomicType = AtomicType.None_,
     st_phase: STPhase = STPhase.Unspecified,
+    pre_quant: float | None = None,
+    pre_relu: bool = False,
 ) -> _TensorT:
     """Copy data from tile back to tensor.
 
@@ -493,11 +499,27 @@ def store(
             floating-point results are non-deterministic. The destination must
             be zero-initialised before the kernel runs. Supported tile dtypes:
             fp32 / bf16 / fp16 / int32 / int16 / int8. bf16 atomic-add is
-            available on the Ascend910B (A2/A3) profile; it is not supported on
+            available on the Ascend910 (A2/A3) profile; it is not supported on
             A5, where an fp32 accumulator + cast is required instead.
         st_phase: Consumer-side unit-flag phase. A producer that finishes with
             ``acc_phase=pl.AccPhase.Final`` must be consumed by a store with
             ``st_phase=pl.STPhase.Final`` so the unit flag is cleared.
+        pre_quant: Scale applied by the cube's FIXPIPE while it drains an ``Acc``
+            tile to global memory — the write becomes ``out = tile * pre_quant``
+            in one instruction, with no vector work. This is what makes a
+            *scale-bearing* conversion reachable from a cube accumulator: an
+            INT32 accumulator into an FP16 tensor (dequantization) or into an
+            INT8 one (requantization), neither of which the unscaled writeback
+            can do. Legal source/destination dtype pairs are backend-specific
+            and rejected here rather than in the assembler. ``None`` (default)
+            emits no scale; ``1.0`` is a real identity scale and still selects
+            the quantizing form.
+        pre_relu: Apply ReLU in the same writeback. It runs on the *accumulator*,
+            **before** ``pre_quant`` — pto-isa spells it ``ReluPreMode`` — with
+            the destination clamp last, so the pair reproduces
+            ``maximum(tile, 0) * pre_quant`` and not
+            ``maximum(tile * pre_quant, 0)``. The two agree for every positive
+            scale and differ at every element for a negative one.
 
     Returns:
         Tensor wrapping the store operation
@@ -511,6 +533,8 @@ def store(
         >>> result = store(partial, [0, 0], out, atomic=pl.AtomicType.Add)
         >>> # clear the unit flag after a final phased accumulation
         >>> result = store(acc, [0, 0], out, st_phase=pl.STPhase.Final)
+        >>> # INT32 accumulator dequantized and ReLU'd straight into FP16 GM
+        >>> result = store(acc_i32, [0, 0], out_f16, pre_quant=1.0 / 1024, pre_relu=True)
     """
     normalized_offsets = _normalize_intlike(offsets)
     normalized_shapes = _normalize_intlike(shapes) if shapes is not None else None
@@ -521,22 +545,64 @@ def store(
         normalized_shapes,
         atomic=int(atomic),
         st_phase=st_phase,
+        pre_quant=pre_quant,
+        pre_relu=pre_relu,
     )
     return output_tensor.__class__(expr=call_expr)
 
 
-def assemble(target: Tile, source: Tile, offset: Sequence[IntLike]) -> Tile:
+def assemble(
+    target: Tile,
+    source: Tile,
+    offset: Sequence[IntLike],
+    *,
+    pre_quant: float | None = None,
+    pre_relu: bool = False,
+) -> Tile:
     """Write source tile data into target tile at specified offset.
 
     Args:
         target: Target tile to update
         source: Source tile to write
         offset: Offset dimensions for where to write
+        pre_quant: Scale applied by the cube's FIXPIPE while it drains an ``Acc``
+            source into a ``Mat`` target — the write becomes
+            ``target[offset] = source * pre_quant`` in one instruction, with no
+            vector work. This is what makes a *scale-bearing* conversion
+            reachable from a cube accumulator: an INT32 accumulator into an FP16
+            Mat tile (dequantization), which the next matmul can then read
+            on-chip. ``None`` (default) emits no scale; ``1.0`` is a real
+            identity scale and still selects the quantizing form.
+
+            **Currently rejected on every backend** (PTOAS#1570). ptoas assembles the scale
+            onto ``pto.tinsert`` but emits a pto-isa call that binds it to the
+            row index instead, silently dropping it, so PyPTO refuses the whole
+            destination rather than emit a kernel that computes the wrong thing.
+            Use the Acc -> GM form — ``tile.store(acc, ..., pre_quant=s)``, which
+            is device-verified — or scale in the vector unit. ``pre_relu`` alone
+            is unaffected here.
+        pre_relu: Apply ReLU in the same writeback. It runs on the *accumulator*,
+            **before** ``pre_quant`` — pto-isa spells it ``ReluPreMode`` — with
+            the destination clamp last, so the pair reproduces
+            ``maximum(source, 0) * pre_quant`` and not
+            ``maximum(source * pre_quant, 0)``. The two agree for every positive
+            scale and differ at every element for a negative one.
 
     Returns:
         Tile wrapping the assemble operation
+
+    Example:
+        >>> # INT32 accumulator dequantized and ReLU'd into an FP16 Mat scratch
+        >>> s = create([128, 128], pl.FP16, target_memory=pl.Mem.Mat)
+        >>> s = assemble(s, acc_i32, [0, 0], pre_quant=1.0 / 1024, pre_relu=True)
     """
-    call_expr = _ir_ops.assemble(target.unwrap(), source.unwrap(), _normalize_intlike(offset))
+    call_expr = _ir_ops.assemble(
+        target.unwrap(),
+        source.unwrap(),
+        _normalize_intlike(offset),
+        pre_quant=pre_quant,
+        pre_relu=pre_relu,
+    )
     return Tile(expr=call_expr)
 
 
@@ -899,10 +965,23 @@ def random(
     Returns:
         Tile wrapping the random operation.
     """
-    raw_seeds = (key0, key1, counter0, counter1, counter2, counter3)
-    seeds = [v.unwrap() if isinstance(v, Scalar) else v for v in raw_seeds]
+
+    def _seed_expr(seed: int | Scalar) -> int | Expr:
+        return seed.unwrap() if isinstance(seed, Scalar) else seed
+
     vshape = list(valid_shape) if valid_shape is not None else None
-    call_expr = _ir_ops.random(*seeds, list(shape), valid_shape=vshape, dtype=dtype, rounds=rounds)
+    call_expr = _ir_ops.random(
+        _seed_expr(key0),
+        _seed_expr(key1),
+        _seed_expr(counter0),
+        _seed_expr(counter1),
+        _seed_expr(counter2),
+        _seed_expr(counter3),
+        list(shape),
+        valid_shape=vshape,
+        dtype=dtype,
+        rounds=rounds,
+    )
     return Tile(expr=call_expr)
 
 
@@ -1084,6 +1163,8 @@ def div(
         lhs: Left-hand side tile
         rhs: Right-hand side tile or scalar
         high_precision: Whether to select PTOAS's high-precision division mode.
+            Honoured only on A5: A2/A3 PTO-ISA ignores it and returns the default
+            result, which compilation warns about.
             Only available when ``rhs`` is a Tile.
 
     Returns:
@@ -1241,7 +1322,9 @@ def recip(tile: Tile, high_precision: bool = False) -> Tile:
 
     Args:
         tile: Input tile
-        high_precision: Whether to select PTOAS's high-precision reciprocal mode (FP16/FP32 only)
+        high_precision: Whether to select PTOAS's high-precision reciprocal mode
+            (FP16/FP32 only). Honoured only on A5: A2/A3 PTO-ISA ignores it and
+            returns the default result, which compilation warns about.
 
     Returns:
         Tile wrapping the recip operation
@@ -1255,7 +1338,9 @@ def log(tile: Tile, high_precision: bool = False) -> Tile:
 
     Args:
         tile: Input tile
-        high_precision: Whether to select PTOAS's high-precision logarithm mode
+        high_precision: Whether to select PTOAS's high-precision logarithm mode.
+            Honoured only on A5: A2/A3 PTO-ISA ignores it and returns the default
+            result, which compilation warns about.
 
     Returns:
         Tile wrapping the log operation
@@ -1368,10 +1453,9 @@ def quant_mx(
         Cube RHS layout; scale col/col NN.
 
     Note:
-        ``quant_mx`` and ``matmul_mx`` cannot currently share one InCore mixed
-        task. Stage the quantized data and scale through GM between separate
-        AIV and AIC kernels; automatic cross-core data+scale transport is a
-        follow-up.
+        On Ascend950, ``quant_mx`` and ``matmul_mx`` may share one InCore mixed
+        task. The compiler carries both generated results over V2C; the
+        FP8E8M0 scale keeps its logical MX scale layout.
     """
     if group_axis not in (0, 1):
         raise ValueError(f"pl.quant_mx group_axis must be 0 or 1, but got {group_axis!r}")
@@ -2390,6 +2474,11 @@ def reinterpret_view(
 ) -> Tile:
     """Reinterpret a tile over the same bytes with a different dtype.
 
+    FP4E2M1X2 <-> UINT8/INT8 preserves the carrier shape and requires a
+    dense address-backed 2D row-major Vec tile with a static UB offset.
+    Reshape the byte view separately before aliasing back. On A5, PYPTO
+    and DSA_RP support these aliases; PTOAS 0.65 planning is unsupported.
+
     Args:
         data: Input tile.
         dtype: Target element dtype, which must differ from the source dtype.
@@ -2483,6 +2572,8 @@ def rem(lhs: Tile, rhs: Tile, tmp: Tile, high_precision: bool = False) -> Tile:
             provably provides two rows and covers the dividend columns on
             A2/A3. It must not overlap either source there.
         high_precision: Whether to select PTOAS's high-precision TREM mode.
+            Honoured only on A5: A2/A3 PTO-ISA ignores it and returns the default
+            result, which compilation warns about.
             This mode is defined only for FP32 and is ignored by A2/A3 hardware.
 
     Returns:
@@ -2592,6 +2683,8 @@ def fmod(lhs: Tile, rhs: Tile, high_precision: bool = False) -> Tile:
         lhs: Left-hand side tile
         rhs: Right-hand side tile
         high_precision: Whether to select PTOAS's high-precision TFMOD mode.
+            Honoured only on A5: A2/A3 PTO-ISA ignores it and returns the default
+            result, which compilation warns about.
             This mode is defined only for FP32.
 
     Returns:
@@ -2987,6 +3080,55 @@ def sels(mask: Tile, src: Tile, tmp: Tile, scalar: int | float | Expr | Scalar) 
     return Tile(expr=call_expr)
 
 
+def select(
+    cond: Tile,
+    on_true: Tile | int | float | Expr | Scalar,
+    on_false: Tile | int | float | Expr | Scalar,
+) -> Tile:
+    """Per-element value selection: ``out[i] = cond[i] ? on_true[i] : on_false[i]``.
+
+    The scratch-free counterpart of :func:`sel` / :func:`sels`: the mask geometry
+    and the architecture's scratch tile are derived during lowering, so neither
+    appears in the call.
+
+    Both branches are evaluated. This selects values -- it is not a branch, and
+    it applies no memory-access or tail masking of its own.
+
+    Two Tile branches must share a shape, valid extents, and dtype; the lowered TSEL reads both sources
+    element-wise, does not broadcast, and has one element type for both sources
+    and the result. A scalar branch must be a compile-time
+    constant and requires a statically shaped result, because the lowering
+    materializes it with ``tile.full``.
+
+    Example — clamp, composing two selects::
+
+        hi_clamped = pl.tile.select(pl.tile.cmps(v, upper, cmp_type=3), v, upper)   # v <= upper
+        clamped = pl.tile.select(pl.tile.cmps(v, lower, cmp_type=5), hi_clamped, lower)  # v >= lower
+
+    Args:
+        cond: The packed predicate mask returned by :func:`cmp` / :func:`cmps`
+            for this result's geometry. For a 0/1 value tile, compare it first:
+            ``pl.tile.cmps(value, 0, cmp_type=1)``
+        on_true: Value selected where cond is true; a Tile or a constant scalar
+        on_false: Value selected where cond is false; same forms as on_true
+
+    Returns:
+        Tile wrapping the select operation
+
+    Raises:
+        ValueError: If cond is not this result's packed predicate mask, if both
+            on_true and on_false are scalars, if two Tile branches disagree on
+            shape, valid extents, or dtype, or if a scalar branch is not a
+            compile-time constant
+    """
+
+    def _unwrap(value: Tile | int | float | Expr | Scalar) -> int | float | Expr:
+        return value.unwrap() if isinstance(value, (Tile, Scalar)) else value
+
+    call_expr = _ir_ops.select(cond.unwrap(), _unwrap(on_true), _unwrap(on_false))
+    return Tile(expr=call_expr)
+
+
 def sort32(src: Tile, idx: Tile, *, tmp: Tile | None = None) -> Tile:
     """Sort fixed 32-element blocks with explicit index tile.
 
@@ -3342,6 +3484,19 @@ def mrgsort(
     src3: Tile,
     tmp: Tile,
     exhausted: bool = ...,
+) -> Tile: ...
+
+
+@overload
+def mrgsort(
+    src0: Tile,
+    src1: Tile | None = ...,
+    src2: Tile | None = ...,
+    src3: Tile | None = ...,
+    tmp: Tile | None = ...,
+    exhausted: bool = ...,
+    *,
+    block_len: int | Scalar | None = ...,
 ) -> Tile: ...
 
 

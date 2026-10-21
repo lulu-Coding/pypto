@@ -189,7 +189,8 @@ FunctionPtr IRMutator::VisitFunction(const FunctionPtr& func) {
   // ``func->attrs_`` would deduce a const reference and silently copy instead.
   return std::make_shared<const Function>(func->name_, std::move(new_params), func->param_directions_,
                                           std::move(new_return_types), std::move(new_body), func->span_,
-                                          func->func_type_, func->level_, func->role_, std::move(new_attrs));
+                                          func->func_type_, func->level_, func->role_, std::move(new_attrs),
+                                          func->requires_runtime_binding_, func->ir_stage_);
 }
 
 ExprPtr IRMutator::VisitExpr(const ExprPtr& expr) { return ExprFunctor<ExprPtr>::VisitExpr(expr); }
@@ -932,9 +933,13 @@ StmtPtr IRMutator::VisitStmt_(const ClusterScopeStmtPtr& op) {
   INTERNAL_CHECK_SPAN(op->body_, op->span_) << "ClusterScopeStmt has null body";
   auto new_body = StmtFunctor<StmtPtr>::VisitStmt(op->body_);
   INTERNAL_CHECK_SPAN(new_body, op->span_) << "ClusterScopeStmt body mutated to null";
-  if (new_body.get() != op->body_.get()) {
+  // ``kAttrDumpVars`` (``pl.dump_tag`` / ``dumps=``) names Vars, so a
+  // Var-substituting pass must rewrite it like the InCore / Spmd handlers do.
+  auto [new_attrs, attrs_changed] = MutateScopeAttrs(op->attrs_);
+  if (new_body.get() != op->body_.get() || attrs_changed) {
     auto result = MutableCopy(op);
     result->body_ = std::move(new_body);
+    if (attrs_changed) result->attrs_ = std::move(new_attrs);
     return result;
   }
   return op;
@@ -944,9 +949,13 @@ StmtPtr IRMutator::VisitStmt_(const GraphScopeStmtPtr& op) {
   INTERNAL_CHECK_SPAN(op->body_, op->span_) << "GraphScopeStmt has null body";
   auto new_body = StmtFunctor<StmtPtr>::VisitStmt(op->body_);
   INTERNAL_CHECK_SPAN(new_body, op->span_) << "GraphScopeStmt body mutated to null";
-  if (new_body.get() != op->body_.get()) {
+  // ``kAttrDumpVars`` (``pl.dump_tag`` / ``dumps=``) names Vars, so a
+  // Var-substituting pass must rewrite it like the InCore / Spmd handlers do.
+  auto [new_attrs, attrs_changed] = MutateScopeAttrs(op->attrs_);
+  if (new_body.get() != op->body_.get() || attrs_changed) {
     auto result = MutableCopy(op);
     result->body_ = std::move(new_body);
+    if (attrs_changed) result->attrs_ = std::move(new_attrs);
     return result;
   }
   return op;

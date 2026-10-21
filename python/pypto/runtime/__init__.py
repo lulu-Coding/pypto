@@ -22,7 +22,7 @@ one config object can drive both phases::
     from pypto import ir
     from pypto.runtime import RunConfig
 
-    config = RunConfig(platform="a2a3sim")
+    config = RunConfig()
     compiled = ir.compile(MyProgram, **config.compile_kwargs())
 
     a = torch.full((128, 128), 2.0)
@@ -58,6 +58,7 @@ Exporting it is for the change that migrates those signatures.
 to the layer it belongs to.
 """
 
+from . import log_config as _log_config
 from .bench import BenchmarkStats, TraceInvocation, TraceSpan, benchmark
 from .device_tensor import DeviceTensor, StackedDeviceTensor
 from .distributed_runner import (
@@ -66,7 +67,6 @@ from .distributed_runner import (
     ReadOnlyHostTensor,
     execute_distributed_compiled,
 )
-from .log_config import _ensure_configured as _ensure_log_configured
 from .log_config import configure_log
 from .log_config import current_level as log_level
 from .pto_isa import ensure_pto_isa_root, pto_isa_include_dir
@@ -79,11 +79,18 @@ from .runner import (
     execute_compiled,
 )
 from .runtime_base import Worker
+from .runtime_pin import (
+    RuntimePinMismatch,
+    RuntimePinStatus,
+    RuntimePinWarning,
+    check_runtime_pin,
+    runtime_pin_status,
+)
 from .tensor_spec import ScalarSpec, TensorSpec
 from .worker import ChipWorker, RegistrationHandle
 
 # Honour ``PYPTO_RUNTIME_LOG`` before any runtime entry point runs.
-_ensure_log_configured()
+_log_config._ensure_configured()
 
 __all__ = [
     "benchmark",
@@ -93,6 +100,11 @@ __all__ = [
     "log_level",
     "ensure_pto_isa_root",
     "pto_isa_include_dir",
+    "check_runtime_pin",
+    "runtime_pin_status",
+    "RuntimePinMismatch",
+    "RuntimePinStatus",
+    "RuntimePinWarning",
     "BenchmarkStats",
     "TraceInvocation",
     "TraceSpan",

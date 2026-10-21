@@ -120,6 +120,10 @@ set(PYPTO_SOURCES
     src/ir/type.cpp
 
     # IR - Operators
+    src/ir/op/buffer_ops/elementwise.cpp
+    src/ir/op/buffer_ops/matrix.cpp
+    src/ir/op/buffer_ops/memory.cpp
+    src/ir/op/buffer_ops/view.cpp
     src/ir/op/tile_ops/batch_matmul.cpp
     src/ir/op/tile_ops/broadcast.cpp
     src/ir/op/tile_ops/elementwise.cpp
@@ -199,9 +203,12 @@ set(PYPTO_SOURCES
     src/ir/transforms/materialize_comm_domain_scopes_pass.cpp
     src/ir/transforms/lower_host_tensor_collectives_pass.cpp
     src/ir/transforms/lower_l2_tensor_collectives_pass.cpp
+    src/ir/transforms/legalize_spmd_launches_pass.cpp
     src/ir/transforms/materialize_dist_tensor_ctx_pass.cpp
     src/ir/transforms/legalize_graph_boundary_pass.cpp
     src/ir/transforms/materialize_valid_shape_symbols_pass.cpp
+    src/ir/transforms/lower_tile_to_buffer_pass.cpp
+    src/ir/transforms/select_buffer_ir_functions_pass.cpp
     src/ir/transforms/optimize_orch_tensors_pass.cpp
     src/ir/transforms/derive_call_directions_pass.cpp
     src/ir/transforms/auto_derive_task_dependencies_pass.cpp
@@ -214,6 +221,19 @@ set(PYPTO_SOURCES
     src/ir/transforms/loop_invariant_mat_residency.cpp
     src/ir/transforms/inline_functions_pass.cpp
     src/ir/transforms/init_memref.cpp
+    src/ir/transforms/lower_composite/lower_composite_all_to_all.cpp
+    src/ir/transforms/lower_composite/lower_composite_all_to_all_v.cpp
+    src/ir/transforms/lower_composite/lower_composite_allgather.cpp
+    src/ir/transforms/lower_composite/lower_composite_allreduce.cpp
+    src/ir/transforms/lower_composite/lower_composite_barrier.cpp
+    src/ir/transforms/lower_composite/lower_composite_broadcast.cpp
+    src/ir/transforms/lower_composite/lower_composite_builder.cpp
+    src/ir/transforms/lower_composite/lower_composite_common.cpp
+    src/ir/transforms/lower_composite/lower_composite_math.cpp
+    src/ir/transforms/lower_composite/lower_composite_mx.cpp
+    src/ir/transforms/lower_composite/lower_composite_reduce_scatter.cpp
+    src/ir/transforms/lower_composite/lower_composite_rules.cpp
+    src/ir/transforms/lower_composite/lower_composite_select.cpp
     src/ir/transforms/lower_composite_ops_pass.cpp
     src/ir/transforms/materialize_tensor_strides_pass.cpp
     src/ir/transforms/ir_property.cpp
@@ -222,6 +242,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/op_conversion_registry.cpp
     src/ir/transforms/outline_incore_scopes_pass.cpp
     src/ir/transforms/outline_cluster_scopes_pass.cpp
+    src/ir/transforms/deduplicate_outlined_kernels_pass.cpp
     src/ir/transforms/outline_hierarchy_scopes_pass.cpp
     src/ir/transforms/outline_graph_scopes_pass.cpp
     src/ir/transforms/expand_mixed_kernel_pass.cpp
@@ -254,8 +275,8 @@ set(PYPTO_SOURCES
     src/ir/transforms/lower_pipeline_loops_pass.cpp
     src/ir/transforms/lower_pipeline_to_slots_pass.cpp
     src/ir/transforms/canonicalize_io_order_pass.cpp
-    src/ir/transforms/structural_equal.cpp
-    src/ir/transforms/structural_hash.cpp
+    src/ir/transforms/structural_comparison.cpp
+    src/ir/transforms/utils/signature_symbols.cpp
     src/ir/transforms/utils/acc_init_builder.cpp
     src/ir/transforms/utils/narrow_loop_carry.cpp
     src/ir/transforms/utils/buffer_root_collector.cpp
@@ -291,6 +312,7 @@ set(PYPTO_SOURCES
     src/ir/verifier/verify_aiv_split.cpp
     src/ir/verifier/verify_acc_compact.cpp
     src/ir/verifier/verify_acc_to_gm_store.cpp
+    src/ir/verifier/verify_fixpipe_epilogue.cpp
     src/ir/verifier/verify_atomic_add_dtype.cpp
     src/ir/verifier/verify_acc_store_phase.cpp
     src/ir/verifier/verify_no_scalar_kernel_return.cpp
@@ -315,6 +337,8 @@ set(PYPTO_SOURCES
     src/ir/verifier/verify_runtime_scopes_materialized.cpp
     src/ir/verifier/verify_call_directions.cpp
     src/ir/verifier/verify_tile_type_coherence.cpp
+    src/ir/verifier/verify_buffer_ir.cpp
+    src/ir/verifier/verify_tile_storage.cpp
     src/ir/verifier/verify_assign_type_symmetry.cpp
     src/ir/verifier/verify_graph_functions.cpp
     src/ir/verifier/verify_orchestration_references.cpp
@@ -339,6 +363,7 @@ set(PYPTO_SOURCES
     src/codegen/orchestration/orchestration_codegen.cpp
     src/codegen/orchestration_op_registry.cpp
     src/codegen/pto/pto_codegen.cpp
+    src/codegen/pto/pto_buffer_codegen.cpp
     src/codegen/pto/pto_control_flow_codegen.cpp
     src/codegen/pto/pto_scalar_expr_codegen.cpp
     src/codegen/pto/pto_type_utils.cpp
@@ -358,9 +383,14 @@ set(PYPTO_SOURCES
     src/backend/950/backend_950_ops.cpp
     src/backend/common/backend.cpp
     src/backend/common/backend_config.cpp
+    src/backend/common/backend_handler.cpp
     src/backend/common/backend_registry.cpp
+    src/backend/common/buffer_elementwise_recipes.cpp
+    src/backend/common/buffer_view_semantics.cpp
     src/backend/common/pto_ops_common.cpp
     src/backend/common/pto_ops_shared.cpp
+    src/backend/common/pto_ops_cast.cpp
+    src/backend/common/pto_ops_select.cpp
     src/backend/common/pto_ops_elementwise.cpp
     src/backend/common/pto_ops_datamove.cpp
     src/backend/common/pto_ops_memory.cpp

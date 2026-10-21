@@ -22,6 +22,7 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/backend/common/op_rules.h"
 #include "pypto/backend/common/soc.h"
 #include "pypto/core/common.h"
 #include "pypto/ir/memory_allocator_policy.h"
@@ -51,8 +52,9 @@ class BackendHandler;
  * @brief Backend type identifier for selecting backend instance
  */
 enum class BackendType {
-  Ascend910B,  ///< 910B backend (PTO assembly codegen)
-  Ascend950    ///< 950 PTO backend
+  Ascend910,              ///< 910 backend (A2/A3 PTO assembly codegen)
+  Ascend950,              ///< 950 PTO backend
+  Ascend910B = Ascend910  ///< Compatibility alias; prefer Ascend910
 };
 
 /**
@@ -70,7 +72,7 @@ const Backend* GetBackendInstance(BackendType type);
  * updating this function so diagnostics stay readable.
  *
  * @param type Backend type
- * @return Display name (e.g. "Ascend910B", "Ascend950")
+ * @return Display name (e.g. "Ascend910", "Ascend950")
  */
 std::string BackendTypeToString(BackendType type);
 
@@ -119,6 +121,12 @@ class BackendOpRegistryEntry {
    */
   BackendOpRegistryEntry& f_infer_pipe(BackendPipeInferFunc func);
 
+  /// Register final target validation; omitted callbacks retain legacy checks.
+  BackendOpRegistryEntry& f_validate(BackendOpValidateFunc func);
+
+  /// Register a pure query for compiler-created scratch, independent of codegen.
+  BackendOpRegistryEntry& f_plan_scratch(BackendScratchPlanFunc func);
+
   /**
    * @brief Constrain a specific input tile layout for this backend op
    *
@@ -156,6 +164,8 @@ class BackendOpRegistryEntry {
   std::optional<BackendCodegenFunc> codegen_func_;
   std::optional<BackendPipeInferFunc> infer_pipe_func_;
   std::optional<BackendTileLayoutSpec> tile_layout_spec_;
+  std::optional<BackendOpValidateFunc> validate_func_;
+  std::optional<BackendScratchPlanFunc> scratch_plan_func_;
 };
 
 // Macro for registering backend operators with fluent interface
@@ -176,12 +186,14 @@ class Backend {
    * @brief Backend operator information
    *
    * Stores backend-specific operator metadata including code generation
-   * function and optional per-call pipe inference function.
+   * function and optional pipe inference, layout, validation, and scratch rules.
    */
   struct BackendOpInfo {
     BackendCodegenFunc codegen_func;
     std::optional<BackendPipeInferFunc> infer_pipe_func;
     std::optional<BackendTileLayoutSpec> tile_layout_spec;
+    std::optional<BackendOpValidateFunc> validate_func;
+    std::optional<BackendScratchPlanFunc> scratch_plan_func;
   };
 
   virtual ~Backend() = default;
@@ -210,10 +222,15 @@ class Backend {
    * @param op_name Operator name
    * @param func Code generation function
    * @param infer_pipe_func Optional per-call pipe inference function
+   * @param tile_layout_spec Optional input/output layout constraints
+   * @param validate_func Optional final target validator
+   * @param scratch_plan_func Optional compiler scratch synthesis query
    */
   void FinalizeOpRegistration(const std::string& op_name, BackendCodegenFunc func,
                               std::optional<BackendPipeInferFunc> infer_pipe_func = std::nullopt,
-                              std::optional<BackendTileLayoutSpec> tile_layout_spec = std::nullopt);
+                              std::optional<BackendTileLayoutSpec> tile_layout_spec = std::nullopt,
+                              std::optional<BackendOpValidateFunc> validate_func = std::nullopt,
+                              std::optional<BackendScratchPlanFunc> scratch_plan_func = std::nullopt);
 
   /**
    * @brief Infer pipeline type for a specific call
@@ -242,6 +259,20 @@ class Backend {
    * @return Pointer to operator info, or nullptr if not registered
    */
   [[nodiscard]] const BackendOpInfo* GetOpInfo(const std::string& op_name) const;
+
+  /// Query this backend's registered scratch rule without reading global target
+  /// state. An unregistered op is an error; nullopt means a registered op has
+  /// not supplied a rule, never "no scratch required" or "all inputs legal".
+  [[nodiscard]] std::optional<OpScratchPlan> PlanOpScratch(const std::string& op_name,
+                                                           const OpScratchRequest& request) const;
+
+  /**
+   * @brief List the operators actually registered for this backend, sorted by name.
+   *
+   * The snapshot includes architecture-specific exclusions and overrides. It
+   * describes registration, not support for every possible operand descriptor.
+   */
+  [[nodiscard]] std::vector<std::string> GetRegisteredOpNames() const;
 
   /**
    * @brief Get backend-specific tile layout constraints for an operator
@@ -294,7 +325,7 @@ class Backend {
    * @brief Total physical core count of a given core type across the whole SoC.
    *
    * Sums the per-cluster core counts of the requested type, weighted by cluster
-   * and die multiplicities (e.g. Ascend910B: 48 VECTOR / 24 CUBE cores).
+   * and die multiplicities (e.g. Ascend910: 48 VECTOR / 24 CUBE cores).
    *
    * @param core_type Core type to count (VECTOR / CUBE)
    * @return Number of physical cores of that type (0 if none)

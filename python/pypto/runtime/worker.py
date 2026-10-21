@@ -20,16 +20,16 @@ and call the returned :class:`RegistrationHandle`.
 
 Example — implicit reuse::
 
-    from pypto.runtime import ChipWorker, RunConfig
+    from pypto.runtime import ChipWorker, ExecutionMode, RunConfig
 
-    with ChipWorker(config=RunConfig(platform="a2a3")):
+    with ChipWorker(config=RunConfig(execution_mode=ExecutionMode.ONBOARD)):
         out1 = Add(*tensors1)   # uses active ChipWorker
         out2 = Mul(*tensors2)   # reuses same ChipWorker
     # close() runs once on exit
 
 Example — explicit dispatch::
 
-    w = ChipWorker(config=RunConfig(platform="a2a3"))
+    w = ChipWorker(config=RunConfig(execution_mode=ExecutionMode.ONBOARD))
     try:
         out = w.run(compiled_add, a, b)
         h = w.register(compiled_mul)        # pre-register hot path
@@ -48,6 +48,8 @@ import weakref
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
+from pypto._target import ExecutionMode
+from pypto.backend import BackendType
 from pypto.pypto_core.passes import RuntimeKind, runtime_kind_to_name
 
 from .runner import RunConfig
@@ -69,7 +71,7 @@ def _get_simpler_worker_cls() -> type:
     global _SimplerWorker  # noqa: PLW0603 - module-level cache that tests patch directly
     if _SimplerWorker is None:
         from .task_interface import (  # noqa: PLC0415
-            Worker as _W,  # pyright: ignore[reportAttributeAccessIssue]
+            Worker as _W,
         )
 
         _SimplerWorker = _W
@@ -81,7 +83,7 @@ def _get_simpler_call_config_cls() -> type:
     global _SimplerCallConfig  # noqa: PLW0603 - module-level cache that tests patch directly
     if _SimplerCallConfig is None:
         from .task_interface import (  # noqa: PLC0415
-            CallConfig as _CC,  # pyright: ignore[reportAttributeAccessIssue]
+            CallConfig as _CC,
         )
 
         _SimplerCallConfig = _CC
@@ -196,7 +198,7 @@ class ChipWorker(Worker):
         self._level = level
         self._runtime = runtime
         self._enable_sdma = bool(enable_sdma)
-        self._token: contextvars.Token | None = None
+        self._token: contextvars.Token[tuple[ChipWorker, ...]] | None = None
         # Simpler's owner-side memory API now returns Buffer objects, while
         # PyPTO intentionally keeps its public raw-pointer surface stable.
         self._device_buffers: dict[tuple[int, int], Any] = {}
@@ -366,7 +368,7 @@ class ChipWorker(Worker):
         """
         self._require_initialized("malloc")
         self._require_local_worker_id(worker_id, "malloc")
-        if not isinstance(nbytes, int) or nbytes <= 0:
+        if type(nbytes) is not int or nbytes <= 0:
             raise ValueError(f"nbytes must be a positive int, got {nbytes!r}")
         handle = self._impl.malloc(nbytes)
         try:
@@ -458,6 +460,16 @@ class ChipWorker(Worker):
         return self._level
 
     @property
+    def backend_type(self) -> BackendType:
+        """Target architecture selected by this worker's configuration."""
+        return self._config.backend_type
+
+    @property
+    def execution_mode(self) -> ExecutionMode:
+        """Simulator or onboard execution."""
+        return self._config.execution_mode
+
+    @property
     def platform(self) -> str:
         return self._config.platform
 
@@ -539,7 +551,8 @@ class ChipWorker(Worker):
             raise ValueError(
                 f"CompiledProgram.platform={compiled.platform!r} does not match "
                 f"ChipWorker.platform={self.platform!r}. Compile for the matching "
-                f"platform, or construct ChipWorker(config=RunConfig(platform={compiled.platform!r}))."
+                "platform, or construct ChipWorker(config=RunConfig("
+                "backend_type=compiled.backend_type, execution_mode=compiled.execution_mode))."
             )
         if compiled.runtime_name != self._runtime:
             raise ValueError(
@@ -604,7 +617,9 @@ class ChipWorker(Worker):
 
         dfx_dir: Path | None = None
         if rc.any_dfx_enabled():
-            dfx_dir = Path(compiled.output_dir) / "dfx_outputs"
+            from ._artifact_runtime import runtime_output_directory  # noqa: PLC0415
+
+            dfx_dir = runtime_output_directory(compiled) / "dfx_outputs"
             dfx_dir.mkdir(parents=True, exist_ok=True)
 
         orch_args, coerced, return_style = compiled._build_orch_args(*args, worker=self._impl)
@@ -614,7 +629,13 @@ class ChipWorker(Worker):
         if dfx_dir is not None:
             from .runner import _collect_dfx_artifacts  # noqa: PLC0415
 
-            _collect_dfx_artifacts(dfx_dir, self.platform, rc.dfx_options())
+            runtime = vars(compiled).get("_artifact_runtime")
+            if runtime is None:
+                _collect_dfx_artifacts(dfx_dir, self.platform, rc.dfx_options())
+            else:
+                _collect_dfx_artifacts(
+                    dfx_dir, self.platform, rc.dfx_options(), prebuilt_directory=runtime.directory
+                )
 
         if not return_style:
             return None

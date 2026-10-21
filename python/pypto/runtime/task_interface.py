@@ -14,19 +14,29 @@ helpers come from the ``simpler`` package installed via ``pip install
 simpler``.
 """
 
-from simpler.task_interface import (  # pyright: ignore[reportMissingImports]
-    CallConfig,  # pyright: ignore[reportAttributeAccessIssue]
-    ChipCallable,  # pyright: ignore[reportAttributeAccessIssue]
-    ChipStorageTaskArgs,  # pyright: ignore[reportAttributeAccessIssue]
-    ChipTensor,  # pyright: ignore[reportAttributeAccessIssue]
-    CoreCallable,  # pyright: ignore[reportAttributeAccessIssue]
-    DataType,  # pyright: ignore[reportAttributeAccessIssue]
-    TaskArgs,  # pyright: ignore[reportAttributeAccessIssue]
-    Tensor,  # pyright: ignore[reportAttributeAccessIssue]
-    scalar_to_uint64,  # pyright: ignore[reportAttributeAccessIssue]
+# `check_runtime_pin()` has to run before the simpler imports it guards, so every import
+# below is deliberately not at the top of the file (E402 is ignored in pyproject.toml).
+from .runtime_pin import check_runtime_pin
+
+# Before touching simpler: an extension built from a revision other than ``runtime/``
+# makes struct fields read as 0 with no error, and the resulting failure surfaces
+# several layers away looking like a product bug. Cached -- the git calls happen once
+# per process, no matter how many modules call this.
+check_runtime_pin()
+
+from simpler.task_interface import (
+    CallConfig,
+    ChipCallable,
+    ChipStorageTaskArgs,
+    ChipTensor,
+    CoreCallable,
+    DataType,
+    TaskArgs,
+    Tensor,
+    scalar_to_uint64,
 )
-from simpler.worker import Worker  # pyright: ignore[reportMissingImports, reportAttributeAccessIssue]
-from simpler_setup.torch_interop import (  # pyright: ignore[reportMissingImports, reportAttributeAccessIssue]
+from simpler.worker import Worker
+from simpler_setup.torch_interop import (
     make_chip_tensor_arg,
     torch_dtype_to_datatype,
 )

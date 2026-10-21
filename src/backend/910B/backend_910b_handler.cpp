@@ -13,6 +13,7 @@
 
 #include <initializer_list>
 
+#include "pypto/backend/910B/backend_910b.h"
 #include "pypto/backend/common/backend_handler.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
@@ -22,6 +23,8 @@
 namespace pypto {
 namespace backend {
 
+Ascend910BHandler::Ascend910BHandler() : BackendHandler(Backend910B::Instance()) {}
+
 const Ascend910BHandler& Ascend910BHandler::Instance() {
   static const Ascend910BHandler instance;
   return instance;
@@ -29,7 +32,7 @@ const Ascend910BHandler& Ascend910BHandler::Instance() {
 
 ir::TileView Ascend910BHandler::BuildCrossCoreTransferView(ir::MemorySpace dest_ms,
                                                            const ir::TileView& original_view) const {
-  // Ascend910B (a2a3): cross-core transfer goes through GM. All GM -> Mat
+  // Ascend910 (a2a3): cross-core transfer goes through GM. All GM -> Mat
   // transfers must be in NZ layout (hardware constraint), so Left / Right /
   // Mat destinations all use NZ at the transfer boundary. The final
   // Left/Right layout is later resolved by a Mat -> Left/Right move (MTE1).

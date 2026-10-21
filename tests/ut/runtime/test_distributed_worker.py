@@ -53,8 +53,10 @@ from pypto.runtime.distributed_runner import (
     _collect_l3_swimlane,
     _construct_worker,
     _make_call_config,
+    _register_callables,
     _reset_dfx_dispatch_state,
     _submit_chip,
+    add_chip_tensor_arg,
 )
 from pypto.runtime.runner import RunConfig
 
@@ -420,7 +422,8 @@ class TestAsyncDispatchHandle:
         m = patched_setup
         compiled = _fake_compiled([_param("a", [16, 16])], [])
         compiled.output_dir = tmp_path
-        natives = [_ControlledNativeHandle(), _ImmediateNativeHandle()]
+        native = _ControlledNativeHandle()
+        natives = [native, _ImmediateNativeHandle()]
         m["submit_dispatch"].side_effect = natives
         rt = DistributedWorker(compiled)
         arg = _resident(rt, (16, 16))
@@ -434,11 +437,11 @@ class TestAsyncDispatchHandle:
                 )
             )
             caller.start()
-            assert natives[0].result_started.wait(timeout=2)
+            assert native.result_started.wait(timeout=2)
             clear.assert_not_called()
             assert m["submit_dispatch"].call_count == 1
 
-            natives[0].complete()
+            native.complete()
             caller.join(timeout=2)
             assert not caller.is_alive()
             clear.assert_called_once_with(tmp_path / "dfx_outputs")
@@ -2202,6 +2205,44 @@ class TestAssembleChipCallables:
 
         assert enable_sdma is True
 
+    @pytest.mark.parametrize("artifact_cached", [False, True])
+    def test_host_transfer_contract_survives_registration(
+        self, tmp_path, stub_device_runner, monkeypatch, artifact_cached
+    ):
+        compiled = self._build(tmp_path, ["chip_a", "chip_b"])
+        chips = {
+            "chip_a": (object(), "host_build_graph", {"host_tensor_indices": [1]}),
+            "chip_b": (object(), "host_build_graph", {}),
+        }
+        if artifact_cached:
+            compiled._artifact_runtime = SimpleNamespace(load=lambda: chips)
+        else:
+            stub_device_runner._compile_and_assemble.side_effect = list(chips.values())
+        callables, _, _ = _assemble_chip_callables(compiled)
+        worker = MagicMock()
+        _, registered = _register_callables(worker, {}, callables)
+        buffer_module = ModuleType("simpler.buffer")
+        none_transfer = object()
+        setattr(buffer_module, "TensorTransfer", SimpleNamespace(NONE=none_transfer))
+        monkeypatch.setitem(sys.modules, "simpler.buffer", buffer_module)
+        tensor = torch.zeros(2)
+        wire = object()
+        args = MagicMock()
+        with patch.object(
+            importlib.import_module("pypto.runtime.tensor_arg"), "make_tensor_arg", return_value=wire
+        ):
+            add_chip_tensor_arg(args, worker, tensor, "INOUT", registered, "chip_a", 1)
+            args.add_tensor.assert_called_once_with(wire, "INOUT", transfer=none_transfer)
+            args.reset_mock()
+            add_chip_tensor_arg(args, worker, tensor, "INPUT", registered, "chip_a", 0)
+            args.add_tensor.assert_called_once_with(wire, "INPUT")
+            args.reset_mock()
+            add_chip_tensor_arg(args, worker, tensor, "INOUT", registered, "chip_b", 1)
+            args.add_tensor.assert_called_once_with(wire, "INOUT")
+            resident = DeviceTensor(0xABCD, (2,), torch.float32)
+            with pytest.raises(ValueError, match="host control tensor slot 1 requires a CPU tensor"):
+                add_chip_tensor_arg(args, worker, resident, "INOUT", registered, "chip_a", 1)
+
     def test_raises_on_inconsistent_runtime(self, tmp_path, stub_device_runner):
         compiled = self._build(tmp_path, ["chip_a", "chip_b"])
         stub_device_runner._compile_and_assemble.side_effect = [
@@ -2384,6 +2425,46 @@ def _write_dfx_dispatch_dirs(dfx: Path, *rels: str) -> None:
         (dfx / rel / "chip_swimlane_records.json").write_text("{}", encoding="utf-8")
 
 
+def _write_capture(
+    rank_dir: Path,
+    name: str,
+    *,
+    records: bool = False,
+    deps: bool = False,
+    run_id: int | None = None,
+    capture_index: int | None = None,
+    digest: str = "deadbeef",
+) -> Path:
+    """Lay down one ``rank{r}/d{k}`` capture the way the ChipWorker child does.
+
+    The child writes ``deps.json`` in a dep_gen run and the records in a swimlane
+    run — never both in one capture — plus the ``dispatch_identity.json`` sidecar
+    that says which run the capture came from. ``run_id=None`` omits the sidecar,
+    which is what an older runtime's layout looks like.
+    """
+    capture = rank_dir / name
+    capture.mkdir(parents=True)
+    if records:
+        (capture / "chip_swimlane_records.json").write_text(json.dumps({"capture": name}), encoding="utf-8")
+    if deps:
+        (capture / "deps.json").write_text('{"edges": []}', encoding="utf-8")
+    if run_id is not None:
+        (capture / "dispatch_identity.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "run_id": run_id,
+                    "task_slot": 0,
+                    "chip_rank": int(rank_dir.name.removeprefix("rank")),
+                    "local_capture_index": capture_index,
+                    "callable_digest": digest,
+                }
+            ),
+            encoding="utf-8",
+        )
+    return capture
+
+
 def _write_chip_program(output_dir: Path, program: str, *kernel_names: str) -> None:
     """Lay down ``next_levels/<program>/kernel_config.py`` naming *kernel_names*.
 
@@ -2468,9 +2549,15 @@ class TestCollectL3Swimlane:
 
         seen: list[SimpleNamespace] = []
 
-        def _fake(work_dir, out_dir, records, func_names=None):  # noqa: ANN001
+        def _fake(work_dir, out_dir, records, func_names=None, deps_json=None):  # noqa: ANN001
             seen.append(
-                SimpleNamespace(work_dir=work_dir, out_dir=out_dir, records=records, func_names=func_names)
+                SimpleNamespace(
+                    work_dir=work_dir,
+                    out_dir=out_dir,
+                    records=records,
+                    func_names=func_names,
+                    deps_json=deps_json,
+                )
             )
 
         monkeypatch.setattr(_runner, "_generate_swimlane", _fake)
@@ -2639,6 +2726,267 @@ class TestCollectL3Swimlane:
         assert json.loads((dfx / "rank0" / "d0" / "name_map.json").read_text())["callable_id_to_name"] == {
             "0": "rms"
         }
+
+    def test_two_pass_captures_are_paired_for_their_task_graph(
+        self, tmp_path, monkeypatch, fake_swimlane_converter
+    ):
+        # The swimlane two-pass is two runs, and the child numbers captures per
+        # process -> the graph pass's deps.json is in d0 while the timing pass's
+        # records are in d1. Unpaired, the converter finds no graph beside the
+        # records and renders a swimlane with zero dependency edges: task
+        # timings survive, every arrow is gone.
+        seen = self._spy_generate_swimlane(monkeypatch)
+        _write_chip_program(tmp_path, "only_chip", "rms")
+        rank = tmp_path / "dfx_outputs" / "rank0"
+        graph = _write_capture(rank, "d0", deps=True, run_id=1, capture_index=0)
+        timing = _write_capture(rank, "d1", records=True, run_id=2, capture_index=1)
+
+        _collect_l3_swimlane(tmp_path, "a2a3")
+
+        # One dispatch, one directory — and the graph pass's ``d0`` is the one
+        # kept, since the timing pass's index is only that ordinal plus an
+        # offset. Every consumer that looks for a dispatch's files together
+        # (the converter, critical_path, the viewers) finds them in one place.
+        assert not timing.exists()
+        assert sorted(f.name for f in graph.iterdir()) == [
+            "chip_swimlane_records.json",
+            "deps.json",
+            "dispatch_identity.json",
+            "dispatch_identity.timing.json",
+            "name_map.json",
+        ]
+        assert json.loads((graph / "chip_swimlane_records.json").read_text()) == {"capture": "d1"}
+        # The graph is now the records' own sibling, which is the converter's
+        # default, so no explicit path is needed.
+        assert [s.out_dir for s in seen] == [graph]
+        assert seen[0].deps_json is None
+
+    def test_pairing_recovers_the_program_marker_from_the_graph_capture(
+        self, tmp_path, monkeypatch, fake_swimlane_converter
+    ):
+        # ``_submit_chip`` derives the marker's directory from *this run's*
+        # dispatch ordinal, so the marker lands on the graph capture and the
+        # records' own capture has none. With two programs in the build the
+        # single-program fallback cannot save it (issue #2169), so the pairing
+        # has to carry the marker across.
+        seen = self._spy_generate_swimlane(monkeypatch)
+        _write_chip_program(tmp_path, "lm_head", "lm_head_dispatch_push")
+        _write_chip_program(tmp_path, "mtp_decode_layer", "mtp_projection_rms")
+        rank = tmp_path / "dfx_outputs" / "rank0"
+        graph = _write_capture(rank, "d0", deps=True, run_id=1, capture_index=0)
+        _mark_dispatch_program(graph, "mtp_decode_layer")
+        _write_capture(rank, "d1", records=True, run_id=2, capture_index=1)
+
+        _collect_l3_swimlane(tmp_path, "a2a3")
+
+        assert seen[0].work_dir == tmp_path / "next_levels" / "mtp_decode_layer"
+        assert json.loads((graph / "name_map.json").read_text())["callable_id_to_name"] == {
+            "0": "mtp_projection_rms"
+        }
+
+    def test_pairing_follows_the_dispatch_not_the_directory_order(
+        self, tmp_path, monkeypatch, fake_swimlane_converter
+    ):
+        # A card that ran two dispatches per pass fills d0-d1 in the graph pass
+        # and d2-d3 in the timing pass. Pairing by bare ``d{k}`` order or by
+        # ``local_capture_index`` would hand d2 the *second* dispatch's graph;
+        # the ordinal within a run plus the callable digest is what keeps each
+        # dispatch with its own edges.
+        seen = self._spy_generate_swimlane(monkeypatch)
+        _write_chip_program(tmp_path, "only_chip", "rms")
+        rank = tmp_path / "dfx_outputs" / "rank0"
+        first_graph = _write_capture(rank, "d0", deps=True, run_id=1, capture_index=0, digest="aaa")
+        second_graph = _write_capture(rank, "d1", deps=True, run_id=1, capture_index=1, digest="bbb")
+        _write_capture(rank, "d2", records=True, run_id=2, capture_index=2, digest="aaa")
+        _write_capture(rank, "d3", records=True, run_id=2, capture_index=3, digest="bbb")
+
+        _collect_l3_swimlane(tmp_path, "a2a3")
+
+        # ``d0``/``d1`` are the two dispatches; ``d2``/``d3`` were the same two
+        # captured again. Each set of records lands on its own dispatch, and the
+        # card is left with exactly one directory per dispatch.
+        assert sorted(d.name for d in rank.iterdir()) == ["d0", "d1"]
+        assert json.loads((first_graph / "chip_swimlane_records.json").read_text()) == {"capture": "d2"}
+        assert json.loads((second_graph / "chip_swimlane_records.json").read_text()) == {"capture": "d3"}
+        assert sorted(s.out_dir.name for s in seen) == ["d0", "d1"]
+
+    def test_colocated_graph_and_records_pass_no_explicit_path(
+        self, tmp_path, monkeypatch, fake_swimlane_converter
+    ):
+        # A runtime that files both passes under one capture needs no pairing:
+        # the converter's own default (the records' sibling) is already right, so
+        # the collector must not start overriding it.
+        seen = self._spy_generate_swimlane(monkeypatch)
+        _write_chip_program(tmp_path, "only_chip", "rms")
+        rank = tmp_path / "dfx_outputs" / "rank0"
+        _write_capture(rank, "d0", records=True, deps=True, run_id=1, capture_index=0)
+
+        _collect_l3_swimlane(tmp_path, "a2a3")
+
+        assert seen[0].deps_json is None
+
+    def test_sole_graph_capture_pairs_without_identity_sidecars(
+        self, tmp_path, monkeypatch, fake_swimlane_converter
+    ):
+        # An older runtime writes no identity sidecar. Exactly one graph capture
+        # and exactly one timing capture on the card leaves nothing to confuse,
+        # so the edges are still recovered rather than dropped for want of a
+        # sidecar.
+        seen = self._spy_generate_swimlane(monkeypatch)
+        _write_chip_program(tmp_path, "only_chip", "rms")
+        rank = tmp_path / "dfx_outputs" / "rank0"
+        graph = _write_capture(rank, "d0", deps=True)
+        _write_capture(rank, "d1", records=True)
+
+        _collect_l3_swimlane(tmp_path, "a2a3")
+
+        assert sorted(d.name for d in rank.iterdir()) == ["d0"]
+        assert seen[0].out_dir == graph
+        assert seen[0].deps_json is None
+
+    def test_legacy_layout_will_not_reuse_one_graph_for_several_captures(
+        self, tmp_path, monkeypatch, fake_swimlane_converter, capsys
+    ):
+        # Without sidecars, one graph capture beside two sets of records says
+        # nothing about which dispatch that graph belongs to. Handing it to both
+        # gives two dispatches the same edges — each individually plausible.
+        seen = self._spy_generate_swimlane(monkeypatch)
+        _write_chip_program(tmp_path, "only_chip", "rms")
+        rank = tmp_path / "dfx_outputs" / "rank0"
+        _write_capture(rank, "d0", deps=True)
+        _write_capture(rank, "d1", records=True)
+        _write_capture(rank, "d2", records=True)
+
+        _collect_l3_swimlane(tmp_path, "a2a3")
+
+        assert [s.deps_json for s in seen] == [None, None]
+        assert "No task graph paired with rank0/d1" in capsys.readouterr().out
+
+    def test_repeated_callable_pairs_by_position_when_the_passes_agree(
+        self, tmp_path, monkeypatch, fake_swimlane_converter
+    ):
+        # A card that dispatches the same callable twice per pass has two
+        # captures with identical digests, so the digest alone cannot pair them.
+        # Identical sequences make the position meaningful, which is what keeps
+        # each dispatch with its own edges.
+        self._spy_generate_swimlane(monkeypatch)
+        _write_chip_program(tmp_path, "only_chip", "rms")
+        rank = tmp_path / "dfx_outputs" / "rank0"
+        first = _write_capture(rank, "d0", deps=True, run_id=1, capture_index=0, digest="aaa")
+        second = _write_capture(rank, "d1", deps=True, run_id=1, capture_index=1, digest="aaa")
+        _write_capture(rank, "d2", records=True, run_id=2, capture_index=2, digest="aaa")
+        _write_capture(rank, "d3", records=True, run_id=2, capture_index=3, digest="aaa")
+
+        _collect_l3_swimlane(tmp_path, "a2a3")
+
+        assert sorted(d.name for d in rank.iterdir()) == ["d0", "d1"]
+        assert json.loads((first / "chip_swimlane_records.json").read_text()) == {"capture": "d2"}
+        assert json.loads((second / "chip_swimlane_records.json").read_text()) == {"capture": "d3"}
+
+    def test_a_shorter_timing_pass_rejects_the_whole_run_pair(
+        self, tmp_path, monkeypatch, fake_swimlane_converter, capsys
+    ):
+        # The passes do not restore mutable arguments between them, so a
+        # dispatch count that depends on data can differ. Graph ``[A, A]``
+        # against timing ``[A]``: the surviving dispatch may logically be the
+        # second, and pairing it with the first ``A``'s graph would put wrong
+        # edges on a trace that reads as complete.
+        seen = self._spy_generate_swimlane(monkeypatch)
+        _write_chip_program(tmp_path, "only_chip", "rms")
+        rank = tmp_path / "dfx_outputs" / "rank0"
+        _write_capture(rank, "d0", deps=True, run_id=1, capture_index=0, digest="aaa")
+        _write_capture(rank, "d1", deps=True, run_id=1, capture_index=1, digest="aaa")
+        _write_capture(rank, "d2", records=True, run_id=2, capture_index=2, digest="aaa")
+
+        _collect_l3_swimlane(tmp_path, "a2a3")
+
+        assert seen[0].deps_json is None
+        assert "No task graph paired with rank0/d2" in capsys.readouterr().out
+
+    def test_a_longer_timing_pass_rejects_the_whole_run_pair(
+        self, tmp_path, monkeypatch, fake_swimlane_converter
+    ):
+        # The mirror case: the timing pass dispatched more than the graph pass
+        # saw, so the extra dispatch has no graph and the ones before it are no
+        # longer guaranteed to line up either.
+        seen = self._spy_generate_swimlane(monkeypatch)
+        _write_chip_program(tmp_path, "only_chip", "rms")
+        rank = tmp_path / "dfx_outputs" / "rank0"
+        _write_capture(rank, "d0", deps=True, run_id=1, capture_index=0, digest="aaa")
+        _write_capture(rank, "d1", records=True, run_id=2, capture_index=1, digest="aaa")
+        _write_capture(rank, "d2", records=True, run_id=2, capture_index=2, digest="aaa")
+
+        _collect_l3_swimlane(tmp_path, "a2a3")
+
+        assert [s.deps_json for s in seen] == [None, None]
+
+    def test_a_reordered_timing_pass_rejects_the_whole_run_pair(
+        self, tmp_path, monkeypatch, fake_swimlane_converter
+    ):
+        # Same dispatch count, different order: position no longer identifies a
+        # dispatch, and every pairing in the run is suspect rather than just the
+        # moved one.
+        seen = self._spy_generate_swimlane(monkeypatch)
+        _write_chip_program(tmp_path, "only_chip", "rms")
+        rank = tmp_path / "dfx_outputs" / "rank0"
+        _write_capture(rank, "d0", deps=True, run_id=1, capture_index=0, digest="aaa")
+        _write_capture(rank, "d1", deps=True, run_id=1, capture_index=1, digest="bbb")
+        _write_capture(rank, "d2", records=True, run_id=2, capture_index=2, digest="bbb")
+        _write_capture(rank, "d3", records=True, run_id=2, capture_index=3, digest="aaa")
+
+        _collect_l3_swimlane(tmp_path, "a2a3")
+
+        assert [s.deps_json for s in seen] == [None, None]
+
+    def test_later_timing_runs_reuse_the_graph_pass(self, tmp_path, monkeypatch, fake_swimlane_converter):
+        # A benchmark loop captures several timing runs against one graph pass.
+        # Each is the same dispatch sequence, so each keeps the graph's edges.
+        seen = self._spy_generate_swimlane(monkeypatch)
+        _write_chip_program(tmp_path, "only_chip", "rms")
+        rank = tmp_path / "dfx_outputs" / "rank0"
+        graph = _write_capture(rank, "d0", deps=True, run_id=1, capture_index=0)
+        _write_capture(rank, "d1", records=True, run_id=2, capture_index=1)
+        _write_capture(rank, "d2", records=True, run_id=3, capture_index=2)
+
+        _collect_l3_swimlane(tmp_path, "a2a3")
+
+        # Folding both into ``d0`` would have them overwrite each other, so each
+        # timing run keeps its own directory and is converted against the shared
+        # graph by path.
+        assert sorted(d.name for d in rank.iterdir()) == ["d0", "d1", "d2"]
+        assert [s.deps_json for s in seen] == [graph / "deps.json", graph / "deps.json"]
+
+    def test_ambiguous_graph_captures_render_without_edges(
+        self, tmp_path, monkeypatch, fake_swimlane_converter, capsys
+    ):
+        # Two candidate graphs and no identity to tell them apart: guessing would
+        # attach another dispatch's edges, which reads as a real measurement.
+        # Convert without edges and say so instead.
+        seen = self._spy_generate_swimlane(monkeypatch)
+        _write_chip_program(tmp_path, "only_chip", "rms")
+        rank = tmp_path / "dfx_outputs" / "rank0"
+        _write_capture(rank, "d0", deps=True)
+        _write_capture(rank, "d1", deps=True)
+        _write_capture(rank, "d2", records=True)
+
+        _collect_l3_swimlane(tmp_path, "a2a3")
+
+        assert seen[0].deps_json is None
+        assert "No task graph paired with rank0/d2" in capsys.readouterr().out
+
+    def test_pairing_stays_inside_the_card(self, tmp_path, monkeypatch, fake_swimlane_converter):
+        # Ranks run different data and their task graphs are not interchangeable,
+        # so a card with no graph of its own must not borrow its neighbour's.
+        seen = self._spy_generate_swimlane(monkeypatch)
+        _write_chip_program(tmp_path, "only_chip", "rms")
+        dfx = tmp_path / "dfx_outputs"
+        _write_capture(dfx / "rank0", "d0", deps=True, run_id=1, capture_index=0)
+        _write_capture(dfx / "rank1", "d1", records=True, run_id=2, capture_index=1)
+
+        _collect_l3_swimlane(tmp_path, "a2a3")
+
+        assert [s.out_dir.parent.name for s in seen] == ["rank1"]
+        assert seen[0].deps_json is None
 
 
 class _BoolStrictCallConfig:

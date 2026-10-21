@@ -10,15 +10,81 @@
 """Shared helpers for the orchestration-codegen test files."""
 
 import difflib
+import os
 import re
+import runpy
+import shutil
+import subprocess
 import textwrap
+from pathlib import Path
 
+import pytest
 from pypto import backend, codegen, passes
 from pypto.backend import BackendType
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 from pypto.pypto_core import ir
 
 SELF_ALIAS_RE = re.compile(r"\bauto\s+(\w+)\s*=\s*\1\s*;")
+
+
+def _runtime_include_args(
+    repo_root: Path, *, runtime_name: str = "host_build_graph", arch: str = "a2a3"
+) -> list[str]:
+    """Resolve orchestration headers from the pinned runtime's build metadata."""
+    src = repo_root / "runtime" / "src"
+    runtime_dir = src / arch / "runtime" / runtime_name
+    config_path = runtime_dir / "build_config.py"
+    if not config_path.is_file():
+        pytest.skip("runtime submodule not checked out")
+    config = runpy.run_path(str(config_path))["BUILD_CONFIG"]["orchestration"]
+    # Runtime shims must precede shared headers: their Tensor alias selects the
+    # runtime under test. Searching every directory can select another runtime's
+    # types.h and hide an ABI mismatch. The src root supports prefixed includes.
+    paths = [runtime_dir / path for path in config["include_dirs"]]
+    paths.extend(
+        (
+            src / "common" / "task_interface",
+            src / "common",
+            src / arch / "platform" / "include",
+            src / "common" / "platform" / "include",
+            src,
+        )
+    )
+    return [f"-I{path}" for path in paths]
+
+
+def _assert_orchestration_compiles(
+    main_cpp: Path, *, runtime_name: str = "host_build_graph", arch: str = "a2a3"
+) -> None:
+    """Type-check generated orchestration against the checked-out runtime."""
+    repo_root = Path(__file__).resolve().parents[3]
+    assert main_cpp.is_file(), f"no orchestration emitted at {main_cpp}"
+    include_args = _runtime_include_args(repo_root, runtime_name=runtime_name, arch=arch)
+    candidates = (os.environ.get("CXX"), "g++-15", "g++", "c++")
+    compiler = next(
+        (found for name in candidates if name and (found := shutil.which(name))),
+        None,
+    )
+    if compiler is None:
+        pytest.skip("no C++ compiler available")
+    result = subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-fsyntax-only",
+            "-Werror=deprecated-declarations",
+            *include_args,
+            str(main_cpp),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    # With a checked-out runtime and its declared include paths, missing headers
+    # are compatibility failures too; skipping would hide a stale generated path.
+    assert result.returncode == 0, (
+        f"generated orchestration does not compile against {arch}/{runtime_name}:\n{result.stderr}"
+    )
 
 
 def assert_code_equal(actual: str, expected: str) -> None:
@@ -121,7 +187,7 @@ def _out_of_scope_tensor_refs(code: str) -> list[str]:
 
     Walks brace scopes recording the tensor identifiers declared in each, then
     flags any *use* that names a declared tensor not visible at the use site.
-    Three use shapes are scanned (a name escaping a closed ``SIMPLER_SCOPE`` block
+    Four use shapes are scanned (a name escaping a closed ``SIMPLER_SCOPE`` block
     can surface as any of them):
 
       * ``add_input/output/inout/no_dep(X)``         — call-arg reads (#1697)
@@ -129,6 +195,7 @@ def _out_of_scope_tensor_refs(code: str) -> list[str]:
         method-receiver reads (the after-scope ``buf_rv.reshape(...)`` shape that
         an ``add_*``-only checker missed, #1713)
       * ``... = X;`` / ``... = X.method(...)``        — assignment-RHS reads
+      * ``X = ...;``                                — assignment-target writes
 
     A used name out of scope is flagged when it is *either* declared as a tensor
     somewhere (``declared_anywhere``) *or* an SSA-versioned tensor temp
@@ -147,6 +214,7 @@ def _out_of_scope_tensor_refs(code: str) -> list[str]:
     use_add = re.compile(r"\badd_(?:input|output|inout|no_dep)\(\s*(\w+)\s*\)")
     use_method = re.compile(r"\b(\w+)\s*\.(?:reshape|view|transpose|assemble|slice|get_ref)\s*\(")
     use_rhs = re.compile(r"=\s*(\w+)\s*[;.]")
+    use_lhs = re.compile(r"^\s*(\w+)\s*=(?!=)")
     scopes: list[set[str]] = [set()]
     bad: list[str] = []
     for raw in code.splitlines():
@@ -160,6 +228,7 @@ def _out_of_scope_tensor_refs(code: str) -> list[str]:
         names = [m.group(1) for m in use_add.finditer(line)]
         names += [m.group(1) for m in use_method.finditer(line)]
         names += [m.group(1) for m in use_rhs.finditer(line)]
+        names += [m.group(1) for m in use_lhs.finditer(line)]
         for name in names:
             if any(name in s for s in scopes):
                 continue
@@ -197,7 +266,7 @@ def _generate_orch_full_pipeline(
     ``test_array_codegen._generate_pto`` but targets the Orchestration function.
     """
     backend.reset_for_testing()
-    backend.set_backend_type(BackendType.Ascend910B)
+    backend.set_backend_type(BackendType.Ascend910)
     pm = PassManager.get_strategy(
         OptimizationStrategy.Default,
         analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,

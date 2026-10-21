@@ -1,5 +1,9 @@
 # 分布式编程模型
 
+> **旧 Python 接口示例：** 本页为兼容现有用法保留 `platform=` 调用，
+> 这些调用会发出 `DeprecationWarning`；新代码应使用 `backend_type` 和
+> `execution_mode`。参见[目标映射](../../dev/08-entry-points.md#迁移旧-platform-示例)。
+>
 > **前置知识：** [快速入门](../00-getting_started.md) — 基本 PyPTO tensor/tile 模型。
 > 本指南使用 `pld` 命名空间（`import pypto.language.distributed as pld`）。
 >
@@ -126,7 +130,8 @@ python script.py
 
 ## PyPTO 中的分布式编程是什么？
 
-PyPTO 的分布式模型采用**对称内存 + 信号**范式。每个 rank 有一个 per-rank
+这是[章节引言](index.md)那一句概述背后的完整模型：PyPTO 的分布式模型采用
+**对称内存 + 信号**范式。每个 rank 有一个 per-rank
 **window buffer**，各对端的地址空间是对称的。通信通过单边
 `put`/`get`/`remote_load` 加**信号同步**（`notify`/`wait`）来完成。
 **通信域** 是共享对称 window pool 的 rank 子集；整个 world 为默认通信域。

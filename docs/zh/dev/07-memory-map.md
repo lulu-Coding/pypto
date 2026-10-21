@@ -45,11 +45,11 @@ mark、把该 panel 画成永远满的。
 
 用哪个 backend 按以下顺序决定：
 
-1. `-b/--backend` —— 显式给出 `BackendType` 成员名（`Ascend910B`、`Ascend950`）。
+1. `-b/--backend` —— 显式给出 `BackendType` 成员名（`Ascend910`、`Ascend950`）。
 2. 该 case 的 `ptoas/*.pto` 产物，用其中的 `pto.target_arch` 属性去匹配各 backend
    自己的 `get_pto_target_arch()`。这份映射保存在 backend 一侧而不是在本工具里复制
    一份，因此新增 backend 无需改动本工具。
-3. 否则假定为 `Ascend910B`，并在页面上标注 *assumed*，以免把 panel 缩放当成实测值。
+3. 否则假定为 `Ascend910`，并在页面上标注 *assumed*，以免把 panel 缩放当成实测值。
 
 容量读的是**当前**代码树的值，而不是 dump 当初编译时的值。因此在容量变更之后重新绘制
 旧的 `build_output/`，panel 会按新值缩放。
@@ -160,7 +160,7 @@ SSA 的 phi/yield 链每轮迭代都会用一个新名字重新绑定同一块�
 
 ## 相关文档
 
-- `docs/zh/dev/passes/37-allocate_memory_addr.md` —— 被绘制的那个 pass
-- `docs/zh/dev/passes/36-memory_reuse.md` —— 决定哪些生命周期可以共享 slot 的 pass
+- `docs/zh/dev/passes/38-allocate_memory_addr.md` —— 被绘制的那个 pass
+- `docs/zh/dev/passes/37-memory_reuse.md` —— 决定哪些生命周期可以共享 slot 的 pass
 - `docs/zh/dev/passes/00-pass_manager.md` —— `ReportInstrument`，现在只负责给出产物目录
 - `docs/zh/dev/04-simulator-trace-cleaning.md` —— `pypto.tools` 中另一个事后分析工具

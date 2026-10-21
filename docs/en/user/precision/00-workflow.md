@@ -1,5 +1,9 @@
 # Narrowing Down a Precision Gap
 
+> **Legacy Python API examples:** `platform=` calls on this page are retained for
+> compatibility. They emit `DeprecationWarning`; new code should use
+> `backend_type` and `execution_mode`. See the [target mapping](../../dev/08-entry-points.md#legacy-platform-examples).
+
 The result does not match the golden. This page is the order in which to suspect things —
 not an API reference.
 
@@ -50,7 +54,7 @@ bisecting anything.
 | ------ | ---------- | ----- |
 | Split-K / atomic add | Last bits, run to run | Accumulation order across cores is not fixed |
 | FP16 / BF16 accumulation | Grows with reduction length | Accumulate in FP32 where you can |
-| Reduction shape | Binary-tree vs sequential | Whether `col_sum` gets a `tmp_tile` changes the order |
+| Reduction shape | Binary-tree vs sequential | `col_sum(x, is_binary=True)` for Tensor, or `tmp_tile` for Tile, changes the order |
 | Backend differences | Instruction-level | The same op need not be bit-identical across backends |
 | Multi-hop cast | **Usually none** — see below | `LegalizeTileCast` expands what the ISA cannot do in one step |
 
@@ -74,7 +78,7 @@ The middle case is the one worth remembering: FP16 "overflow" starts at `65520`,
 
 A chain introduces a real difference only when an intermediate type cannot exactly represent
 source values that *are* in the destination's range. Check
-[LegalizeTileCast](../../dev/passes/17-legalize_tile_cast.md) for the class your chain falls
+[LegalizeTileCast](../../dev/passes/18-legalize_tile_cast.md) for the class your chain falls
 into rather than assuming the hop is the culprit.
 
 The claim is checkable, so this page checks it. The block below casts `INT32 → FP16`
@@ -273,5 +277,5 @@ output is wrong" into "this step is wrong" in one run.
 ## See Also
 
 - [Worked cases](01-cases.md) — this order applied end to end.
-- [LegalizeTileCast](../../dev/passes/17-legalize_tile_cast.md) — when a cast chain is exact.
+- [LegalizeTileCast](../../dev/passes/18-legalize_tile_cast.md) — when a cast chain is exact.
 - [Reduction and softmax](../tutorials/01-reduction-softmax.md) — padding and reductions.

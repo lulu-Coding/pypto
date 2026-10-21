@@ -77,6 +77,11 @@ void CheckSupportedFp32BuiltinVariant(DataType dtype, const std::string& op_name
                                  << dtype.ToString();
 }
 
+void CheckSupportedAllToAllVBuiltinVariant(DataType dtype, const std::string& op_name) {
+  CHECK(dtype == DataType::FP32 || dtype == DataType::INT8)
+      << op_name << " currently supports only dtype=FP32 or INT8; got " << dtype.ToString();
+}
+
 void CheckSignalDistributedTensor(const DistributedTensorTypePtr& signal_type, const std::string& op_name) {
   CHECK(signal_type) << op_name << " signal must be a DistributedTensor";
   CHECK(signal_type->dtype_ == DataType::INT32)
@@ -599,23 +604,60 @@ void CheckStaticContiguousPayload(const TensorTypePtr& type, const char* role) {
   }
 }
 
+// The documented all_to_all_v contract for core_num is `int | Scalar[INDEX]`:
+// the argument's type must be an integer Scalar. A float-typed scalar would
+// otherwise be forwarded verbatim to the entry by the builtin dispatch, and a
+// tensor-typed one would surface only as an INTERNAL_CHECK deep inside codegen
+// rather than as a user-facing diagnostic. Both the public op and the builtin
+// share this check so the two rails cannot drift apart.
+//
+// The predicate is IsInt() rather than IsIndexLike(): an INT32 Scalar handle is
+// accepted today and narrowing to INDEX-only would reject working programs.
+// Compare pld.*.remote_store, whose `peer` deliberately takes the looser
+// IsA<ScalarType> because dtype narrowing is codegen's job.
+void CheckAllToAllVCoreNumType(const ExprPtr& core_num, const char* op_name) {
+  auto core_num_scalar = As<ScalarType>(core_num->GetType());
+  CHECK(core_num_scalar && core_num_scalar->dtype_.IsInt())
+      << op_name << " core_num must be an integer Scalar, got " << core_num->GetType()->TypeName();
+  if (auto core_num_const = As<ConstInt>(core_num)) {
+    CHECK(core_num_const->value_ > 0)
+        << op_name << " core_num must be positive, got " << core_num_const->value_;
+  }
+}
+
 TypePtr DeduceTensorAllToAllVType(const std::vector<ExprPtr>& args,
                                   const std::vector<std::pair<std::string, std::any>>& kwargs) {
-  CHECK(args.size() == 5) << "pld.tensor.all_to_all_v requires 5 args "
-                             "(input, target, signal, send_counts, recv_counts), but got "
+  // core_num is the 6th *operand*, never a kwarg. The op used to declare it as
+  // `.set_attr<int>("core_num")`; a caller passing it that way would be silently
+  // ignored here while lowering read the operand, and the printer would emit
+  // `core_num=` twice (once for the operand, once for the attr) producing IR that
+  // cannot be re-parsed. Rejecting the schema alone is not enough: ValidateKwargs
+  // is skipped for an op with no declared attrs, so the check belongs here.
+  for (const auto& [key, value] : kwargs) {
+    (void)value;
+    CHECK(key != "core_num") << "pld.tensor.all_to_all_v does not accept a 'core_num' keyword "
+                                "argument; pass it as the 6th positional operand "
+                                "(int | Scalar[INDEX])";
+  }
+  CHECK(args.size() == 6) << "pld.tensor.all_to_all_v requires 6 args "
+                             "(input, target, signal, send_counts, recv_counts, core_num), but got "
                           << args.size();
   for (size_t i = 0; i < args.size(); ++i) {
     CHECK(args[i]) << "pld.tensor.all_to_all_v positional argument #" << i << " must not be null";
   }
 
-  // core_num is the requested AIV block limit for the managed CHIP/L2 rail.
-  // The InCore composite rail requires 1; LowerCompositeOps enforces that, so
-  // the deducer only rejects a value no rail could honour. Optional with a
-  // default of 1: every rail is single-core unless asked otherwise, so IR built
-  // without the kwarg (hand-built calls, programs deserialized from a .pto
-  // written before it existed) keeps its original meaning.
-  auto core_num = GetKwargOr<int>(kwargs, "core_num", 1);
-  CHECK(core_num > 0) << "pld.tensor.all_to_all_v core_num must be positive, got " << core_num;
+  // core_num is the requested AIV block *limit* L for the managed CHIP/L2 or
+  // HOST rail — a maximum, not a promise; the admitted block count B is
+  // computed at the entry (CalAllToAllVBlocks). It is now a genuine argument
+  // (a Scalar[INDEX] Expr), not a compile-time-only kwarg, so a fully dynamic
+  // request can flow through IR: only a statically-known ConstInt is
+  // range-checked here, exactly as no other dynamic scalar argument in this
+  // op (e.g. send_counts' runtime values) is compile-time-checked either. A
+  // dynamic core_num's positivity is validated at the runtime entry instead.
+  // The InCore composite rail requires a compile-time core_num == 1;
+  // LowerCompositeOps enforces that, so this deducer only rejects a
+  // statically-provable non-positive value no rail could ever honour.
+  CheckAllToAllVCoreNumType(args[5], "pld.tensor.all_to_all_v");
 
   // input: flattened send buffer [NR*MAX_RECV, SIZE] — Tensor or DistributedTensor
   // (same Tensor-like contract as symmetric all_to_all / send_counts).
@@ -676,9 +718,12 @@ TypePtr DeduceTensorAllToAllVType(const std::vector<ExprPtr>& args,
         << (*target_type->window_buffer_)->name_hint_ << "'";
   }
 
-  // signal: DistributedTensor INT32 [NR, 1].  Restricted to the 2-D form because
-  // the composite lowering always emits MakeSignalOffsets(rank) → [rank, 0];
-  // pld.system.notify/wait reject a rank mismatch against a 1-D signal.
+  // signal: DistributedTensor INT32 [NR, S] — barrier only (S is the
+  // block-aware barrier's per-block lane count, RFC #2521 K2; any positive
+  // compile-time constant is accepted, same as builtin.tensor.allreduce's own
+  // already-general check). Counts never ride this signal: each rank pulls a
+  // scalar word per peer from those peers' send_counts windows (see the
+  // send_counts comment below).
   auto signal_type = As<DistributedTensorType>(args[2]->GetType());
   CHECK(signal_type) << "pld.tensor.all_to_all_v signal must be a DistributedTensor (window-bound), got "
                      << args[2]->GetType()->TypeName();
@@ -686,11 +731,12 @@ TypePtr DeduceTensorAllToAllVType(const std::vector<ExprPtr>& args,
       << "pld.tensor.all_to_all_v signal must have INT32 element type, got dtype "
       << signal_type->dtype_.ToString();
   CHECK(signal_type->shape_.size() == 2)
-      << "pld.tensor.all_to_all_v signal must be 2D [NR, 1], got " << signal_type->shape_.size() << " dims";
+      << "pld.tensor.all_to_all_v signal must be 2D [NR, S], got " << signal_type->shape_.size() << " dims";
   {
     auto signal_dim1 = As<ConstInt>(signal_type->shape_[1]);
-    CHECK(signal_dim1 && signal_dim1->value_ == 1)
-        << "pld.tensor.all_to_all_v signal second dimension must be 1, got "
+    CHECK(signal_dim1 && signal_dim1->value_ > 0)
+        << "pld.tensor.all_to_all_v signal second dimension (S, signal stride) must be a positive "
+           "compile-time constant, got "
         << (signal_dim1 ? std::to_string(signal_dim1->value_) : "<dynamic>");
   }
 
@@ -733,12 +779,17 @@ TypePtr DeduceTensorAllToAllVType(const std::vector<ExprPtr>& args,
       << "pld.tensor.all_to_all_v send_counts dim 0 (" << counts_dim0->value_
       << ") must equal signal dim 0 (NR = " << signal_dim0->value_ << ")";
 
-  // recv_counts: window where each peer publishes how many rows it sent to me
-  // (MPI_Alltoallv recvcounts).  Same 2D [NR, 1] INT32 layout as ``signal`` —
-  // published via ``pld.system.notify`` (Set) as ``min(send_counts[dest],
-  // MAX_RECV)`` into ``recv_counts[my_rank, 0]``.  After the barrier the
-  // receiver reads ``recv_counts[src, 0]`` to skip the unwritten holes at the
-  // tail of each source's MAX_RECV slot.
+  // recv_counts: window where this rank stores how many rows each source sent
+  // to it (MPI_Alltoallv recvcounts).  Same 2D [NR, 1] INT32 layout as
+  // ``signal``.  After Barrier A ``recv_counts[src, 0]`` lets the receiver
+  // skip the unwritten holes at the tail of each source's MAX_RECV slot.  The
+  // hand-written builtin kernel fills it by pulling ONE scalar word per peer
+  // from that peer's own ``send_counts`` window (non-cacheable ld_dev read,
+  // clamped reader-side). The InCore composite rail atomically resets each
+  // receiver's own counts, rendezvous-barriers, then publishes the clamped
+  // count with AtomicAdd into every peer's recv_counts[my_rank, 0]. A second
+  // barrier completes the exchange. Using atomics for both phases prevents
+  // cache-line write-back from clobbering adjacent count or signal cells.
   auto recv_type = As<DistributedTensorType>(args[4]->GetType());
   CHECK(recv_type) << "pld.tensor.all_to_all_v recv_counts must be a DistributedTensor (window-bound), got "
                    << args[4]->GetType()->TypeName();
@@ -784,11 +835,15 @@ REGISTER_OP("pld.tensor.all_to_all_v")
         "the sender's surplus.  Those bytes are UNINITIALISED and may decode as "
         "NaN/Inf, unlike the finite FP32 surplus the old full-capacity push left "
         "there: trim to ``recv_counts`` BEFORE computing over the capacity "
-        "block, or NaN propagates into otherwise-valid rows.  During the same push phase "
-        "each rank publishes that same clamped count into peer ``dest``'s "
-        "``recv_counts[my_rank, 0]`` via ``pld.system.notify`` (Set) — the "
-        "receive-side count vector (MPI_Alltoallv recvcounts) identifying how "
-        "many rows are logically valid, so the receiver skips the rest.  "
+        "block, or NaN propagates into otherwise-valid rows.  The receive-side count "
+        "vector (MPI_Alltoallv recvcounts) lands in ``recv_counts[src, 0]``, "
+        "identifying how many rows are logically valid, so the receiver skips the "
+        "rest: the hand-written builtin kernel pulls ONE scalar word per peer from "
+        "that peer's own ``send_counts`` window after BARRIER A (a non-cacheable "
+        "read) and clamps the value reader-side, while the InCore composite rail "
+        "atomically resets receiver-owned counts, rendezvous-barriers, then publishes "
+        "the clamped count into peer ``dest``'s ``recv_counts[my_rank, 0]`` via "
+        "``pld.system.notify`` (AtomicAdd) before a completion barrier.  "
         "Returns the target window so the caller can read back via "
         "``tile.load`` — same pattern as the symmetric "
         "``pld.tensor.all_to_all`` intrinsic.")
@@ -798,15 +853,22 @@ REGISTER_OP("pld.tensor.all_to_all_v")
     .add_argument("target",
                   "Window-bound DistributedTensor [NR*MAX_RECV, SIZE] — staging area for exchange (InOut)")
     .add_argument("signal",
-                  "Window-bound INT32 DistributedTensor [NR, 1] used as a self-clearing cross-rank "
-                  "barrier (InOut); reusable across calls and inside for/while loops")
+                  "Window-bound INT32 DistributedTensor [NR, 1] used as a credit-based cross-rank "
+                  "barrier (InOut); reusable across sequential calls and rank-uniform InCore "
+                  "for/while loops (zero-initialise once; do not reset). HOST orchestrators reject "
+                  "such loops because loop-carried comm-domain window lifetime management is not modeled")
     .add_argument("send_counts",
                   "INT32 Tensor [NR] or [NR, 1] — rows to send to each destination, read at "
-                  "runtime and clamped to MAX_RECV (Input)")
+                  "runtime and clamped to MAX_RECV (Input). On the HOST/CHIP builtin rails it "
+                  "must be a window-bound DistributedTensor (peers read this rank's entry "
+                  "through CommRemotePtr); a plain Tensor is accepted only on the InCore "
+                  "composite rail")
     .add_argument("recv_counts",
                   "Window-bound INT32 DistributedTensor [NR, 1] — after the barrier, "
                   "recv_counts[src, 0] holds how many rows src sent to this rank (InOut)")
-    .set_attr<int>("core_num")
+    .add_argument("core_num",
+                  "Scalar[INDEX] requested AIV block limit L (a maximum, not a promise — the "
+                  "admitted block count B is computed at the entry from L)")
     .no_memory_spec()
     // stays read-only.
     // Composite collective — the data destination is overwritten, not updated:
@@ -817,7 +879,9 @@ REGISTER_OP("pld.tensor.all_to_all_v")
     // both: written by the notify phase and read by the wait phase.
     .set_arg_effect(1, ArgEffect::Write)
     .set_arg_effect(2, ArgEffect::ReadWrite)
-    .set_arg_effect(4, ArgEffect::Write)
+    // The InCore reset reads and atomically updates each receive count before
+    // publication, even though the final value overwrites its incoming value.
+    .set_arg_effect(4, ArgEffect::ReadWrite)
     .f_deduce_type(DeduceTensorAllToAllVType);
 
 // ============================================================================
@@ -1195,13 +1259,14 @@ namespace {
 TypePtr DeduceBuiltinTensorAllToAllVType(const std::vector<ExprPtr>& args,
                                          const std::vector<std::pair<std::string, std::any>>& kwargs) {
   constexpr const char* kOpName = "builtin.tensor.all_to_all_v";
-  CHECK(args.size() == 5) << kOpName
-                          << " requires exactly 5 positional arguments "
-                             "(input, target, signal, send_counts, recv_counts), but got "
+  CHECK(args.size() == 6) << kOpName
+                          << " requires exactly 6 positional arguments "
+                             "(input, target, signal, send_counts, recv_counts, core_num), but got "
                           << args.size();
   for (size_t i = 0; i < args.size(); ++i) {
     CHECK(args[i]) << kOpName << " positional argument #" << i << " must not be null";
   }
+  CheckAllToAllVCoreNumType(args[5], kOpName);
   // input and target must be different windows (same-expression guard; two
   // distinct pld.window(...) views over one alloc are caught later, at
   // lowering time, by CheckDistinctInputTargetWindows against the
@@ -1235,22 +1300,27 @@ TypePtr DeduceBuiltinTensorAllToAllVType(const std::vector<ExprPtr>& args,
       << kOpName << " target dtype " << target_type->dtype_.ToString() << " must match input dtype "
       << input_type->dtype_.ToString();
 
-  // signal: 2D [NR, 1] only — the composite's own deducer already enforces
-  // this exact shape on the pld.tensor.all_to_all_v call this builtin is
-  // constructed from, so there is no 1D case to additionally support here,
-  // unlike builtin.tensor.all_to_all which pre-dates that constraint.
+  // signal: 2D [NR, S] barrier only — the composite's own deducer already
+  // enforces this exact shape on the call this builtin is constructed from,
+  // so there is no 1D case to additionally support here, unlike
+  // builtin.tensor.all_to_all which pre-dates that constraint. S (the
+  // per-rank signal stride) is the block-aware barrier's per-block lane count
+  // (RFC #2521 K2) — any positive compile-time constant is accepted,
+  // mirroring the composite deducer's own relaxation above. Counts never ride
+  // this signal: each rank pulls a scalar word per peer from those peers'
+  // send_counts windows.
   auto signal_type = As<DistributedTensorType>(args[2]->GetType());
   CHECK(signal_type) << kOpName << " signal must be a DistributedTensor (window-bound), got "
                      << args[2]->GetType()->TypeName();
   CHECK(signal_type->dtype_ == DataType::INT32)
       << kOpName << " signal must have INT32 element type, got dtype " << signal_type->dtype_.ToString();
   CHECK(signal_type->shape_.size() == 2)
-      << kOpName << " signal must be 2D [NR, 1], got " << signal_type->shape_.size() << " dims";
+      << kOpName << " signal must be 2D [NR, S], got " << signal_type->shape_.size() << " dims";
   {
     auto signal_dim1 = As<ConstInt>(signal_type->shape_[1]);
-    CHECK(signal_dim1 && signal_dim1->value_ == 1)
-        << kOpName << " signal second dimension must be 1, got "
-        << (signal_dim1 ? std::to_string(signal_dim1->value_) : "<dynamic>");
+    CHECK(signal_dim1 && signal_dim1->value_ > 0)
+        << kOpName << " signal second dimension (S, signal stride) must be a positive compile-time constant, "
+        << "got " << (signal_dim1 ? std::to_string(signal_dim1->value_) : "<dynamic>");
   }
 
   auto target_dim0 = As<ConstInt>(target_type->shape_[0]);
@@ -1263,10 +1333,11 @@ TypePtr DeduceBuiltinTensorAllToAllVType(const std::vector<ExprPtr>& args,
       << kOpName << " signal dim 0 (" << signal_dim0->value_ << ") must divide target dim 0 ("
       << target_dim0->value_ << ")";
 
-  // send_counts: narrowed from AsTensorTypeLike to a STRICT window-bound
-  // DistributedTensor — same codegen-forced rationale as `input` above.
-  // LOCAL-only: read by this rank, never cross-rank-notified into (unlike
-  // recv_counts).
+  // send_counts: STRICT window-bound DistributedTensor — beyond the
+  // codegen-forced rationale shared with `input` above, the builtin kernel
+  // resolves each peer's copy through CommRemotePtr (the counts pull), so a
+  // non-window address would be garbage.  Written only by this rank; peers
+  // only READ it remotely — no rank ever writes another rank's send_counts.
   auto counts_type = As<DistributedTensorType>(args[3]->GetType());
   CHECK(counts_type) << kOpName << " send_counts must be a DistributedTensor (window-bound), got "
                      << args[3]->GetType()->TypeName();
@@ -1310,7 +1381,7 @@ TypePtr DeduceBuiltinTensorAllToAllVType(const std::vector<ExprPtr>& args,
   CHECK(dtype == target_type->dtype_)
       << kOpName << " dtype kwarg (" << dtype.ToString() << ") must match target dtype ("
       << target_type->dtype_.ToString() << ")";
-  CheckSupportedFp32BuiltinVariant(dtype, kOpName);
+  CheckSupportedAllToAllVBuiltinVariant(dtype, kOpName);
 
   return args[1]->GetType();
 }
@@ -1326,14 +1397,19 @@ REGISTER_OP("builtin.tensor.all_to_all_v")
                   "destination)")
     .add_argument("target",
                   "Window-bound DistributedTensor [NR*MAX_RECV, SIZE] result window (TPUT destination)")
-    .add_argument("signal", "Window-bound INT32 DistributedTensor [NR, 1] signal buffer (single-use barrier)")
+    .add_argument("signal",
+                  "Window-bound INT32 DistributedTensor [NR, 1] credit-based barrier — +1/+1 rounds "
+                  "with wait thresholds 1 and 2, then AtomicAdd(-2) per slot; zero-init once, never reset")
     .add_argument("send_counts",
                   "Window-bound INT32 DistributedTensor [NR] or [NR, 1] — rows to send to each "
-                  "destination, read at runtime and clamped to MAX_RECV (Input, LOCAL only, never "
-                  "cross-rank-published)")
+                  "destination, read at runtime and clamped to MAX_RECV (Input; written only by this "
+                  "rank, READ by peers via the counts pull, never cross-rank-published)")
     .add_argument("recv_counts",
                   "Window-bound INT32 DistributedTensor [NR, 1] — after the barrier, "
                   "recv_counts[src, 0] holds how many rows src sent to this rank (InOut)")
+    .add_argument("core_num",
+                  "Scalar[INDEX] requested AIV block limit L (a maximum, not a promise — the "
+                  "admitted block count B is computed at the entry from L)")
     .set_attr<DataType>("dtype")
     .no_memory_spec()
     .set_internal_only(true)

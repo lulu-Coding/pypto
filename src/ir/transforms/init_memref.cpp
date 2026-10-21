@@ -24,8 +24,10 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/backend/common/backend.h"
 #include "pypto/backend/common/backend_config.h"
 #include "pypto/backend/common/backend_handler.h"
+#include "pypto/backend/common/op_rules.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/error.h"
 #include "pypto/core/logging.h"
@@ -186,68 +188,6 @@ std::optional<uint64_t> StaticSliceViewSpanBytes(const CallPtr& call, const Shap
 // Compiler-owned PTO level3 scratch (A2/A3 under PyPTO/DSA-RP planners only).
 constexpr int64_t kA2A3CiScratchColsInt32 = 192;
 constexpr int64_t kA2A3CiScratchColsInt16 = 448;
-// PTOAS v0.60 makeTCvtTmpType head block: 4 bytes * 64 cols * min(cols/64, 255).
-constexpr int64_t kTcvtHeadBlockCols = 64;
-constexpr int64_t kTcvtHeadBlockBytes = 4;
-constexpr int64_t kTcvtHeadMaxBlocks = 255;
-constexpr int64_t kTcvtTailRowBytes = 32;
-constexpr int64_t kTcvtFp16HalfToI8Base = 128;
-constexpr int64_t kTcvtMinScratchBytes = 32;
-constexpr int64_t kTcvtScratchAlignBytes = 32;
-
-int64_t CeilDivI64(int64_t num, int64_t den) { return (num + den - 1) / den; }
-
-/// Non-saturating A2/A3 pto.tcvt forms whose ISA implementation needs a tmp.
-/// Mirrors PTOAS v0.60 `makeTCvtTmpType` for FP32->INT16 and FP16->{INT16,INT8,UINT8}.
-///
-/// Excludes INT4: pto-isa routes FP16<->INT4 through saturating `vconv_f162s4*`
-/// without a TmpTileData operand (`kIsNarrowingCvt` does not cover int4). PTOAS
-/// level3 therefore does not require an explicit tcvt tmp for those casts.
-bool TcvtNeedsLevel3Scratch(DataType src, DataType dst) {
-  if (src == DataType::FP32 && dst == DataType::INT16) return true;
-  return src == DataType::FP16 && (dst == DataType::INT16 || dst == DataType::INT8 || dst == DataType::UINT8);
-}
-
-/// Match PTOAS v0.60's makeTCvtTmpType capacity calculation. The returned byte
-/// count is represented as an i8 scratch tile so the shape is also its capacity.
-int64_t TcvtScratchCapacityBytes(const TileTypePtr& src_tile, DataType dst, const Span& span) {
-  const auto src_shape = src_tile->shape_;
-  const auto valid_shape = GetValidShape(src_tile);
-  CHECK_SPAN(src_shape.size() == 2 && valid_shape.size() == 2, span)
-      << "InitMemRef: A2/A3 narrowing tile.cast scratch requires a 2D source tile";
-  auto rows_ci = As<ConstInt>(valid_shape[0]);
-  auto cols_ci = As<ConstInt>(valid_shape[1]);
-  auto src_cols_ci = As<ConstInt>(src_shape[1]);
-  CHECK_SPAN(rows_ci && cols_ci && src_cols_ci, span)
-      << "InitMemRef: A2/A3 non-saturating narrowing tile.cast requires static source shape "
-         "and valid_shape to size its level3 scratch tile";
-
-  const int64_t rows = rows_ci->value_;
-  const int64_t cols = cols_ci->value_;
-  const int64_t src_cols = src_cols_ci->value_;
-  int64_t bytes = 0;
-  if (src_tile->dtype_ == DataType::FP32) {
-    if (rows > 0 && cols > 0) {
-      const int64_t head = kTcvtHeadBlockBytes * kTcvtHeadBlockCols *
-                           std::min<int64_t>(cols / kTcvtHeadBlockCols, kTcvtHeadMaxBlocks);
-      const int64_t remainder = cols % kTcvtHeadBlockCols;
-      const int64_t tail =
-          remainder == 0
-              ? 0
-              : kTcvtTailRowBytes * ((std::min<int64_t>(rows, kTcvtHeadMaxBlocks) - 1) * (src_cols / 8) +
-                                     CeilDivI64(remainder, 8));
-      bytes = std::max(head, tail);
-    }
-  } else if (src_tile->dtype_ == DataType::FP16 && cols > 0) {
-    const int64_t width = std::min<int64_t>(cols, kTcvtHeadBlockCols);
-    const int64_t half_to_i16 = kTcvtTailRowBytes * CeilDivI64(width, 8);
-    const int64_t half_to_i8 =
-        std::max(half_to_i16, kTcvtFp16HalfToI8Base + kTcvtTailRowBytes * CeilDivI64(width, 16));
-    bytes = (dst == DataType::INT8 || dst == DataType::UINT8) ? half_to_i8 : half_to_i16;
-  }
-  return std::max<int64_t>(kTcvtMinScratchBytes,
-                           CeilDivI64(bytes, kTcvtScratchAlignBytes) * kTcvtScratchAlignBytes);
-}
 
 ExprPtr MakeStaticShape(const std::vector<int64_t>& dims, const Span& span) {
   std::vector<ExprPtr> elements;
@@ -273,8 +213,8 @@ struct PtoScratchSpec {
 /// for them. `tile.col_sum` / `tile.row_expand_add` likewise keep caller tmp.
 class MaterializePtoLevel3ScratchMutator : public IRMutator {
  public:
-  explicit MaterializePtoLevel3ScratchMutator(bool materialize_a2a3_scratch)
-      : materialize_a2a3_scratch_(materialize_a2a3_scratch) {}
+  explicit MaterializePtoLevel3ScratchMutator(const backend::Backend* target)
+      : backend_(target), materialize_a2a3_scratch_(target->GetHandler()->RequiresLevel3TmpScratch()) {}
 
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
     auto call = As<Call>(op->value_);
@@ -316,24 +256,20 @@ class MaterializePtoLevel3ScratchMutator : public IRMutator {
     }
 
     if (IsOp(call, "tile.cast") && call->args_.size() == 1) {
-      if (!materialize_a2a3_scratch_) return std::nullopt;
       auto src_type = As<TileType>(call->args_[0]->GetType());
       INTERNAL_CHECK_SPAN(src_type, span) << "tile.cast source must be TileType before InitMemRef";
       const DataType dst = call->GetKwarg<DataType>("target_type");
-      if (!TcvtNeedsLevel3Scratch(src_type->dtype_, dst)) return std::nullopt;
-      // The scratch exists only for PTOAS's *non-saturating* narrowing helper,
-      // which emulates the target's overflow behavior with a chunked vector
-      // sequence. A saturating cast is a native conversion that takes no tmp, so
-      // synthesizing one would allocate Vec memory the emitted `pto.tcvt` never
-      // reads. Every pair reaching here narrows to an integer, whose default is
-      // saturating, so only a cast that explicitly opted out needs the buffer. A
-      // caller-supplied tmp is untouched either way: this arm only runs for the
-      // 1-argument form.
-      if (GetSaturationMode(call) != static_cast<int>(SaturationMode::kOff)) {
-        return std::nullopt;
-      }
-      const int64_t bytes = TcvtScratchCapacityBytes(src_type, dst, span);
-      return PtoScratchSpec{MakeStaticShape({1, bytes}, span), DataType::INT8, "tcvt"};
+      // Ask the backend whether this conversion needs scratch. Caller-provided
+      // scratch is preserved because this arm only handles one-argument casts.
+      const bool saturating = GetEmittedSaturationMode(call) == static_cast<int>(SaturationMode::kOn);
+      const auto plan =
+          backend_->PlanOpScratch("tile.cast", {src_type->dtype_, std::nullopt, dst, saturating, src_type});
+      INTERNAL_CHECK_SPAN(plan, span) << "Internal error: tile.cast scratch rule is not registered";
+      if (plan->status == backend::OpScratchStatus::NotRequired) return std::nullopt;
+      CHECK_SPAN(plan->status == backend::OpScratchStatus::Required, span) << "InitMemRef: " << plan->reason;
+      INTERNAL_CHECK_SPAN(plan->spec, span) << "Internal error: required cast scratch has no spec";
+      const auto& spec = *plan->spec;
+      return PtoScratchSpec{MakeStaticShape({spec.rows, spec.cols}, span), spec.dtype, "tcvt"};
     }
 
     if (IsOp(call, "tile.sort32") && call->args_.size() == 2) {
@@ -350,6 +286,7 @@ class MaterializePtoLevel3ScratchMutator : public IRMutator {
     return std::nullopt;
   }
 
+  const backend::Backend* backend_;
   bool materialize_a2a3_scratch_ = false;
   std::size_t scratch_counter_ = 0;
 };
@@ -713,14 +650,33 @@ class InitMemRefMutator : public IRMutator {
     if (!parent_memref_opt.has_value()) return nullptr;
     const auto& parent_memref = *parent_memref_opt;
 
+    // A nested slice can narrow a strided window's byte envelope back to its
+    // dense size without removing the parent's row gaps. Preserve that fact
+    // through every storage-sharing view instead of inferring it at codegen
+    // from only the final MemRef size.
+    bool non_dense_source = non_dense_view_memrefs_.count(parent_memref) != 0;
+    if (auto parent_tile = As<TileType>(source->GetType())) {
+      const auto dense_bytes = utils::StaticPhysicalAllocationBytes(parent_tile, MemorySpace::Vec, handler_);
+      non_dense_source = non_dense_source || !dense_bytes || *dense_bytes != parent_memref->size_;
+    }
+    if (auto call = As<Call>(new_value); call && IsOp(call, "tile.reinterpret_view")) {
+      auto source_tile = As<TileType>(source->GetType());
+      auto result_tile = As<TileType>(op->var_->GetType());
+      const bool fp4_alias = (source_tile && source_tile->dtype_.IsPackedFp4()) ||
+                             (result_tile && result_tile->dtype_.IsPackedFp4());
+      // A reverse packed-to-byte alias drops the same pitch/offset metadata as
+      // byte-to-packed, so neither direction can hide a strided ancestor.
+      CHECK_SPAN(!fp4_alias || (!non_dense_source && As<ConstInt>(parent_memref->byte_offset_)), call->span_)
+          << "FP4E2M1X2 UB alias requires a contiguous byte-carrier tile with a static UB offset; "
+             "unsupported slice provenance survives nested slices, aliases and reshapes. Slice the "
+             "GM tensor and load the window instead";
+    }
+
     // Compute additional byte offset from the view op (if applicable)
     ExprPtr additional_offset = MakeZeroByteOffset();
     if (auto call = As<Call>(new_value)) {
       additional_offset = ComputeViewByteOffset(call, source->GetType());
     }
-
-    // Accumulate: total_offset = parent.byte_offset + additional_offset
-    ExprPtr total_offset = AddByteOffsets(parent_memref->byte_offset_, additional_offset);
 
     auto source_ms = ExtractMemorySpaceFromType(source->GetType());
 
@@ -742,20 +698,10 @@ class InitMemRefMutator : public IRMutator {
       }
     }
 
-    // For pure aliases (no offset change, same size), share the SAME MemRef shared_ptr
-    // to preserve base_ Ptr identity. MemoryReuse builds sharing groups by base_ Ptr —
-    // variables sharing the same base_ are merged into one lifetime group.
-    bool is_pure_alias = (view_size == parent_memref->size_);
-    if (is_pure_alias) {
-      if (auto const_offset = As<ConstInt>(additional_offset)) {
-        is_pure_alias = (const_offset->value_ == 0);
-      } else {
-        is_pure_alias = false;
-      }
-    }
-    MemRefPtr view_memref = is_pure_alias
-                                ? parent_memref
-                                : std::make_shared<MemRef>(parent_memref->base_, total_offset, view_size);
+    // Full aliases share the exact MemRef; subviews retain the source's slots
+    // while narrowing the window. Later reanchoring uses the same construction.
+    MemRefPtr view_memref = MakeAliasingMemRef(parent_memref, additional_offset, view_size, op->span_);
+    if (non_dense_source) non_dense_view_memrefs_.insert(view_memref);
 
     std::optional<MemRefPtr> view_opt = view_memref;
     TypePtr new_type = CloneTypeWithMemRefAndRemapExprs(
@@ -1019,6 +965,7 @@ class InitMemRefMutator : public IRMutator {
   }
 
   std::map<VarPtr, VarPtr> var_map_;
+  std::set<MemRefPtr> non_dense_view_memrefs_;
   const DeclaredAllocMap& declared_allocs_;
   const backend::BackendHandler* handler_ = nullptr;
   FunctionType func_type_ = FunctionType::InCore;
@@ -1043,17 +990,18 @@ FunctionPtr TransformInitMemRef(const FunctionPtr& func) {
   auto normalized_func = NormalizeStmtStructure(func);
 
   const auto* ctx = PassContext::Current();
-  const backend::BackendHandler* handler = nullptr;
+  const backend::Backend* target = nullptr;
   if (backend::BackendConfig::IsConfigured()) {
-    handler = ctx ? ctx->GetBackendHandler() : backend::GetBackend()->GetHandler();
+    target = ctx ? ctx->GetBackend() : backend::GetBackend();
   }
+  const auto* handler = target ? target->GetHandler() : nullptr;
 
   // PTOAS level2 owns implicit-tmp materialization as part of PlanMemory. PyPTO
   // and DSA-RP instead emit fixed addresses and invoke level3. CI/TCVT scratch
-  // remains restricted to A2/A3, while TSORT32 scratch is level-driven.
+  // requirements come from the backend, while TSORT32 scratch is level-driven.
   const MemoryPlanner planner = ctx ? ctx->GetMemoryPlanner() : MemoryPlanner::PyPTO;
   if (handler != nullptr && (planner == MemoryPlanner::PyPTO || planner == MemoryPlanner::DsaRP)) {
-    MaterializePtoLevel3ScratchMutator materializer(handler->RequiresLevel3TmpScratch());
+    MaterializePtoLevel3ScratchMutator materializer(target);
     normalized_func = materializer.VisitFunction(normalized_func);
   }
 

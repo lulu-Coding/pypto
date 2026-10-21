@@ -15,7 +15,7 @@ lower-level primitives only when building a custom protocol.
 | `NotifyOp` | `AtomicAdd`, `Set` | Signal deposit mode. `AtomicAdd`: atomically increment the peer's signal slot (use for multi-rank barriers). `Set`: overwrite the peer's signal slot (use for 1:1 handshakes). |
 | `WaitCmp` | `Eq`, `Ge` | Wait predicate. `Eq`: block until signal slot equals expected value. `Ge`: block until signal slot >= expected value. |
 | `ReduceOp` | `Sum`, `Max`, `Min`, `Prod` | Reduction operator for collective operations. Support is per-operation: `allreduce` accepts all four; `reduce_scatter` accepts all four on the InCore rail, while the HOST builtin rail currently lowers only `Sum`. |
-| `AtomicType` | `None_`, `Add` | Remote-store combine mode. `None_`: plain store. `Add`: atomically accumulate into peer's destination — requires an `fp32`/`bf16`/`fp16`/`int32`/`int16`/`int8` destination, and a `bf16` destination requires the Ascend910B (A2/A3) profile. |
+| `AtomicType` | `None_`, `Add` | Remote-store combine mode. `None_`: plain store. `Add`: atomically accumulate into peer's destination — requires an `fp32`/`bf16`/`fp16`/`int32`/`int16`/`int8` destination, and a `bf16` destination requires the Ascend910 (A2/A3) profile. |
 | `DistributedTensor` | — | A tensor view bound to a comm-domain window buffer. Every collective and RMA op requires this type on the window side. |
 | `CommCtx` | — | Communication context handle. Produced by `get_comm_ctx()`; consumed by `rank()` and `nranks()`. |
 
@@ -116,8 +116,9 @@ notify next to cube work.
 > value; after `wait` returns, the caller has observed the barrier. These
 > tile-level `notify`/`wait` primitives use monotonic counters that do not
 > self-reset — allocate a fresh buffer per call. The `pld.tensor.*`
-> collectives are the exception: their signal buffers are self-clearing and
-> reusable across back-to-back calls.
+> collectives are the exception: their signal buffers are reusable across
+> back-to-back calls (a self-clearing epilogue for most, a credit-carrying
+> two-round barrier for `all_to_all_v`'s builtin kernel).
 
 ## Deferred Completion: Release the Core, Keep the Task Pending
 
@@ -253,11 +254,17 @@ dispatches between the two on the operand you pass.
 One-sided bulk transfer — rank A writes to or reads from rank B's window
 without rank B participating in the transfer (beyond the signal barrier).
 
+```text
+put(dst, peer=B, src, ...)   this rank: src (In)  --write-->  peer B: dst (InOut)
+get(dst, peer=B, src, ...)   this rank: dst (Out) <--read---  peer B: src (In)
+                             (caller is always "this rank"; peer is always B)
+```
+
 ### Put (Write to Peer)
 
 | Name | Signature | Mutation | Description |
 | ---- | --------- | -------- | ----------- |
-| `put` | `(dst: DT, peer: IntLike, src: DT \| Tensor, dst_offsets=None, src_offsets=None, shape=None, *, atomic=AtomicType.None_, chunk_rows=0, chunk_cols=0, pipeline=False) -> Call` | `dst: InOut`, `src: In` | Write local `src` into peer rank's `dst`. `dst` **must** be window-bound; `src` may be plain `Tensor`. With no offsets/shape, writes the full local slice. `atomic=Add` accumulates instead of overwriting (hardware atomic-add dtypes only: `fp32`/`bf16`/`fp16`/`int32`/`int16`/`int8`; `bf16` is Ascend910B-only). |
+| `put` | `(dst: DT, peer: IntLike, src: DT \| Tensor, dst_offsets=None, src_offsets=None, shape=None, *, atomic=AtomicType.None_, chunk_rows=0, chunk_cols=0, pipeline=False) -> Call` | `dst: InOut`, `src: In` | Write local `src` into peer rank's `dst`. `dst` **must** be window-bound; `src` may be plain `Tensor`. With no offsets/shape, writes the full local slice. `atomic=Add` accumulates instead of overwriting (hardware atomic-add dtypes only: `fp32`/`bf16`/`fp16`/`int32`/`int16`/`int8`; `bf16` is Ascend910-only). |
 
 ### Get (Read from Peer)
 

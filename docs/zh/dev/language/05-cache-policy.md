@@ -7,10 +7,10 @@
 该策略是*作者声明的契约（contract）*，绝不是编译器推断出来的提示（hint）。因此它必须
 显式书写，粒度二选一，并且从 DSL 一路原样传递到代码生成（codegen）。
 
-> **当前状态**：PTOAS 尚未提供 L2 bypass 通路
-> （[PTOAS#1356](https://github.com/hw-native-sys/PTOAS/issues/1356)），因此
-> `BYPASS` 声明目前会**告警，并按普通缓存访问编译**。生成代码在有无该声明时逐字节
-> 一致。参见[当前状态](#当前状态)。
+> **要求 PTOAS >= v0.64**（`toolchain/versions.env` 中的 `PTOAS_VERSION`），并且
+> **只在 a2a3 上真正生效**。`BYPASS` 声明会变成 `pto.tload` 上的一个 `cache_policy`
+> 属性，外加一个携带该设备 uncached 别名距离的 `offset` 操作数，由汇编器加到该条
+> load 的源地址上。参见[codegen 发射什么](#codegen-发射什么)与[架构差异](#架构差异)。
 
 ## 两个书写面
 
@@ -133,26 +133,26 @@ pl.set_cache_policy(b, BYPASS)                 statement, consumed at parse
   -> ScopeStmt.attrs_["cache_policy_vars"]     parse .. pass 9   (Var identity)
   -> Function attr "cache_policy"              pass 9 .. pass 11 (param INDICES)
   -> tile.load kwarg "cache"                   pass 11 .. codegen
-  -> codegen: warn, emit an ordinary cached access
+  -> codegen: `cache_policy` attribute on each emitted `pto.tload`
 ```
 
 | 跳 | 载体 | 负载类型 | 写入方 | 消费方 |
 | -- | ---- | -------- | ------ | ------ |
 | 1 | `ScopeStmt.attrs_[kAttrCachePolicyVars]` | `vector<pair<VarPtr, int>>` | DSL parser | [`OutlineIncoreScopes`](../passes/09-outline_incore_scopes.md)（pass 9） |
-| 2 | `Function.attrs_[kAttrCachePolicyParams]` | `vector<pair<int32_t, int>>`，按索引排序 | pass 9 | [`ConvertTensorToTileOps`](../passes/11-convert_tensor_to_tile_ops.md)（pass 11） |
+| 2 | `Function.attrs_[kAttrCachePolicyParams]` | `vector<pair<int32_t, int>>`，按索引排序 | pass 9 | [`ConvertTensorToTileOps`](../passes/12-convert_tensor_to_tile_ops.md)（pass 11） |
 | 3 | `tile.load` 的 `cache` kwarg | `int`（`ir::CachePolicy`） | pass 11 | PTO codegen |
 
 保证这条链路不出错的几点设计考量：
 
 - **不放在 `TensorView` 的字段上。** 普通 kernel 参数根本没有 `tensor_view_`，在那里
   打策略会强行造出一个 TensorView —— 从而牵入严格的 `TensorViewCanonical` verifier；
-  而且 [`MaterializeTensorStrides`](../passes/33-materialize_tensor_strides.md) 会通过
+  而且 [`MaterializeTensorStrides`](../passes/34-materialize_tensor_strides.md) 会通过
   一个位置参数构造函数重建该 view，会静默丢掉这个字段。
 - **参数索引只在 pass 9..11 之间有效。** 二者之间只夹着 `OutlineClusterScopes`，它不会
   改动已外提 InCore 函数的参数列表。而下游的 pass *会*改：
-  [`InjectGMPipeBuffer`](../passes/25-inject_gm_pipe_buffer.md) 与
-  [`MaterializeDistTensorCtx`](../passes/47-materialize_dist_tensor_ctx.md) 追加参数，
-  [`MaterializeValidShapeSymbols`](../passes/52-materialize_valid_shape_symbols.md)
+  [`InjectGMPipeBuffer`](../passes/26-inject_gm_pipe_buffer.md) 与
+  [`MaterializeDistTensorCtx`](../passes/49-materialize_dist_tensor_ctx.md) 追加参数，
+  [`MaterializeValidShapeSymbols`](../passes/54-materialize_valid_shape_symbols.md)
   则在*前面插入*。这正是 pass 11 转换完成后必须擦除该 attr 的原因。
 - **kwarg 是 `int` 而不是枚举。** 它沿用 `tile.store` 的 `atomic` kwarg 做法，因此
   序列化器、反序列化器、`structural_hash` 与 `structural_equal` 都无需新增枚举分支。
@@ -179,22 +179,93 @@ with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm"):
 | 其余为空的作用域 | 只含一条声明的作用域打印该标记，而不是 `pass` |
 | 函数 attr（`cache_policy`） | 打印为 `(索引, 策略)` 元组列表，因此在 pass 9 与 pass 11 之间 —— 它唯一存在的窗口 —— 抓取的 pass dump 可以重新解析 |
 
-## 当前状态
+## codegen 发射什么
 
-PTOAS 尚未提供 L2 bypass 通路
-（[PTOAS#1356](https://github.com/hw-native-sys/PTOAS/issues/1356)）。因此 codegen 会把
-该请求一路携带下来，然后按普通缓存访问编译，并按"每 kernel 每张量一次"告警（而不是
-每条发射出的 load 一次 —— 展开后的循环会发射同一条 load 很多次）：
+一次 `BYPASS` 读取会变成发射出的那条 load 上的一个属性，外加一个操作数 —— 从张量地址
+到同一批字节的 uncached 别名之间的距离：
 
-```text
-[warning] [CacheBypassUnsupported] tensor 'b' requests CachePolicy.BYPASS, but PTOAS
-has no L2-bypass path yet (https://github.com/hw-native-sys/PTOAS/issues/1356);
-compiling as an ordinary cached access at <file>:<line>
+```mlir
+func.func @main(%arg0: !pto.ptr<f32>, %arg1: !pto.ptr<f32>,
+                %__pypto_l2_cache_offset: i64) {
+  ...
+  pto.tload ins(%b__ssa_v0_pview : !pto.partition_tensor_view<256x256xf32>)
+            outs(%b__ssa_v0_mat  : !pto.tile_buf<loc=mat, ...>)
+            {cache_policy = #pto.load_cache_policy<l2_bypass>}
+            offset = %__pypto_l2_cache_offset : i64
 ```
 
-生成的 MLIR 在有无该声明时**逐字节一致**。今天就写上它的意义在于：等 PTOAS 侧落地
-后，kernel 可以零成本地享受到 bypass —— 届时告警点会被原地替换为一个以 bypass 为根的
-tensor view，codegen 之上的一切都无需改动。
+只有属性本身并不移动地址：PTOAS 只对同时声明了 `l2_bypass` 的 load 施加该 offset，
+而没有 offset 的声明会编译成普通的带缓存 load。二者合在一起才构成绕过 L2 —— 也正因
+如此，真正让这个特性落地的是 offset 而不是属性，而[只有 a2a3 才有这个 offset](#架构差异)。
+
+### offset 从哪里来
+
+A2/A3 把每个 GM 页映射两次 —— 一次带缓存，一次不带 —— 对 uncached 别名发起的 load
+不会在 L2 中分配。两个映射之间的距离是只有驱动才知道的逐设备取值
+（`rtGetL2CacheOffset`），因此它不能在编译器里写成常量：本机报告 `0x80000000000`，
+而 pto-isa 注释中写的是 `0x100000000000`。
+
+simpler 每个 Worker 查询一次，并把它带到每个核的 `GlobalContext`，incore kernel 通过
+`get_l2_cache_offset(args)` 读取（simpler PR #2323）。生成的 kernel wrapper 在入口处
+**只读一次** —— 该值在一次 dispatch 内不会变化，逐 load 读取等于为一个常量反复走 GM
+—— 然后通过合成参数 `%__pypto_l2_cache_offset` 向下传递：
+
+```cpp
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
+    // ... tensor unpacking ...
+    uint64_t __pypto_l2_cache_offset = get_l2_cache_offset(args);
+    main(a__ssa_v0, b__ssa_v0, out__ssa_v0, __pypto_l2_cache_offset);
+}
+```
+
+PTOAS >= v0.64 会把这一对变成对源描述符**副本**的地址运算 —— 因此同一张量的其它 load
+仍使用带缓存的地址 —— 随后发出一条普通 `TLOAD`：
+
+```diff
+-  TLOAD(v45, v50);
++  __gm__ uint8_t* v51 = reinterpret_cast<__gm__ uint8_t*>(PTOAS__GLOBAL_TENSOR_DATA(v50));
++  __gm__ float* v52 = (__gm__ float*) (v51 + v5);
++  GlobalTensor<float, ...> v53(nullptr);
++  v53 = v50;
++  TASSIGN(v53, v52);
++  TLOAD(v45, v53);
+```
+
+0 是合法取值而非失败：不提供别名的 a2a3 设备返回 0，`addr + 0` 就是原地址，此时该声明
+损失的是带宽而不是正确性。模拟器天然属于这种情况。注意这是**设备**返回 0，与"该架构
+根本没有别名"不同 —— 后者压根不会拿到 offset 操作数。
+
+这次发射有五条性质值得写明，因为每一条都在
+`tests/ut/codegen/test_cache_policy_codegen.py` 中有对应断言（参数顺序在
+`tests/ut/codegen/test_prefetch_codegen.py`）：
+
+| 性质 | 原因 |
+| ---- | ---- |
+| `CachePolicy.DEFAULT` **什么都不发射** | 未声明策略的 kernel 保持本特性出现之前的 PTO 形态，因此属性、操作数与参数就是两个在其余方面完全相同的 kernel 之间唯一的差异 |
+| 该属性按 **load** 发射，而不是按张量 | 它是指令的性质；若两条 load 只有第一条带 hint，第二条仍会在 L2 中分配（被取代的 `[CacheBypassUnsupported]` 诊断刻意是"每张量一次"—— 粒度正好相反） |
+| offset 参数**每个 kernel 只追加一次** | 一个运行时取值服务于全部绕过缓存的 load，入口处读一次即可 |
+| 它与 MX 的 `layout` 合并进**同一个**属性字典且排在其后，操作数则跟在字典之后 | PTOAS 要求所有存在的属性在同一个字典里；把 `layout` 留在前面可使未声明策略的 MX load 保持逐字节一致 |
+| a5 只发射属性，**不**发射 offset | 那里没有第二份映射可寻址（见[架构差异](#架构差异)），也没有可供读取距离的入口 |
+
+### 架构差异
+
+双重映射是 a2a3 的属性，建立在它之上的一切也都是：
+
+| 目标 | 当前一条 `BYPASS` 声明的实际效果 |
+| ---- | -------------------------------- |
+| a2a3 设备 | load 对 uncached 别名发起，即 `addr + get_l2_cache_offset(args)`。这正是该特性存在的场景 |
+| 无别名的 a2a3 设备 | 驱动返回 `0`，`addr + 0` 即原地址，读取照常带缓存 —— 结果正确，只是少了一项优化。模拟器天然如此 |
+| a5 | codegen 只发射属性、不发射 offset，而 PTOAS v0.64 把裸属性降级为普通 `TLOAD`。该声明被接受，但**不产生任何效果** |
+
+a5 并不是"缺一个 offset 等着填"：它根本没有第二份映射可寻址。pto-isa 在 a5 的
+`TLOAD` 上以指令操作数的形式携带 L2 hint，未来的 a5 路径应当落在那里 —— v0.64 并未把
+它接到 `cache_policy` 上，因此在 a5 上，生成的 CCE 里声明过的 load 与未声明的毫无区别。
+
+### 更旧的汇编器
+
+发射本身是无条件的 —— `offset` 是 v0.64 新增的，更旧的汇编器会在 `pto.tload`
+的校验处拒绝它。实际上走不到那一步：在汇编第一个 `.pto` 之前，codegen 会运行
+`ptoas --version`，拒绝任何比本仓库所固定 `PTOAS_VERSION` 更旧的汇编器，报错中同时给出两个版本。
 
 ### 限制
 
@@ -216,10 +287,13 @@ tensor view，codegen 之上的一切都无需改动。
 | 下沉 | `src/ir/transforms/convert_tensor_to_tile_ops_pass.cpp` |
 | Printer | `src/ir/transforms/python_printer.cpp`（`PrintScopeCachePolicyStmts`） |
 | Codegen | `src/backend/common/pto_ops_memory.cpp`（`MakeTileLoadCodegenPTO`） |
+| 合成参数 | `src/codegen/pto/pto_codegen.cpp`（`MemRefCollectorVisitor::UsesL2BypassLoad`、签名发射） |
+| Kernel wrapper | `python/pypto/backend/pto_backend.py`（`_uses_l2_cache_offset`、`_generate_kernel_wrapper`） |
+| 运行时读取入口 | `runtime/src/a2a3/runtime/*/common/intrinsic.h`（`get_l2_cache_offset`）、`runtime/docs/l2-cache-bypass.md` |
 
 ## 另请参阅
 
 - [语句与控制流](01-statements.md) —— 作用域形态，以及其它解析期标记
   （`pl.dump_tag`、`pl.static_assert`）。
 - [OutlineIncoreScopes](../passes/09-outline_incore_scopes.md) —— 第 1 跳 → 第 2 跳。
-- [ConvertTensorToTileOps](../passes/11-convert_tensor_to_tile_ops.md) —— 第 2 跳 → 第 3 跳。
+- [ConvertTensorToTileOps](../passes/12-convert_tensor_to_tile_ops.md) —— 第 2 跳 → 第 3 跳。

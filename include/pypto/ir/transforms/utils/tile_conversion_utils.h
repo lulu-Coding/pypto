@@ -15,15 +15,22 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
+#include "pypto/backend/common/backend.h"
+#include "pypto/backend/common/backend_config.h"
+#include "pypto/backend/common/backend_handler.h"
+#include "pypto/backend/common/op_rules.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
+#include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/utils/tensor_view_semantics.h"
 
 namespace pypto::ir::tile_conversion_utils {
@@ -107,6 +114,38 @@ inline ExprPtr MakeSignalOffsets(const ExprPtr& rank_expr, const Span& span) {
 inline ExprPtr MakeSignalOffsets(const ExprPtr& rank_expr, const ExprPtr& row_expr, const Span& span) {
   std::vector<ExprPtr> elements = {row_expr, rank_expr};
   return std::make_shared<MakeTuple>(std::move(elements), span);
+}
+
+/// The BackendHandler a conversion should consult, or nullptr when no backend
+/// is configured (the plain-IR unit-test paths).
+inline const backend::BackendHandler* ActiveBackendHandler() {
+  if (!backend::BackendConfig::IsConfigured()) return nullptr;
+  const auto* ctx = PassContext::Current();
+  return ctx != nullptr ? ctx->GetBackendHandler() : backend::BackendConfig::GetBackend()->GetHandler();
+}
+
+/// Query the registered select rule before constructing a Call. Standalone
+/// IR passes historically use A5 geometry and no dtype gate without a target;
+/// preserve that fallback here, without assigning defaults to other backends.
+inline backend::OpScratchPlan PlanSelectScratch(const std::string& op_name,
+                                                const backend::OpScratchRequest& request) {
+  if (!backend::BackendConfig::IsConfigured()) {
+    return {backend::OpScratchStatus::Required, backend::TileScratchSpec{DataType::UINT8, 1, 32}, ""};
+  }
+  const auto* ctx = PassContext::Current();
+  const auto* target = ctx ? ctx->GetBackend() : backend::BackendConfig::GetBackend();
+  const auto plan = target->PlanOpScratch(op_name, request);
+  INTERNAL_CHECK(plan.has_value()) << "Internal error: missing scratch rule for " << op_name;
+  return *plan;
+}
+
+/// TSEL synthesis is source-independent. Existing tensor conversions need
+/// only the geometry, whereas composite select also supplies the source dtype.
+inline backend::TileScratchSpec TselScratchSpec() {
+  const auto plan = PlanSelectScratch("tile.sel", {});
+  INTERNAL_CHECK(plan.status == backend::OpScratchStatus::Required && plan.spec)
+      << "Internal error: TSEL scratch geometry must be known";
+  return *plan.spec;
 }
 
 }  // namespace pypto::ir::tile_conversion_utils

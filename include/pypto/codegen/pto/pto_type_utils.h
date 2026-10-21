@@ -13,6 +13,7 @@
 #define PYPTO_CODEGEN_PTO_PTO_TYPE_UTILS_H_
 
 #include <cstdint>
+#include <optional>
 #include <string>
 
 #include "pypto/core/dtype.h"
@@ -123,6 +124,11 @@ struct TileTypeComponents {
 void CheckBoxedTileExtents(const ir::TileType& tile_type, const TileTypeComponents& components,
                            const ir::Span* span);
 
+/// Same box rule for an already-physical descriptor, such as a Buffer IR
+/// ``BufferType``, whose element type and memory space are given directly.
+void CheckBoxedTileExtents(const DataType& dtype, std::optional<ir::MemorySpace> space,
+                           const TileTypeComponents& components, const ir::Span* span);
+
 /// Reject an unboxed (``none_box``) tile whose contiguous axis is not a whole
 /// number of 32-byte units, which PTO cannot address.
 ///
@@ -147,6 +153,23 @@ void CheckFlatTileExtents(const ir::TileType& tile_type, const TileTypeComponent
 
 TileTypeComponents ExtractTileTypeInfo(const ir::TileType& tile_type,
                                        const std::string& dtype_str_override = "");
+
+/// Pack a FIXPIPE scalar pre-quantization scale into the ``pre_quant`` operand word.
+///
+/// The fix-pipe reads its scale out of one 64-bit configuration register, and
+/// pto-isa's `SET_QUANT_SCALAR_IMPL` (a2a3 and a5 alike) builds that word as the
+/// zero-extended **IEEE-754 bit pattern of the FP32 scale**, then overwrites bit
+/// 46 with the destination's signedness for byte-sized destinations. CANN's
+/// `SetFixpipePreQuantFlag(0x3a800000)` is exactly this encoding of `1.0f/1024`.
+///
+/// Bits 37..45 (the 8-bit quantization zero-point) are left at zero: nothing in
+/// the IR carries an offset yet, and the DSL chain this word is folded from
+/// (`tile * scale`) has none.
+///
+/// @param scale Pre-quantization multiplier, applied in FP32 before the
+///              destination clamp and any `pre_relu`.
+/// @param dst   Destination dtype; only its byte-ness and signedness matter.
+int64_t EncodeFixpipePreQuant(double scale, const DataType& dst);
 
 }  // namespace codegen
 }  // namespace pypto

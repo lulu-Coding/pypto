@@ -50,7 +50,7 @@ struct L0TileConfig {
   int N = 0;
   int K = 0;
 
-  // L0 capacities in bytes (typically read from BackendHandler::GetL0?CapacityBytes).
+  // L0 capacities in bytes (typically read from BackendHandler::GetCapacityBytes).
   uint32_t l0a_bytes = 0;
   uint32_t l0b_bytes = 0;
   uint32_t l0c_bytes = 0;
@@ -73,7 +73,7 @@ struct L0TileConfig {
   // Physical row alignment of one L0C accumulator allocation. This is
   // deliberately separate from align_m: align_m constrains legal cube work
   // shapes, while l0c_align_m accounts for rows that occupy SRAM outside the
-  // logical/valid M extent. Ascend910B's INT8 -> INT32 path, for example,
+  // logical/valid M extent. Ascend910's INT8 -> INT32 path, for example,
   // charges M=16 as 32 physical accumulator rows.
   int l0c_align_m = 16;
 

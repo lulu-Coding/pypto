@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 
+#include "pypto/backend/common/backend.h"
 #include "pypto/core/error.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/stmt.h"
@@ -130,11 +131,18 @@ void BindPass(nb::module_& m) {
       .value("AccToGmStoreValid", IRProperty::AccToGmStoreValid,
              "Every tile.store draining an Acc-resident tile targets a GM tensor whose dtype the "
              "backend fix-pipe can narrow into (INT32/FP32/FP16[/BF16]); INT8/INT16 must route "
-             "through a Vec tile instead")
+             "through a Vec tile instead. A store carrying a FIXPIPE epilogue (pre_quant / "
+             "pre_relu) is judged by the scale-bearing table instead, which does reach INT8, and "
+             "an epilogue on a non-Acc source is rejected")
+      .value("FixpipeEpilogueValid", IRProperty::FixpipeEpilogueValid,
+             "Every tile.assemble carrying a FIXPIPE epilogue (pre_quant / pre_relu) is an Acc->Mat "
+             "writeback the fix-pipe can perform: pre_relu alone rides the unscaled narrowing, while "
+             "pre_quant is accepted only for backend-supported dtype pairs; the Acc->GM half of the "
+             "contract is AccToGmStoreValid")
       .value("AtomicAddDtypeValid", IRProperty::AtomicAddDtypeValid,
              "Every atomic-add write into GM (tile.store / tensor.assemble / pld.tensor.put / "
              "pld.tile.put / pld.tensor.remote_store / pld.tile.remote_store) targets a dtype the "
-             "backend store pipe can combine; a bf16 destination requires the Ascend910B (A2/A3) "
+             "backend store pipe can combine; a bf16 destination requires the Ascend910 (A2/A3) "
              "profile")
       .value("AccCompactValid", IRProperty::AccCompactValid,
              "Every tile.matmul_acc / tile.matmul_mx_acc accumulates into a CompactMode.normal "
@@ -154,7 +162,17 @@ void BindPass(nb::module_& m) {
              "mean a dispatchable task, and the runtime passes scalars in by value while returning "
              "only tensors, so such a return has no carrier -- write the value into a [1] tensor "
              "output and read it back with pl.tensor.read. Scalar[TASK_ID] is exempt, and a "
-             "device-side scalar helper belongs in an Inline function");
+             "device-side scalar helper belongs in an Inline function")
+      .value("AivSplitLoweredValid", IRProperty::AivSplitLoweredValid,
+             "Lowered AIV split regions and compatible flat bodies have valid cross-core boundaries")
+      .value("BufferIR", IRProperty::BufferIR,
+             "InCore/AIC/AIV use explicit buffer handles and valid registered buffer calls; "
+             "includes SSA, lexical use-after-definition, and assignment symmetry, not lifetime or "
+             "initialization proofs")
+      .value("TileStorageLegalized", IRProperty::TileStorageLegalized,
+             "Device region boundaries use canonical, nonoverlapping allocation windows")
+      .value("TileStorageAllocated", IRProperty::TileStorageAllocated,
+             "Device region storage and transfers also have nonoverlapping effective address windows");
 
   // Bind IRPropertySet
   auto ir_property_set = nb::class_<IRPropertySet>(passes, "IRPropertySet", "A set of IR properties");
@@ -335,16 +353,17 @@ void BindPass(nb::module_& m) {
                           "verification and the diagnostic channel (warnings + performance\n"
                           "hints) for PassPipeline.")
       .def(nb::init<std::vector<PassInstrumentPtr>, VerificationLevel, DiagnosticPhase, DiagnosticCheckSet,
-                    MemoryPlanner, bool, RuntimeKind>(),
+                    MemoryPlanner, bool, RuntimeKind, bool>(),
            nb::arg("instruments"), nb::arg("verification_level") = VerificationLevel::Basic,
            nb::arg("diagnostic_phase") = DiagnosticPhase::PrePipeline,
            nb::arg("disabled_diagnostics") = DiagnosticCheckSet{DiagnosticCheck::UnusedControlFlowResult},
            nb::arg("memory_planner") = MemoryPlanner::PyPTO,
            nb::arg("enable_pypto_l0c_double_buffer") = false, nb::arg("runtime") = kDefaultRuntimeKind,
+           nb::arg("enable_buffer_ir") = true,
            "Create a PassContext with instruments, verification level, diagnostic phase gate, "
            "optional disabled diagnostic checks, memory planner selection, the experimental "
            "legacy-PyPTO chooser-emitted L0C double-buffer (dbC=2) opt-in, and the target Simpler "
-           "runtime ABI")
+           "runtime ABI, and default-on whole-kernel Buffer IR selection")
       .def("__enter__",
            [](PassContext& self) -> PassContext& {
              self.EnterContext();
@@ -358,12 +377,16 @@ void BindPass(nb::module_& m) {
       .def("get_disabled_diagnostics", &PassContext::GetDisabledDiagnostics,
            "Get the diagnostic checks suppressed by this context")
       .def("get_instruments", &PassContext::GetInstruments, "Get the instruments registered on this context")
+      .def("get_backend", &PassContext::GetBackend, nb::rv_policy::reference,
+           "Get the configured backend for operator queries; does not bind a new target")
       .def("get_memory_planner", &PassContext::GetMemoryPlanner,
            "Get the memory planner selection for this context")
       .def("get_enable_pypto_l0c_double_buffer", &PassContext::GetEnablePyptoL0cDoubleBuffer,
            "Whether chooser-emitted L0C double-buffering (dbC=2) is enabled under the legacy PyPTO "
            "memory planner")
       .def("get_runtime", &PassContext::GetRuntime, "Get the target Simpler runtime ABI for this context")
+      .def("get_enable_buffer_ir", &PassContext::GetEnableBufferIR,
+           "Whether supported whole kernels use Buffer IR")
       .def_static("current", &PassContext::Current, nb::rv_policy::reference,
                   "Get the currently active context, or None if no context is active");
 
@@ -386,6 +409,9 @@ void BindPass(nb::module_& m) {
              "Propagates loop-carried iter_arg/initValue MemRefs down the yield/producer chain so\n"
              "accumulator producers write directly into the carried buffer. Split out of MemoryReuse\n"
              "so it can run without legacy opportunistic reuse (memory_planner=DSA_RP or PTOAS).");
+
+  passes.def("verify_tile_storage", &pass::VerifyTileStorage, nb::arg("allocated") = false,
+             "Verify canonical device storage; allocated=True also checks effective address overlap");
 
   passes.def("memory_reuse", &pass::MemoryReuse,
              "Create a memory reuse pass\n\n"
@@ -448,7 +474,11 @@ void BindPass(nb::module_& m) {
              typecheck::ErrorType::DISTRIBUTED_WINDOW_IDENTITY_MISMATCH,
              "Distributed tensors refer to different window buffers")
       .value("TILE_VIEW_MISMATCH", typecheck::ErrorType::TILE_VIEW_MISMATCH,
-             "Effective TileView metadata mismatch");
+             "Effective TileView metadata mismatch")
+      .value("BUFFER_DESCRIPTOR_MISMATCH", typecheck::ErrorType::BUFFER_DESCRIPTOR_MISMATCH,
+             "Buffer descriptor or multi-buffer slot count mismatch")
+      .value("TENSOR_LAYOUT_MISMATCH", typecheck::ErrorType::TENSOR_LAYOUT_MISMATCH,
+             "Call argument layout differs from the callee parameter's");
 
   // Bind NestedCallErrorType enum
   nb::enum_<nested_call::ErrorType>(passes, "NestedCallErrorType", "Nested call verification error types")
@@ -510,6 +540,9 @@ void BindPass(nb::module_& m) {
   passes.def("convert_to_ssa", &pass::ConvertToSSA, "Create an SSA conversion pass");
   passes.def("outline_incore_scopes", &pass::OutlineIncoreScopes,
              "Create a pass that outlines InCore scopes into separate functions");
+  passes.def("deduplicate_outlined_kernels", &pass::DeduplicateOutlinedKernels,
+             "Reuse closed outlined kernel definitions while preserving all dispatches");
+
   passes.def("outline_cluster_scopes", &pass::OutlineClusterScopes,
              "Create a pass that outlines Cluster scopes into Group functions "
              "and standalone Spmd scopes into Spmd functions");
@@ -526,8 +559,10 @@ void BindPass(nb::module_& m) {
              "(convert tile.assemble loops to tile.store loops).");
   passes.def("block_nz_tensor_views", &pass::BlockNzTensorViews,
              "Create a pass that rewrites logical pl.NZ tensors into pto-isa's blocked NZ form\n\n"
-             "An NZ TensorType shape [..., R, C] becomes [..., C/c0, R/16, 16, c0], where\n"
-             "c0 is the element count of a 32-byte C0 line (256 / dtype bits), and every\n"
+             "An NZ TensorType shape [B, R, C] becomes [B, C/c0, R/16, 16, c0] and [R, C]\n"
+             "becomes [1, C/c0, R/16, 16, c0] — the leading slot is always present, so a\n"
+             "rank-2 tensor gets a batch extent of 1 rather than a shorter shape. c0 is\n"
+             "the element count of a 32-byte C0 line (256 / dtype bits), and every\n"
              "consuming tile.load has its offsets / shapes / valid_shape rewritten into\n"
              "blocked coordinates while its logical 2-D destination TileType is preserved.\n"
              "Must run after ConvertTensorToTileOps and after FlattenTileNdTo2D (it\n"
@@ -636,10 +671,14 @@ void BindPass(nb::module_& m) {
              "LowerHostTensorCollectives, while the host dispatch chain is still intact.");
   passes.def("lower_host_tensor_collectives", &pass::LowerHostTensorCollectives,
              "Lower host-level pld.tensor.allreduce calls to builtin tensor collective dispatches.");
+  passes.def("legalize_spmd_launches", &pass::LegalizeSpmdLaunches,
+             "Guard SPMD launches unless arith proves core_num positive.\n"
+             "Potentially empty launches require caller-provided output tensors.");
+
   passes.def("lower_l2_tensor_collectives", &pass::LowerL2TensorCollectives,
              "Lower managed pld.tensor.* collectives written in a CHIP/L2 orchestration body\n"
              "into one local builtin AIV task (no per-device fan-out, no nested L2 dispatch).\n"
-             "Runs immediately before DeriveCallDirections so the emitted call gets its\n"
+             "Runs before DeriveCallDirections so the emitted call gets its\n"
              "argument directions and TensorMap task edges derived like any kernel call.");
   passes.def("materialize_dist_tensor_ctx", &pass::MaterializeDistTensorCtx,
              "Materialize CommCtx parameters and arguments for DistributedTensor function parameters.");
@@ -652,6 +691,16 @@ void BindPass(nb::module_& m) {
              "neither a physical tensor dimension nor a scalar parameter, so a precompiled kernel\n"
              "never receives it. Adds the symbol as a leading Scalar[INDEX] parameter and passes\n"
              "the caller's actual extent at every call/submit site.");
+  passes.def("select_buffer_ir_functions", &pass::SelectBufferIRFunctions,
+             "Select whole kernels for Buffer IR before storage legalization.");
+  passes.def("lower_tile_to_buffer", &pass::LowerTileToBuffer,
+             "Replace planned device Tile storage with explicit Buffer IR.\n\n"
+             "Runs last, after storage legalization, address placement and signature materialization.\n"
+             "The initial recipe covers dense static rank-2 Vec FP32 allocations, GM transfers,\n"
+             "add/mul and copies in straight-line kernels, branches and loops. Unsupported recipes fail "
+             "explicitly.\n"
+             "Verifies storage closure even when automatic verification is disabled, and verifies\n"
+             "BufferIR after conversion.");
   passes.def("stamp_tfree_split", &pass::StampTfreeSplit,
              "Copy each cross-core tpop's split/pipe-id onto its matching tfree op so codegen\n"
              "reads them from the op directly. Covers mixed-kernel and explicit AIC/AIV tfrees.");

@@ -14,7 +14,7 @@
 | `NotifyOp` | `AtomicAdd`, `Set` | 信号投递模式。`AtomicAdd`：原子递增对端信号槽（多 rank 屏障）。`Set`：覆盖对端信号槽（1:1 握手）。 |
 | `WaitCmp` | `Eq`, `Ge` | 等待谓词。`Eq`：等于时解除阻塞。`Ge`：大于等于时解除阻塞。 |
 | `ReduceOp` | `Sum`, `Max`, `Min`, `Prod` | 集合通信的规约算子。支持情况按操作而定：`allreduce` 支持全部四种；`reduce_scatter` 在 InCore 通道支持全部四种（HOST builtin 通道目前仅 lower `Sum`）。 |
-| `AtomicType` | `None_`, `Add` | 远程存储合并模式。`None_`：普通存储。`Add`：原子累加——要求目标为 `fp32`/`bf16`/`fp16`/`int32`/`int16`/`int8`，其中 `bf16` 目标仅支持 Ascend910B（A2/A3）。 |
+| `AtomicType` | `None_`, `Add` | 远程存储合并模式。`None_`：普通存储。`Add`：原子累加——要求目标为 `fp32`/`bf16`/`fp16`/`int32`/`int16`/`int8`，其中 `bf16` 目标仅支持 Ascend910（A2/A3）。 |
 | `DistributedTensor` | — | 绑定到通信域 window buffer 的 tensor 视图。 |
 | `CommCtx` | — | 通信上下文句柄。 |
 
@@ -97,7 +97,8 @@ def handshake_step(
 
 > **Buffer 重用安全：** Signal 使用单调计数器且不会自重置。这些 tile 级
 > `notify`/`wait` 原语每次调用需分配新 buffer；`pld.tensor.*` 集合通信除外，
-> 其 signal buffer 自清理，可在连续调用间复用。
+> 其 signal buffer 可在连续调用间复用（多数为自清理尾声；`all_to_all_v` 的
+> builtin 内核为携带信用的两轮屏障）。
 
 ## 延迟完成：释放物理核，保留逻辑任务
 
@@ -212,11 +213,17 @@ Python future、host callback 或等待信号的 host thread。需要在同一�
 单边批量传输——rank A 写入或读取 rank B 的 window，rank B 无需参与传输
 （除了 signal 屏障）。
 
+```text
+put(dst, peer=B, src, ...)   本 rank：src (In)  --写入-->  对端 B：dst (InOut)
+get(dst, peer=B, src, ...)   本 rank：dst (Out) <--读取--  对端 B：src (In)
+                             （调用方始终是"本 rank"；对端始终是 B）
+```
+
 ### Put（写入对端）
 
 | 名称 | 签名 | 变更 | 描述 |
 | ---- | ---- | ---- | ---- |
-| `put` | `(dst: DT, peer: IntLike, src: DT \| Tensor, dst_offsets=None, src_offsets=None, shape=None, *, atomic=AtomicType.None_, chunk_rows=0, chunk_cols=0, pipeline=False) -> Call` | `dst: InOut`，`src: In` | 将本地 `src` 写入对端 rank 的 `dst`。`dst` **必须**为 window-bound；`src` 可以是普通 `Tensor`。未指定 offsets/shape 时，写入完整的本地分片。`atomic=Add` 时累加而非覆盖（仅限硬件原子加 dtype：`fp32`/`bf16`/`fp16`/`int32`/`int16`/`int8`；`bf16` 仅支持 Ascend910B）。 |
+| `put` | `(dst: DT, peer: IntLike, src: DT \| Tensor, dst_offsets=None, src_offsets=None, shape=None, *, atomic=AtomicType.None_, chunk_rows=0, chunk_cols=0, pipeline=False) -> Call` | `dst: InOut`，`src: In` | 将本地 `src` 写入对端 rank 的 `dst`。`dst` **必须**为 window-bound；`src` 可以是普通 `Tensor`。未指定 offsets/shape 时，写入完整的本地分片。`atomic=Add` 时累加而非覆盖（仅限硬件原子加 dtype：`fp32`/`bf16`/`fp16`/`int32`/`int16`/`int8`；`bf16` 仅支持 Ascend910）。 |
 
 ```python
 # dst 必须为 window-bound

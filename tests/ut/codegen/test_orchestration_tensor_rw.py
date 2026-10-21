@@ -79,7 +79,7 @@ class TestTensorReadWriteOffsetCodegen:
     def test_tensor_read_constant_1d(self):
         """1D tensor [8], read(t, [3]) -> get_tensor_data<float>(ext_t, 1, indices_val)."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Prog:
@@ -97,7 +97,7 @@ class TestTensorReadWriteOffsetCodegen:
     def test_tensor_read_constant_2d(self):
         """2D tensor [4, 8], read(t, [1, 3]) -> get_tensor_data<float>(ext_t, 2, indices_val)."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Prog:
@@ -116,7 +116,7 @@ class TestTensorReadWriteOffsetCodegen:
     def test_tensor_read_constant_3d(self):
         """3D tensor [2, 4, 8], read(t, [1, 2, 3]) -> get_tensor_data<float>(ext_t, 3, indices_val)."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Prog:
@@ -133,7 +133,7 @@ class TestTensorReadWriteOffsetCodegen:
     def test_tensor_read_variable_index(self):
         """2D tensor [4, 8], read(t, [i, j]) -> indices array carries the runtime expressions."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Prog:
@@ -160,7 +160,7 @@ class TestTensorReadWriteOffsetCodegen:
     def test_tensor_write_constant_2d(self):
         """2D tensor [4, 8], write(t, [1, 3], val) -> set_tensor_data<float>(ext_t, 2, indices_t, val)."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class Prog:
@@ -185,7 +185,7 @@ class TestTensorReadWriteOffsetCodegen:
         """Loop-carried store to a default-In tensor should emit output params."""
 
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class OutputProgram:
@@ -221,7 +221,7 @@ class TestTensorReadWriteOffsetCodegen:
         """Loop-carried read-modify-write should emit inout params."""
 
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class InOutProgram:
@@ -259,7 +259,7 @@ class TestTensorReadWriteOffsetCodegen:
         """Loop-carried Out handles must not cross-wire after an IfStmt merge (#2392)."""
 
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         program = pl.parse_program(_LOOP_CARRIED_OUT_SRC)
         transformed = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(program)
@@ -287,7 +287,10 @@ class TestTensorReadWriteOffsetCodegen:
             re.MULTILINE,
         )
         identity_edges = list(identity_edge_re.finditer(code))
-        assert {match["lhs_base"] for match in identity_edges} == {"a", "b"}, code
+        # Immutable aliases may disappear entirely. Each output must still be
+        # accounted for by an identity edge or a direct external-tensor input.
+        direct_inouts = set(re.findall(r"params_t\d+\.add_inout\(ext_([ab])\);", code))
+        assert {match["lhs_base"] for match in identity_edges} | direct_inouts == {"a", "b"}, code
         cross_wires = [
             match.group(0).strip() for match in identity_edges if match["lhs_base"] != match["rhs_base"]
         ]
@@ -307,7 +310,7 @@ class TestTensorReadWriteOffsetCodegen:
         """
 
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class MixedReturnProgram:
@@ -366,7 +369,7 @@ class TestTensorReadWriteOffsetCodegen:
         """OutWindowExternalizer tuple outputs must rebind loop carries instead of redeclaring them."""
 
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class WindowedTupleLoopCarryProgram:
@@ -456,7 +459,7 @@ class TestTensorReadWriteOffsetCodegen:
         """
 
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         N, M, W = 64, 2048, 8
 
@@ -515,7 +518,7 @@ class TestTensorReadWriteOffsetCodegen:
     def test_group_submit_uses_both_aiv_slots_for_split_vector_kernel(self):
         """Cross-core split inferred from pipe ops should reuse one AIV kernel across both slots."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class SplitGroupProgram:
@@ -574,18 +577,18 @@ class TestTensorReadWriteOffsetCodegen:
         orch_result = _generate_orch_result(transformed)
         code = orch_result.code
         expected_ids = (
-            orch_result.func_name_to_id["cube_consumer"],
-            orch_result.func_name_to_id["vector_producer"],
-            orch_result.func_name_to_id["vector_producer"],
+            {r.code_name: r.func_id for r in orch_result.kernel_registrations}["cube_consumer"],
+            {r.code_name: r.func_id for r in orch_result.kernel_registrations}["vector_producer"],
+            {r.code_name: r.func_id for r in orch_result.kernel_registrations}["vector_producer"],
         )
 
         assert f"MixedKernels mixed_0 = {{{expected_ids[0]}, {expected_ids[1]}, {expected_ids[2]}}};" in code
         assert "rt_submit_task(mixed_0, params_t0);" in code
 
     def test_no_split_mixed_group_dispatches_same_aiv_on_both_lanes(self):
-        """Ascend910B no-split mixed kernels should still launch both AIV lanes."""
+        """Ascend910 no-split mixed kernels should still launch both AIV lanes."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class NoSplitGroupProgram:
@@ -614,9 +617,9 @@ class TestTensorReadWriteOffsetCodegen:
         orch_result = _generate_orch_result(transformed)
         code = orch_result.code
         expected_ids = (
-            orch_result.func_name_to_id[aic_funcs[0].name],
-            orch_result.func_name_to_id[aiv_funcs[0].name],
-            orch_result.func_name_to_id[aiv_funcs[0].name],
+            {r.code_name: r.func_id for r in orch_result.kernel_registrations}[aic_funcs[0].name],
+            {r.code_name: r.func_id for r in orch_result.kernel_registrations}[aiv_funcs[0].name],
+            {r.code_name: r.func_id for r in orch_result.kernel_registrations}[aiv_funcs[0].name],
         )
 
         assert f"MixedKernels mixed_0 = {{{expected_ids[0]}, {expected_ids[1]}, {expected_ids[2]}}};" in code
@@ -625,7 +628,7 @@ class TestTensorReadWriteOffsetCodegen:
     def test_standalone_spmd_dispatches_group_with_spmd_launch_spec(self):
         """Standalone Spmd should remain a wrapper and carry launch spec into Group dispatch."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class SpmdMixedProgram:
@@ -685,7 +688,7 @@ class TestTensorReadWriteOffsetCodegen:
         the orchestration helper rather than a baked literal.
         """
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class SpmdQueryProgram:
@@ -724,9 +727,12 @@ class TestTensorReadWriteOffsetCodegen:
                 passes.outline_cluster_scopes()(passes.convert_to_ssa()(SpmdQueryProgram))
             )
         )
+        transformed = passes.legalize_spmd_launches()(passes.normalize_return_order()(transformed))
         code = _generate_orch_code(transformed)
 
-        assert "params_t0.launch_spec.set_block_num(rt_available_cluster_count());" in code, code
+        assert "spmd_core_num = rt_available_cluster_count();" in code, code
+        assert "params_t0.launch_spec.set_block_num(spmd_core_num);" in code, code
+        assert "if (" in code, code
         assert "params_t0.launch_spec.set_require_sync_start(true);" in code, code
 
     def test_spmd_mixed_multi_out_single_return_alias_targets_actual_return(self):
@@ -743,7 +749,7 @@ class TestTensorReadWriteOffsetCodegen:
         the callee body to the source Param and uses that index for the alias.
         """
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class SpmdMultiOutSingleReturnProgram:
@@ -846,7 +852,7 @@ class TestTensorReadWriteOffsetCodegen:
         ``GenerateSingleReturnAlias`` aliased to ``out_indices[0]`` (= ``pre``).
         """
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class SpmdMultiOutReturnLast:
@@ -926,7 +932,7 @@ class TestTensorReadWriteOffsetCodegen:
     def test_spmd_multi_assemble(self):
         """SPMD multi-output call with assemble should preserve both OutputExisting tuple aliases."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class SpmdMultiAssembleProgram:
@@ -975,7 +981,7 @@ class TestTensorReadWriteOffsetCodegen:
     def test_spmd_gm_pipe_buffer_tensor_create_scales_with_core_num(self):
         """SPMD gm_pipe_buffer allocation should scale by launch core_num in orchestration codegen."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class SpmdGMPipeProgram:
@@ -1021,7 +1027,7 @@ class TestTensorReadWriteOffsetCodegen:
     def test_gm_pipe_buffer_tensor_create_uses_callee_workspace(self):
         """Each injected gm_pipe_buffer tensor.create is sized from its callee pipe layout."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class PerCalleeGMPipeProgram:
@@ -1084,7 +1090,7 @@ class TestTensorReadWriteOffsetCodegen:
         of the allocation.
         """
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class BidirGMPipeProgram:
@@ -1122,7 +1128,7 @@ class TestTensorReadWriteOffsetCodegen:
     def test_gm_pipe_buffer_honours_explicit_slot_num(self):
         """Workspace sizing follows the slot_num the pipe was actually initialized with."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class DeepGMPipeProgram:
@@ -1158,7 +1164,7 @@ class TestTensorReadWriteOffsetCodegen:
     def test_submit_dispatched_pipe_group_sizes_workspace_and_resolves_callees(self):
         """Submitted pipe kernels with different signatures share one Group ABI (#2097)."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         @pl.program
         class SubmitPipeProgram:
@@ -1225,11 +1231,13 @@ class TestTensorReadWriteOffsetCodegen:
         # dir_mask=3 is two rings: 2 * 4 slots * 512 B / sizeof(float) == 1024 elements.
         assert shape_values == ["1024"], code
         assert "rt_submit_task" in code, code
-        assert result.func_name_to_signature["cube_side"] == result.func_name_to_signature["vec_side"]
+        assert {r.code_name: r.signature for r in result.kernel_registrations}["cube_side"] == {
+            r.code_name: r.signature for r in result.kernel_registrations
+        }["vec_side"]
         expected_mixed = (
-            result.func_name_to_id["cube_side"],
-            result.func_name_to_id["vec_side"],
-            result.func_name_to_id["vec_side"],
+            {r.code_name: r.func_id for r in result.kernel_registrations}["cube_side"],
+            {r.code_name: r.func_id for r in result.kernel_registrations}["vec_side"],
+            {r.code_name: r.func_id for r in result.kernel_registrations}["vec_side"],
         )
         assert (
             f"MixedKernels mixed_0 = {{{expected_mixed[0]}, {expected_mixed[1]}, {expected_mixed[2]}}};"

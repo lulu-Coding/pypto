@@ -523,7 +523,8 @@ class TestNormalizeReturnOrderSubmit:
     ``.claude/rules/pass-submit-awareness.md``).
     """
 
-    def test_submit_swapped_returns_remapped(self):
+    @pytest.mark.parametrize("out_b_rows", [16, 32])
+    def test_submit_swapped_returns_remapped(self, out_b_rows):
         """InCore kernel returns swapped + result consumed via ``pl.submit`` →
         kernel returns reordered AND the submit-result projection indices
         permuted so ``a``/``b`` keep binding the same buffers.
@@ -546,12 +547,12 @@ class TestNormalizeReturnOrderSubmit:
                 self,
                 x: pl.Tensor[[16], pl.FP32],
                 out_a: pl.Out[pl.Tensor[[16], pl.FP32]],
-                out_b: pl.Out[pl.Tensor[[16], pl.FP32]],
-            ) -> tuple[pl.Tensor[[16], pl.FP32], pl.Tensor[[16], pl.FP32]]:
+                out_b: pl.Out[pl.Tensor[[out_b_rows], pl.FP32]],
+            ) -> tuple[pl.Tensor[[out_b_rows], pl.FP32], pl.Tensor[[16], pl.FP32]]:
                 x_tile: pl.Tile[[16], pl.FP32] = pl.load(x, [0], [16])
                 a_tile: pl.Tile[[16], pl.FP32] = pl.tile.add(x_tile, x_tile)
                 b_tile: pl.Tile[[16], pl.FP32] = pl.tile.mul(x_tile, x_tile)
-                out_b_store: pl.Tensor[[16], pl.FP32] = pl.store(b_tile, [0], out_b)
+                out_b_store: pl.Tensor[[out_b_rows], pl.FP32] = pl.store(b_tile, [0], out_b)
                 out_a_store: pl.Tensor[[16], pl.FP32] = pl.store(a_tile, [0], out_a)
                 return (out_b_store, out_a_store)
 
@@ -560,8 +561,8 @@ class TestNormalizeReturnOrderSubmit:
                 self,
                 x: pl.Tensor[[16], pl.FP32],
                 out_a: pl.Out[pl.Tensor[[16], pl.FP32]],
-                out_b: pl.Out[pl.Tensor[[16], pl.FP32]],
-            ) -> tuple[pl.Tensor[[16], pl.FP32], pl.Tensor[[16], pl.FP32]]:
+                out_b: pl.Out[pl.Tensor[[out_b_rows], pl.FP32]],
+            ) -> tuple[pl.Tensor[[out_b_rows], pl.FP32], pl.Tensor[[16], pl.FP32]]:
                 with pl.manual_scope():
                     (a, b), tid = pl.submit(self.kernel, x, out_a, out_b)  # noqa: F841
                 return (a, b)
@@ -573,12 +574,12 @@ class TestNormalizeReturnOrderSubmit:
                 self,
                 x: pl.Tensor[[16], pl.FP32],
                 out_a: pl.Out[pl.Tensor[[16], pl.FP32]],
-                out_b: pl.Out[pl.Tensor[[16], pl.FP32]],
-            ) -> tuple[pl.Tensor[[16], pl.FP32], pl.Tensor[[16], pl.FP32]]:
+                out_b: pl.Out[pl.Tensor[[out_b_rows], pl.FP32]],
+            ) -> tuple[pl.Tensor[[16], pl.FP32], pl.Tensor[[out_b_rows], pl.FP32]]:
                 x_tile: pl.Tile[[16], pl.FP32] = pl.load(x, [0], [16])
                 a_tile: pl.Tile[[16], pl.FP32] = pl.tile.add(x_tile, x_tile)
                 b_tile: pl.Tile[[16], pl.FP32] = pl.tile.mul(x_tile, x_tile)
-                out_b_store: pl.Tensor[[16], pl.FP32] = pl.store(b_tile, [0], out_b)  # noqa: F841
+                out_b_store: pl.Tensor[[out_b_rows], pl.FP32] = pl.store(b_tile, [0], out_b)  # noqa: F841
                 out_a_store: pl.Tensor[[16], pl.FP32] = pl.store(a_tile, [0], out_a)  # noqa: F841
                 return (out_a, out_b)
 
@@ -587,8 +588,8 @@ class TestNormalizeReturnOrderSubmit:
                 self,
                 x: pl.Tensor[[16], pl.FP32],
                 out_a: pl.Out[pl.Tensor[[16], pl.FP32]],
-                out_b: pl.Out[pl.Tensor[[16], pl.FP32]],
-            ) -> tuple[pl.Tensor[[16], pl.FP32], pl.Tensor[[16], pl.FP32]]:
+                out_b: pl.Out[pl.Tensor[[out_b_rows], pl.FP32]],
+            ) -> tuple[pl.Tensor[[out_b_rows], pl.FP32], pl.Tensor[[16], pl.FP32]]:
                 with pl.manual_scope():
                     # The pass remaps the submit-result projection indices IN
                     # PLACE (statement order preserved), exactly like the Call
@@ -600,7 +601,7 @@ class TestNormalizeReturnOrderSubmit:
                     # (b, a) tuple-unpack would instead reorder the statements
                     # (b before a), which the in-place remap does not do.
                     _submit_tmp = pl.submit(self.kernel, x, out_a, out_b)
-                    a: pl.Tensor[[16], pl.FP32] = _submit_tmp[1]
+                    a: pl.Tensor[[out_b_rows], pl.FP32] = _submit_tmp[1]
                     b: pl.Tensor[[16], pl.FP32] = _submit_tmp[0]
                     tid: pl.Scalar[pl.TASK_ID] = _submit_tmp[2]  # noqa: F841
                 return (a, b)
@@ -715,6 +716,264 @@ class TestReturnParamsAreStructurallyExplicit:
             assert isinstance(ret, ir.ReturnStmt), f"'{func_name}' body does not end in a ReturnStmt"
             return list(ret.value), list(func.params)
         raise AssertionError(f"function '{func_name}' not found")
+
+    def test_branch_writeback_and_wrapper_return_reference_param(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.AIV)
+            def kernel(
+                self, out: pl.InOut[pl.Tensor[[4, 16], pl.FP32]], condition: pl.Scalar[pl.BOOL]
+            ) -> pl.Tensor[[4, 16], pl.FP32]:
+                if condition:
+                    value = pl.tile.full([1, 16], pl.FP32, 1.0)
+                    out = pl.store(value, [0, 0], out)
+                else:
+                    value = pl.tile.full([1, 16], pl.FP32, 0.0)
+                    out = pl.store(value, [0, 0], out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Spmd)
+            def wrapper(
+                self, out: pl.InOut[pl.Tensor[[4, 16], pl.FP32]], condition: pl.Scalar[pl.BOOL]
+            ) -> pl.Tensor[[4, 16], pl.FP32]:
+                result = self.kernel(out, condition)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.AIV, strict_ssa=True)
+            def kernel(
+                self, out: pl.InOut[pl.Tensor[[4, 16], pl.FP32]], condition: pl.Scalar[pl.BOOL]
+            ) -> pl.Tensor[[4, 16], pl.FP32]:
+                if condition:
+                    value_then = pl.tile.full([1, 16], pl.FP32, 1.0)
+                    out_then = pl.store(value_then, [0, 0], out)
+                    _merged_out, _merged_value = pl.yield_(out_then, value_then)
+                else:
+                    value_else = pl.tile.full([1, 16], pl.FP32, 0.0)
+                    out_else = pl.store(value_else, [0, 0], out)
+                    _merged_out, _merged_value = pl.yield_(out_else, value_else)
+                return out
+
+            @pl.function(type=pl.FunctionType.Spmd, strict_ssa=True)
+            def wrapper(
+                self, out: pl.InOut[pl.Tensor[[4, 16], pl.FP32]], condition: pl.Scalar[pl.BOOL]
+            ) -> pl.Tensor[[4, 16], pl.FP32]:
+                _result = self.kernel(out, condition)
+                return out
+
+        Before = passes.convert_to_ssa()(Before)
+        values, params = self._return_values(Before, "kernel")
+        assert values[0] is not params[0]
+        After = _run_normalize_direct(Before)
+        ir.assert_structural_equal(After, Expected)
+        for name in ("kernel", "wrapper"):
+            values, params = self._return_values(After, name)
+            assert values[0] is params[0]
+
+    def test_dynamic_branch_call_returns_reference_caller_param(self):
+        """Merge metadata must use caller types forwarded by validated callees."""
+        program_source = """
+@pl.program
+class {name}:
+    @pl.function(type=pl.FunctionType.AIV, strict_ssa=True)
+    def write(
+        self, inner_n: pl.Scalar[pl.INDEX], out: pl.InOut[pl.Tensor[[inner_n, 16], pl.FP32]]
+    ) -> pl.Tensor[[inner_n, 16], pl.FP32]:
+        return out
+
+    @pl.function(type=pl.FunctionType.Spmd, strict_ssa=True)
+    def wrapper(
+        self, outer_n: pl.Scalar[pl.INDEX], out: pl.InOut[pl.Tensor[[outer_n, 16], pl.FP32]],
+        condition: pl.Scalar[pl.BOOL]
+    ) -> pl.Tensor[[outer_n, 16], pl.FP32]:
+        if condition:
+            then_out = self.write(outer_n, out)
+            merged = pl.yield_(then_out)
+        else:
+            else_out = self.write(outer_n, out)
+            merged = pl.yield_(else_out)
+        return {returned}
+"""
+        Before = pl.parse(program_source.replace("{name}", "Before").replace("{returned}", "merged"))
+        Expected = pl.parse(program_source.replace("{name}", "Expected").replace("{returned}", "out"))
+        assert isinstance(Before, ir.Program)
+        assert isinstance(Expected, ir.Program)
+
+        def retain_callee_shape_vars(program: ir.Program) -> ir.Program:
+            callee = program.get_function("write")
+            assert callee is not None
+            replacements: dict[int, ir.Var] = {}
+
+            class RetainCalleeShapeVars(ir.IRMutator):
+                def visit_var(self, op: ir.Var) -> ir.Expr:
+                    if op.name_hint != "merged":
+                        return op
+                    if op.unique_id not in replacements:
+                        replacements[op.unique_id] = ir.Var(op.name_hint, callee.params[1].type, op.span)
+                    return replacements[op.unique_id]
+
+            return RetainCalleeShapeVars().visit_program(program)
+
+        # Generated calls/phis can retain callee-local shape Vars until launch
+        # legalization. Model that intermediate type without changing its roots.
+        Before = retain_callee_shape_vars(Before)
+        Expected = retain_callee_shape_vars(Expected)
+        # Launch legalization remaps these provisional type Vars; this test
+        # isolates the return-lineage query that must work before that remap.
+        with passes.PassContext([], passes.VerificationLevel.NONE):
+            After = _run_normalize_direct(Before)
+        # Callee-local shape symbols are open references in this provisional wrapper.
+        ir.assert_structural_equal(After, Expected, enable_auto_mapping=True)
+        values, params = self._return_values(After, "wrapper")
+        assert values[0] is params[1]
+
+    @pytest.mark.parametrize("other_source", ["parameter", "fresh", "view", "valid_shape"])
+    def test_branch_return_with_unproven_identity_is_not_canonicalized(self, other_source):
+        source = {
+            "parameter": "other",
+            "fresh": "pl.create_tensor([4, 16], dtype=pl.FP32)",
+            "view": "pl.tensor.view(out, [4, 16])",
+            "valid_shape": "pl.tensor.set_validshape(out, 2, 16)",
+        }[other_source]
+        then_source = source if other_source in ("view", "valid_shape") else "pl.store(value, [0, 0], out)"
+        Before = pl.parse(f"""
+@pl.program
+class Before:
+    @pl.function(type=pl.FunctionType.AIV)
+    def kernel(
+        self,
+        out: pl.InOut[pl.Tensor[[4, 16], pl.FP32]],
+        other: pl.InOut[pl.Tensor[[4, 16], pl.FP32]],
+        condition: pl.Scalar[pl.BOOL],
+    ) -> pl.Tensor[[4, 16], pl.FP32]:
+        if condition:
+            value = pl.tile.full([1, 16], pl.FP32, 1.0)
+            result = {then_source}
+        else:
+            result = {source}
+        return result
+""")
+
+        assert isinstance(Before, ir.Program)
+        Before = passes.convert_to_ssa()(Before)
+        # These cases must leave the complete input program unchanged.
+        Expected = Before
+        before_values, _ = self._return_values(Before, "kernel")
+        After = _run_normalize_direct(Before)
+        ir.assert_structural_equal(After, Expected)
+        values, params = self._return_values(After, "kernel")
+        assert values[0] is before_values[0]
+        assert all(values[0] is not param for param in params)
+
+    @pytest.mark.parametrize("narrowed_first", [False, True])
+    def test_writeback_after_branch_merge_preserves_returned_valid_shape(self, narrowed_first):
+        """Final type checks also apply when the merge root is already cached."""
+
+        program_source = """
+@pl.program
+class {name}:
+    @pl.function(type=pl.FunctionType.AIV, strict_ssa=True)
+    def kernel(
+        self, out: pl.InOut[pl.Tensor[[4, 16], pl.FP32]], condition: pl.Scalar[pl.BOOL]
+    ) -> tuple[pl.Tensor[[4, 16], pl.FP32], pl.Tensor[[4, 16], pl.FP32]]:
+        if condition:
+            then_value = pl.tile.full([1, 16], pl.FP32, 1.0)
+            then_out = pl.store(then_value, [0, 0], out)
+            merged_out = pl.yield_(then_out)
+        else:
+            else_value = pl.tile.full([1, 16], pl.FP32, 0.0)
+            else_out = pl.store(else_value, [0, 0], out)
+            merged_out = pl.yield_(else_out)
+        result = pl.tensor.set_validshape(merged_out, 2, 16)
+        return {returned}
+"""
+        before_return = "result, merged_out" if narrowed_first else "merged_out, result"
+        expected_return = "result, out" if narrowed_first else "out, result"
+        Before = pl.parse(program_source.replace("{name}", "Before").replace("{returned}", before_return))
+        Expected = pl.parse(
+            program_source.replace("{name}", "Expected").replace("{returned}", expected_return)
+        )
+        assert isinstance(Before, ir.Program)
+        assert isinstance(Expected, ir.Program)
+        After = _run_normalize_direct(Before)
+        ir.assert_structural_equal(After, Expected)
+        values, params = self._return_values(After, "kernel")
+        assert values[int(narrowed_first)] is params[0]
+        assert values[int(not narrowed_first)] is not params[0]
+
+    @pytest.mark.parametrize("branch_narrowing", [False, True])
+    @pytest.mark.parametrize("restored_first", [False, True])
+    def test_restored_writeback_metadata_references_param(self, restored_first, branch_narrowing):
+        """Validate final metadata rather than rejecting an intermediate narrowing."""
+        if branch_narrowing:
+            narrowing = """        if condition:
+            then_out = pl.tensor.set_validshape(out, 2, 16)
+            narrowed = pl.yield_(then_out)
+        else:
+            else_out = pl.tensor.set_validshape(out, 2, 16)
+            narrowed = pl.yield_(else_out)"""
+        else:
+            narrowing = "        narrowed = pl.tensor.set_validshape(out, 2, 16)"
+        program_source = """
+@pl.program
+class {name}:
+    @pl.function(type=pl.FunctionType.AIV, strict_ssa=True)
+    def kernel(
+        self, out: pl.InOut[pl.Tensor[[4, 16], pl.FP32]], tail: pl.Tensor[[2, 16], pl.FP32],
+        condition: pl.Scalar[pl.BOOL]
+    ) -> tuple[pl.Tensor[[4, 16], pl.FP32], pl.Tensor[[4, 16], pl.FP32]]:
+{narrowing}
+        restored = pl.tensor.assemble(narrowed, tail, [2, 0])
+        return {returned}
+"""
+        program_source = program_source.replace("{narrowing}", narrowing)
+        before_return = "restored, narrowed" if restored_first else "narrowed, restored"
+        expected_return = "out, narrowed" if restored_first else "narrowed, out"
+        Before = pl.parse(program_source.replace("{name}", "Before").replace("{returned}", before_return))
+        Expected = pl.parse(
+            program_source.replace("{name}", "Expected").replace("{returned}", expected_return)
+        )
+        assert isinstance(Before, ir.Program)
+        assert isinstance(Expected, ir.Program)
+        After = _run_normalize_direct(Before)
+        ir.assert_structural_equal(After, Expected)
+        values, params = self._return_values(After, "kernel")
+        assert values[int(not restored_first)] is params[0]
+        assert values[int(restored_first)] is not params[0]
+
+    def test_sequential_branch_writebacks_share_lineage(self):
+        """A linear sequence of merges must not trigger an exponential lineage walk."""
+        updates = "\n".join(
+            f"""        if condition:
+            then_value_{i} = pl.tile.full([1, 16], pl.FP32, 1.0)
+            context = pl.store(then_value_{i}, [0, 0], context)
+        else:
+            else_value_{i} = pl.tile.full([1, 16], pl.FP32, 0.0)
+            context = pl.store(else_value_{i}, [0, 0], context)"""
+            for i in range(48)
+        )
+        program_source = f"""
+@pl.program
+class {{name}}:
+    @pl.function(type=pl.FunctionType.AIV)
+    def kernel(
+        self, out: pl.InOut[pl.Tensor[[4, 16], pl.FP32]], condition: pl.Scalar[pl.BOOL]
+    ) -> pl.Tensor[[4, 16], pl.FP32]:
+        context = out
+{updates}
+        return {{returned}}
+"""
+        Before = pl.parse(program_source.replace("{name}", "Before").replace("{returned}", "context"))
+        Expected = pl.parse(program_source.replace("{name}", "Expected").replace("{returned}", "out"))
+        assert isinstance(Before, ir.Program)
+        assert isinstance(Expected, ir.Program)
+        Before = passes.convert_to_ssa()(Before)
+        Expected = passes.convert_to_ssa()(Expected)
+        After = _run_normalize_direct(Before)
+        ir.assert_structural_equal(After, Expected)
+        values, params = self._return_values(After, "kernel")
+        assert values[0] is params[0]
 
     def test_multi_out_kernel_returns_reference_their_params(self):
         """Each returned tensor IS the param object, not an SSA alias of it."""

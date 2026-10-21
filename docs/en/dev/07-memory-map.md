@@ -50,12 +50,12 @@ full.
 
 Which backend is decided in this order:
 
-1. `-b/--backend` — an explicit `BackendType` member name (`Ascend910B`, `Ascend950`).
+1. `-b/--backend` — an explicit `BackendType` member name (`Ascend910`, `Ascend950`).
 2. The case's `ptoas/*.pto` output, whose `pto.target_arch` attribute is matched
    against each backend's own `get_pto_target_arch()`. The mapping lives with
    the backends rather than being duplicated here, so a new backend needs no
    change to this tool.
-3. Otherwise `Ascend910B` is assumed, and the page labels the chip *assumed* so
+3. Otherwise `Ascend910` is assumed, and the page labels the chip *assumed* so
    the panel scales are not mistaken for measured ones.
 
 Capacities are read from the **current** source tree, not from whatever the dump
@@ -188,7 +188,7 @@ loop back-edge shows only its textual extent.
 
 ## Related
 
-- `docs/en/dev/passes/37-allocate_memory_addr.md` — the pass whose output is mapped
-- `docs/en/dev/passes/36-memory_reuse.md` — the pass that decides which lifetimes may share a slot
+- `docs/en/dev/passes/38-allocate_memory_addr.md` — the pass whose output is mapped
+- `docs/en/dev/passes/37-memory_reuse.md` — the pass that decides which lifetimes may share a slot
 - `docs/en/dev/passes/00-pass_manager.md` — `ReportInstrument`, which now only names the artifact directory
 - `docs/en/dev/04-simulator-trace-cleaning.md` — the other post-hoc analysis tool in `pypto.tools`

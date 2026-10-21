@@ -45,6 +45,7 @@
 #include "pypto/ir/transforms/utils/buffer_root_collector.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/narrow_loop_carry.h"
+#include "pypto/ir/transforms/utils/op_predicates.h"
 #include "pypto/ir/transforms/utils/result_alias_utils.h"
 #include "pypto/ir/transforms/utils/tile_conversion_utils.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
@@ -1046,7 +1047,10 @@ class TypePropagatingMutator : public IRMutator {
         auto updated = std::make_shared<Var>(rv->name_hint_, new_iter_args[i]->GetType(), rv->span_);
         // Register mapping for both original and current return_var pointers
         var_remap_[orig_return_vars[i].get()] = updated;
-        if (rv.get() != orig_return_vars[i].get()) var_remap_[rv.get()] = updated;
+        if (rv.get() != orig_return_vars[i].get()) {
+          RetainVar(rv);
+          var_remap_[rv.get()] = updated;
+        }
         updated_rv.push_back(updated);
         rv_changed = true;
       } else {
@@ -1202,7 +1206,7 @@ class TensorToTileMutator : public TypePropagatingMutator {
     auto [bridged_args, bridge_stmts] = BridgeInputSpaces(call, entry->input_reqs);
 
     // Run the converter with bridged args
-    auto conv_result = entry->func(bridged_args, call->kwargs_, call->span_);
+    auto conv_result = entry->func(bridged_args, call->kwargs_, call->span_, conversion_context_);
 
     // Collect all statements: bridge prologue + converter prologue + final assignment
     std::vector<StmtPtr> stmts;
@@ -1222,6 +1226,7 @@ class TensorToTileMutator : public TypePropagatingMutator {
 
     auto tile_name = MakeTileValueName(op->var_->name_hint_);
     auto tile_var = std::make_shared<Var>(tile_name, new_result->GetType(), op->var_->span_);
+    RecordPackedTile(tile_var, new_result);
     stmts.push_back(std::make_shared<AssignStmt>(tile_var, new_result, op->span_));
     var_remap_[op->var_.get()] = tile_var;
 
@@ -1246,7 +1251,7 @@ class TensorToTileMutator : public TypePropagatingMutator {
     if (!entry) return maybe_update();
 
     auto [bridged_args, bridge_stmts] = BridgeInputSpaces(call, entry->input_reqs);
-    auto conv_result = entry->func(bridged_args, call->kwargs_, call->span_);
+    auto conv_result = entry->func(bridged_args, call->kwargs_, call->span_, conversion_context_);
 
     std::vector<StmtPtr> stmts;
     stmts.reserve(bridge_stmts.size() + conv_result.prologue.size() + 1);
@@ -1260,6 +1265,37 @@ class TensorToTileMutator : public TypePropagatingMutator {
   }
 
  private:
+  /// Track packed storage in O(N); views can inherit pitch absent from TileView.
+  void RecordPackedTile(const VarPtr& var, const ExprPtr& value) {
+    auto type = As<TileType>(var->GetType());
+    if (!type) return;
+    const auto view = tile_view_semantics::GetEffectiveTileView(*type);
+    if (view.blayout != TileLayout::row_major || view.slayout != TileLayout::none_box ||
+        !view.stride.empty()) {
+      return;
+    }
+    bool packed = conversion_context_.packed_tiles.count(value) != 0;
+    if (auto call = As<Call>(value)) {
+      const auto* entry = LookupOpEntry(call->op_);
+      packed = entry && entry->GetOpCategory() == "TileOp" &&
+               entry->GetExecutionMemoryAccessEvidence() == ExecutionMemoryAccessEvidence::Functional &&
+               !op_predicates::OutputInheritsSourceBuffer(call->op_->name_);
+      if (entry && IsOp(call, "tile.set_validshape")) {
+        packed = conversion_context_.packed_tiles.count(call->args_[0]) != 0;
+      }
+    }
+    if (packed) conversion_context_.packed_tiles.insert(var);
+  }
+
+  StmtPtr HandlePassThroughAssign(const AssignStmtPtr& op, const ExprPtr& new_value) {
+    auto result = TypePropagatingMutator::HandlePassThroughAssign(op, new_value);
+    auto assign = As<AssignStmt>(result);
+    INTERNAL_CHECK_SPAN(assign, op->span_)
+        << "Internal error: pass-through assignment must stay an assignment";
+    RecordPackedTile(assign->var_, assign->value_);
+    return result;
+  }
+
   void SetYieldTileTargets(const std::vector<VarPtr>& vars) {
     yield_tile_targets_.clear();
     for (const auto& var : vars) yield_tile_targets_.push_back(tile_values_.IsTile(var));
@@ -1317,6 +1353,7 @@ class TensorToTileMutator : public TypePropagatingMutator {
     auto tile =
         std::make_shared<Var>(MakeTileValueName(var ? var->name_hint_ : "operand"), load->GetType(), span);
     stmts.push_back(std::make_shared<AssignStmt>(tile, load, span));
+    RecordPackedTile(tile, load);
     return tile;
   }
 
@@ -1349,8 +1386,9 @@ class TensorToTileMutator : public TypePropagatingMutator {
     const auto* entry = conv_registry_.Lookup("tensor.create");
     INTERNAL_CHECK_SPAN(entry, call->span_)
         << "Internal error: tensor.create has no registered tile conversion";
-    auto converted =
-        As<Call>(entry->func({MakeShapeTuple(boxed, call->span_)}, call->kwargs_, call->span_).result);
+    auto converted = As<Call>(
+        entry->func({MakeShapeTuple(boxed, call->span_)}, call->kwargs_, call->span_, conversion_context_)
+            .result);
     INTERNAL_CHECK_SPAN(converted, call->span_)
         << "Internal error: the tensor.create conversion must produce a Call";
 
@@ -1611,6 +1649,7 @@ class TensorToTileMutator : public TypePropagatingMutator {
   const ConsumerSpaceCollector& consumer_collector_;
   const TensorConversionAnalysis& tile_values_;
   std::unordered_map<const Expr*, ExprPtr> preloaded_tiles_;
+  ConversionContext conversion_context_;
   std::vector<bool> yield_tile_targets_;
   /// Declared GM cache policies of this function's params (empty when the
   /// function carries no ``pl.set_cache_policy`` declaration).
@@ -2376,30 +2415,42 @@ YieldAliasInfo AnalyzeStmtAliases(const StmtPtr& stmt, AliasOriginMap& origin_ma
   return {};
 }
 
+struct ParamAccessInfo {
+  explicit ParamAccessInfo(size_t count)
+      : has_read(count, false), has_write(count, false), dma_store_spans(count), scalar_store_spans(count) {}
+
+  [[nodiscard]] bool HasMixedStores() const {
+    for (size_t i = 0; i < dma_store_spans.size(); ++i) {
+      if (dma_store_spans[i].has_value() && scalar_store_spans[i].has_value()) return true;
+    }
+    return false;
+  }
+
+  std::vector<bool> has_read;
+  std::vector<bool> has_write;
+  std::vector<std::optional<Span>> dma_store_spans;
+  std::vector<std::optional<Span>> scalar_store_spans;
+};
+
+ParamAccessInfo AnalyzeParamAccess(const std::vector<StmtPtr>& stmts, const std::vector<VarPtr>& params) {
+  ParamAccessInfo access(params.size());
+  AliasOriginMap origin_map;
+  for (size_t i = 0; i < params.size(); ++i) {
+    // Include distributed windows, which also name GM storage.
+    if (AsTensorTypeLike(params[i]->GetType())) origin_map[params[i].get()] = ParamOrigins{i};
+  }
+  AnalyzeStmtSequenceAliases(stmts, origin_map, access.has_read, access.has_write, access.dma_store_spans,
+                             access.scalar_store_spans);
+  return access;
+}
+
 /// Upgrade In params to Out/InOut based on tile.store/tensor.write usage analysis.
 void UpgradeWrittenTensorParamDirections(const std::vector<StmtPtr>& stmts, const std::vector<VarPtr>& params,
                                          std::vector<ParamDirection>& param_directions) {
-  std::vector<bool> has_read(params.size(), false);
-  std::vector<bool> has_write(params.size(), false);
-  std::vector<std::optional<Span>> dma_store_spans(params.size());
-  std::vector<std::optional<Span>> scalar_store_spans(params.size());
-  AliasOriginMap origin_map;
-
+  const auto access = AnalyzeParamAccess(stmts, params);
   for (size_t i = 0; i < params.size() && i < param_directions.size(); ++i) {
-    // AsTensorTypeLike also seeds DistributedTensorType window params, so a
-    // pld.tile.remote_store into such a param is attributed as a write below.
-    if (!AsTensorTypeLike(params[i]->GetType())) {
-      continue;
-    }
-    origin_map[params[i].get()] = ParamOrigins{i};
-  }
-
-  auto analysis_map = origin_map;
-  AnalyzeStmtSequenceAliases(stmts, analysis_map, has_read, has_write, dma_store_spans, scalar_store_spans);
-
-  for (size_t i = 0; i < params.size() && i < param_directions.size(); ++i) {
-    if (dma_store_spans[i].has_value() && scalar_store_spans[i].has_value()) {
-      CHECK_SPAN(false, scalar_store_spans[i].value_or(Span::unknown()))
+    if (access.dma_store_spans[i].has_value() && access.scalar_store_spans[i].has_value()) {
+      CHECK_SPAN(false, access.scalar_store_spans[i].value_or(Span::unknown()))
           << "GM tensor '" << params[i]->name_hint_
           << "' mixes MTE3 and scalar stores in one InCore function. tile.store/tensor.assemble "
              "uses the MTE3 path while tensor.write uses the scalar D-cache path; PyPTO cannot "
@@ -2407,10 +2458,10 @@ void UpgradeWrittenTensorParamDirections(const std::vector<StmtPtr>& stmts, cons
              "one UB tile (use tile.write, then one tile.store), or use tensor.write for every GM "
              "element written to this tensor.";
     }
-    if (param_directions[i] != ParamDirection::In || !has_write[i]) {
+    if (param_directions[i] != ParamDirection::In || !access.has_write[i]) {
       continue;
     }
-    param_directions[i] = has_read[i] ? ParamDirection::InOut : ParamDirection::Out;
+    param_directions[i] = access.has_read[i] ? ParamDirection::InOut : ParamDirection::Out;
   }
 }
 
@@ -2576,6 +2627,14 @@ IncoreTransformResult TransformIncoreFunction(const FunctionPtr& func) {
   auto staged_body = CanonicalizeFullTensorScalarUpdates(func->body_, func->params_);
   ConstantScalarFillLoopCanonicalizer scalar_fill_canonicalizer;
   auto canonical_body = scalar_fill_canonicalizer.VisitStmt(staged_body);
+  // A bulk fill must not introduce a second GM store channel beside scalar
+  // updates that cannot be promoted. Reuse the alias-aware access analysis and
+  // retain the original scalar loops when the tentative rewrite would mix
+  // channels. Existing explicit mixed stores still fail the check below.
+  if (canonical_body != staged_body &&
+      AnalyzeParamAccess(FlattenToStmts(canonical_body), func->params_).HasMixedStores()) {
+    canonical_body = staged_body;
+  }
 
   // Pre-scan: collect consumer memory space requirements (e.g. tensor.slice → tensor.matmul
   // needs Mat-space loads).  Driven by InputSpaceReq metadata in OpConversionRegistry.
@@ -2716,7 +2775,8 @@ IncoreTransformResult TransformIncoreFunction(const FunctionPtr& func) {
   auto new_body = SeqStmts::Flatten(std::move(new_stmts), span);
   auto new_func = std::make_shared<Function>(func->name_, new_params, new_param_directions, new_return_types,
                                              new_body, span, FunctionType::InCore, func->level_, func->role_,
-                                             EraseCachePolicyAttr(func->attrs_));
+                                             EraseCachePolicyAttr(func->attrs_),
+                                             func->requires_runtime_binding_, func->ir_stage_);
 
   return {new_func, num_added_outputs};
 }
@@ -2906,9 +2966,9 @@ WrapperTransformResult PropagateOutputsThroughWrapper(
   // wrapper return_types_ to match the inner callee can invalidate existing
   // TupleGetItem users at call-sites.
   std::vector<TypePtr> new_return_types = func->return_types_;
-  auto new_func =
-      std::make_shared<Function>(func->name_, new_params, new_dirs, new_return_types, new_body, func->span_,
-                                 func->func_type_, func->level_, func->role_, func->attrs_);
+  auto new_func = std::make_shared<Function>(func->name_, new_params, new_dirs, new_return_types, new_body,
+                                             func->span_, func->func_type_, func->level_, func->role_,
+                                             func->attrs_, func->requires_runtime_binding_, func->ir_stage_);
   return {new_func, num_added};
 }
 
@@ -3327,11 +3387,10 @@ Pass ConvertTensorToTileOps() {
       }
     }
 
-    // A `tensor.matmul` drops its operands' valid_shape, so an accumulator only
-    // becomes narrower than the seed it is carried from once this pass turns it into
-    // a `tile.matmul` -- which re-types the yields but not the carry those yields
-    // flow through. Repair it here rather than leave a carry the TypeCheck and
-    // AccCompactValid verifiers reject (issue #2470).
+    // 2D tensor.matmul already propagates valid M/N, but carries are still typed
+    // from their seeds. Conversion also introduces physical boxing and Acc
+    // layout/compact metadata. Reconcile converted yields with their carries
+    // before TypeCheck and AccCompactValid run (issue #2470).
     for (auto& func : functions_phase2b) {
       func = narrow_loop_carry::NarrowAccCarries(func);
     }
@@ -3389,7 +3448,7 @@ class IncoreTileOpsVerifier : public IRVisitor {
       // tensor.read/tensor.write on a gm_tensor (TensorType input) intentionally stays unconverted.
       // ``AsTensorTypeLike`` also whitelists ``DistributedTensorType``, which the
       // conversion registry above keeps as ``tensor.read`` / ``tensor.write`` so the
-      // PTO codegen can lower it as a local-rank ``pto.load_scalar`` / ``pto.store_scalar``.
+      // PTO codegen can lower it as a local-rank ``pto.load`` / ``pto.store``.
       if ((IsOp(call, "tensor.read") || IsOp(call, "tensor.write")) && !call->args_.empty() &&
           AsTensorTypeLike(call->args_[0]->GetType())) {
         return;

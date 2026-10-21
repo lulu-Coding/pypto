@@ -29,6 +29,94 @@ for lowering/compiler plumbing, plus other dialects such as VPTO, VMI, and SIMT.
   `tput/tget/tnotify/twait` does not count as ST coverage for
   `tbroadcast/tgather/tscatter/treduce`.
 
+## Planner View Compilation Guard
+
+The `system-tests-a5sim` CI job runs the `fillpad_inplace` planner/view regressions
+with its pinned PTOAS installation, before installing the device runtime:
+
+```bash
+python -m pytest tests/ut/codegen/ --require-ptoas -m ptoas_compile -v
+```
+
+`--require-ptoas` fails test setup when PTOAS is missing, cannot run, or is older
+than the supported version, so native compilation cannot silently skip for a
+missing compiler. The tests cover PTOAS-owned memory planning and the PYPTO/DSA_RP
+comparison paths on both backends. This guard checks MLIR and compilation to C++;
+it does not replace device numerical tests or exhaustively validate the planner.
+
+For an allocation-backed input, the padded result uses a dynamic-valid reshape
+alias initialized to the full tile extent. This preserves subsequent
+`set_validshape` updates, including runtime bounds and uses of the original padded
+handle. This includes allocations declared at function entry for `if/else` results.
+Slice and other non-mutable view inputs retain the static-valid lowering;
+the existing restrictions on updating their validity still apply.
+
+The shared `EnsureTileViewSsa` helper handles typed alias creation and explicit
+runtime-validity initialization. Callers supply the initial extents in physical
+tile coordinates; choosing the full extent remains part of fillpad's semantics.
+An initialized mutable alias always receives a fresh handle, even if its type
+matches the source: their current runtime extents can differ. Existing static
+view callers keep their original behavior. Fillpad uses this helper only on the
+PTOAS planner path; PYPTO and DSA_RP retain their address-backed lowering.
+
+To extend this guard, add `@pytest.mark.ptoas_compile` to a regression test under
+`tests/ut/codegen/`. The test must assert the relevant generated-code semantics
+and actually invoke PTOAS compilation; the marker only selects tests. CI discovers
+marked tests across this directory, so new operators or test files need no workflow
+change. Keep `--require-ptoas` in CI to reject an unavailable compiler.
+
+After installing the runtime, the same CI job also runs the existing
+`fillpad_inplace` numerical tests with PTOAS memory planning on both simulators:
+
+```bash
+python -m pytest tests/st/runtime/ops/test_fillpad_inplace.py --memory-planner=ptoas --platform=a2a3sim,a5sim --forked -v
+```
+
+The six basic cases compare the full `[64, 64]` output against a reference: the first
+48 rows retain the input, and the last 16 rows contain zero, positive infinity,
+or negative infinity. Six more cases cover padding followed by static/runtime
+validity updates and another fill through the original padded alias. Four additional
+cases exercise both paths of an `if/else` result before padding and narrowing.
+Two further cases repeat the same padding mode after narrowing, checking that
+equal source/destination types still retain independent valid extents. This
+complements the compilation guard with simulator numerical coverage; it does not
+establish on-device correctness for every view
+composition covered by the compilation tests.
+
+## Cast Scratch Planning
+
+On A2/A3, non-saturating FP32 -> INT16 and FP16 -> INT16/INT8/UINT8 casts
+need scratch storage. PyPTO and DSA-RP materialize it in `InitMemRef` for PTOAS
+level 3. With the PTOAS planner, level 2 owns that allocation: codegen supplies
+static-valid source/destination reshape views while keeping the one-input
+`pto.tcvt` form. These views alias the existing buffers and preserve the actual
+valid shape, including partial tiles.
+The cast rule registered with `f_plan_scratch` in `pto_ops_cast.cpp` owns scratch
+selection, sizing, and dtype. InitMemRef and codegen query it through
+`Backend::PlanOpScratch("tile.cast", request)`. InitMemRef materializes only a
+`Required` specification; incomplete geometry returns `Unknown` and is diagnosed
+at the call site, rather than being treated as no scratch.
+An explicitly supplied `tmp` bypasses this synthesis rule and keeps its own type
+and capacity. Rank-one sources with explicit scratch remain supported: codegen
+maps their shape and static validity from `[N]` to `[1, N]`.
+
+A2/A3 narrowing casts use disjoint source and destination storage, following
+the shared allocation and codegen safety rule described in
+[MemoryReuse](passes/37-memory_reuse.md). Static-valid views preserve each
+operand's existing storage; they do not make the cast source and destination alias.
+
+Only scratch-backed casts (or an explicit tmp on A2/A3) require static validity.
+Native saturating casts, other native conversions, and A5 casts retain their
+existing dynamic-validity behavior. Runtime validity on an A2/A3 scratch-backed
+cast remains unsupported and is diagnosed before invoking PTOAS.
+
+`tests/ut/codegen/test_ptoas_planner_views.py` checks all four conversion pairs,
+both saturation modes, both backends, all three planners, and full/partial tiles;
+it also invokes native PTOAS compilation when installed. CI runs
+`tests/st/runtime/ops/test_cast_saturation.py` on the A2/A3 simulator to compare
+exact numerical results across planners and verify that partial stores preserve
+output elements outside the valid rectangle.
+
 ## Legend
 
 - **Level**: PyPTO registration/generation level (tile / tensor / tile+tensor / comm /
@@ -69,8 +157,8 @@ for lowering/compiler plumbing, plus other dialects such as VPTO, VMI, and SIMT.
 | pto.make_prefetch_async_context | pto::PrefetchAsyncContext | internal | ✅ | — | — | — | — | validated as part of async-prefetch integration |
 | pto.get_prefetch_async_session | .session | internal | ✅ | — | — | — | — | validated as part of async-prefetch integration |
 | pto.tstore | TSTORE | tile | ✅ | ✅ | ❌ | ✅ | — |  |
-| pto.load_scalar | direct pointer load | tensor | ✅ | ❌ | ✅ | ✅ | — | emitted by `tensor.read` |
-| pto.store_scalar | direct pointer store | tensor | ✅ | ❌ | ✅ | ✅ | — | emitted by `tensor.write` |
+| pto.load | direct pointer load | tensor | ✅ | ❌ | ✅ | ✅ | — | emitted by `tensor.read`; replaces `pto.load_scalar` in PTOAS 0.64 |
+| pto.store | direct pointer store | tensor | ✅ | ❌ | ✅ | ✅ | — | emitted by `tensor.write`; replaces `pto.store_scalar` in PTOAS 0.64 |
 | pto.tmov | TMOV / TMOV_FP | tile | ✅ | ✅ | ❌ | ✅ | — |  |
 | pto.ttrans | TTRANS | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | **Matrix Computation (12)** |  |  |  |  |  |  |  |  |
@@ -164,8 +252,8 @@ for lowering/compiler plumbing, plus other dialects such as VPTO, VMI, and SIMT.
 | **Comparison and Selection (4)** |  |  |  |  |  |  |  |  |
 | pto.tcmp | TCMP | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tcmps | TCMPS | tile | ✅ | ✅ | ❌ | ✅ | — |  |
-| pto.tsel | TSEL | tile | ✅ | ✅ | ❌ | ✅ | — |  |
-| pto.tsels | TSELS | tile | ✅ | ✅ | ❌ | ✅ | — | canonical 4-input path; verified on A2/A3 hardware, A5 hardware verification pending |
+| pto.tsel | TSEL | tile | ✅ | ✅ | ❌ | ✅ | — | also the target of `tile.select` when either branch is a scalar TSELS cannot take |
+| pto.tsels | TSELS | tile | ✅ | ✅ | ❌ | ✅ | — | canonical 4-input path; verified on A2/A3 hardware, A5 hardware verification pending. The composite `tile.select` lowers here for `mask ? tile : scalar` — it has no same-name `pto.*` op of its own |
 | **Bitwise Operations (11)** |  |  |  |  |  |  |  |  |
 | pto.tand | TAND | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | A2/A3 hardware passes signed/unsigned 8/16-bit patterns across full, row-tail, column-tail, and combined-tail shapes; A5 hardware verification pending |
 | pto.tor | TOR | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | A2/A3 hardware passes signed/unsigned 8/16-bit patterns across full, row-tail, column-tail, and combined-tail shapes; A5 hardware verification pending |
@@ -184,14 +272,14 @@ for lowering/compiler plumbing, plus other dialects such as VPTO, VMI, and SIMT.
 | pto.tgather | TGATHER | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tgatherb | TGATHERB | tile | ✅ | ✅ | ❌ | ✅ | — | 32-byte block-offset frontend + exact codegen + same-name ST; verified on A2/A3 hardware (8/8); A5 hardware pending |
 | pto.tscatter | TSCATTER | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
-| pto.mgather | MGATHER | tile | ✅ | ✅ | ❌ | ✅ | — | canonical Vec and Mat overloads with explicit row/elem coalesce; Vec subset verified on A2/A3 hardware, expanded Vec/Mat matrix pending |
+| pto.mgather | MGATHER | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | tensor flat-element Vec interface via `pl.gather(src, index=idx)` when src remains in GM; canonical tile Vec/Mat overloads with row/elem coalesce; expanded Vec/Mat matrix pending |
 | pto.mscatter | MSCATTER | tile | ✅ | ✅ | ❌ | ✅ | — |  |
 | pto.treshape | TRESHAPE | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tinsert | TINSERT | tile | ✅ | ❌ | ❌ | ✅ | — | emitted by `tile.assemble` / automatic matmul lowering |
 | pto.textract | TEXTRACT | tile | ✅ | ✅ | ❌ | ✅ | — |  |
 | pto.tfillpad | TFILLPAD | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tfillpad_expand | TFILLPAD_EXPAND | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
-| pto.tfillpad_inplace | TFILLPAD_INPLACE | tile | ✅ | ✅ | ❌ | ❌ | — | the current codegen emits `pto.tfillpad` |
+| pto.tfillpad_inplace | TFILLPAD_INPLACE | tile | ✅ | ✅ | ❌ | ❌ | — | emits `pto.tfillpad`; PTOAS planning preserves the destination pad/full validity with a `pto.treshape` alias; allocation-backed results retain runtime validity updates |
 | pto.textract_fp | TEXTRACT_FP / TEXTRACT | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING: lacks a complete frontend/codegen/ST path |
 | pto.tinsert_fp | TINSERT_FP / TINSERT | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING: lacks a complete frontend/codegen/ST path |
 | **Sorting (2)** |  |  |  |  |  |  |  |  |

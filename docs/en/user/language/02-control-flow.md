@@ -30,7 +30,7 @@ Four loop constructs share one syntax and differ only in what the compiler is to
 ```text
 pl.range     sequential — the default
 pl.parallel  iterations are independent and may overlap
-pl.unroll    fully unrolled at compile time; bounds must be literals
+pl.unroll    fully unrolled at compile time; bounds must be literals; ≤ 1024 iterations
 pl.pipeline  body replicated `stage` times for ping-pong buffering
 ```
 
@@ -74,7 +74,7 @@ literals or `pl.Scalar` values, except where noted.
 | ---- | ----- | -------------- | ------ |
 | `pl.range(...)` | `ForKind.Sequential` | Yes | int or `Scalar` |
 | `pl.parallel(...)` | `ForKind.Parallel` | Yes | int or `Scalar` |
-| `pl.unroll(...)` | `ForKind.Unroll` | **No** | literals only |
+| `pl.unroll(...)` | `ForKind.Unroll` | Ordinary assignments; explicit SSA only for IR roundtrip | literals only · ≤ 1024 iterations |
 | `pl.pipeline(..., stage=N)` | Sequential + pipelining | Yes | int or `Scalar` |
 
 ```python
@@ -85,6 +85,10 @@ for i in pl.parallel(0, nblocks): ...
 for i in pl.unroll(4): ...            # no init_values here
 ```
 
+`pl.unroll` expands the body once per iteration at compile time, capped at **1024**
+iterations (the `UnrollLoops` pass); a larger trip count raises `ValueError` — restructure
+the loop or use `pl.range()`.
+
 `pl.parallel` is an assertion, not a request: you are telling the compiler the iterations
 are independent. If they are not, the result is a race.
 
@@ -92,8 +96,8 @@ are independent. If they are not, the result is a race.
 ping-pong. The outer loop advances in strides of `stage * step` and a tail dispatch covers
 the remainder when the trip count does not divide evenly. `stage` is required and must be
 a positive integer (typically 2–4). It is lowered at tile level by
-[LowerPipelineLoops](../../dev/passes/31-lower_pipeline_loops.md) — or, under
-`memory_planner=PTOAS`, by [LowerPipelineToSlots](../../dev/passes/30-lower_pipeline_to_slots.md),
+[LowerPipelineLoops](../../dev/passes/32-lower_pipeline_loops.md) — or, under
+`memory_planner=PTOAS`, by [LowerPipelineToSlots](../../dev/passes/31-lower_pipeline_to_slots.md),
 which rotates one un-replicated body through the slots of a single allocation instead.
 
 ```python
@@ -185,7 +189,7 @@ non-SSA source is normal input, not a compatibility mode.
 | **`while_() requires init_values to be specified`** | `pl.while_()` with no carried state | Add `init_values=(...)`, even if it is a single counter |
 | **Parser error on `pl.cond`** | Not the first statement of the `while_` body | Move it to the first line |
 | **Branch merge rejected** | Only one arm yields, or arities differ | Yield the same count and types from both arms |
-| **`unroll()` rejects `init_values`** | Unrolled loops carry no state | Use `pl.range`, or restructure so no value is carried |
+| **`Unroll loops cannot have iter_args`** | `UnrollLoops` received explicit SSA input | Use ordinary assignments in `pl.unroll`; run `UnrollLoops` before `ConvertToSSA` |
 | **`unroll()` rejects a bound** | Bounds must be compile-time literals | Use `pl.range` for a `Scalar` bound |
 | **`pipeline()` stage error** | `stage` missing or not a positive int | Pass `stage=N`, N ≥ 1 |
 | **Race under `pl.parallel`** | Iterations are not actually independent | Use `pl.range`, or remove the cross-iteration dependency |
@@ -205,5 +209,5 @@ non-SSA source is normal input, not a compatibility mode.
 - [Scopes and Placement](04-scopes.md) — the placement scopes these loops sit inside.
 - [ConvertToSSA](../../dev/passes/04-convert_to_ssa.md) — the conversion this page's rules come from.
 - [UnrollLoops](../../dev/passes/02-unroll_loops.md) — what `pl.unroll` becomes.
-- [LowerPipelineToSlots](../../dev/passes/30-lower_pipeline_to_slots.md) — what `pl.pipeline` becomes under `memory_planner=PTOAS`.
-- [LowerPipelineLoops](../../dev/passes/31-lower_pipeline_loops.md) — what `pl.pipeline` becomes otherwise.
+- [LowerPipelineToSlots](../../dev/passes/31-lower_pipeline_to_slots.md) — what `pl.pipeline` becomes under `memory_planner=PTOAS`.
+- [LowerPipelineLoops](../../dev/passes/32-lower_pipeline_loops.md) — what `pl.pipeline` becomes otherwise.

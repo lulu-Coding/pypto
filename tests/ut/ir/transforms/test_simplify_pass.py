@@ -27,6 +27,8 @@ import pytest
 from pypto import ir, passes
 from pypto.pypto_core import DataType
 
+from .storage_test_utils import without_call_memrefs
+
 _OP_PLD_TENSOR_ALLREDUCE = ir.get_op("pld.tensor.allreduce").name
 
 # ============================================================================
@@ -553,6 +555,108 @@ class TestControlFlow:
         assert isinstance(condition, ir.Lt)
         assert condition.left.same_as(iter_arg)
 
+    def test_tensor_iter_arg_memref_offset_preserves_identity(self):
+        """Folding a use's MemRef offset must not invent a new carry definition."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                offset: pl.Scalar[pl.INDEX],
+                cond: pl.Scalar[pl.BOOL],
+                source: pl.Tensor[[8, 8], pl.FP32],
+            ):
+                view: pl.Tensor[[4, 8], pl.FP32, pl.MemRef("mem", offset * 8 * 4, 128)] = pl.tensor.slice(
+                    source, [4, 8], [offset, 0]
+                )
+                for i, (carry,) in pl.parallel(4, init_values=(view,)):
+                    if cond:
+                        pl.tensor.write(carry, [i, 0], pl.const(1.0, pl.FP32))
+                    else:
+                        pl.tensor.write(carry, [i, 0], pl.const(2.0, pl.FP32))
+                    _result = pl.yield_(carry)
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                offset: pl.Scalar[pl.INDEX],
+                cond: pl.Scalar[pl.BOOL],
+                source: pl.Tensor[[8, 8], pl.FP32],
+            ):
+                view: pl.Tensor[[4, 8], pl.FP32, pl.MemRef("mem", offset * 8 * 4, 128)] = pl.tensor.slice(
+                    source, [4, 8], [offset, 0]
+                )
+                for i, (carry,) in pl.parallel(4, init_values=(view,)):
+                    if cond:
+                        pl.tensor.write(carry, [i, 0], pl.const(1.0, pl.FP32))
+                    else:
+                        pl.tensor.write(carry, [i, 0], pl.const(2.0, pl.FP32))
+                    _result = pl.yield_(carry)
+
+        props = passes.IRPropertySet()
+        props.insert(passes.IRProperty.SSAForm)
+        props.insert(passes.IRProperty.UseAfterDef)
+        assert not passes.PropertyVerifierRegistry.verify(props, Before)
+        after = passes.simplify()(Before)
+        diagnostics = passes.PropertyVerifierRegistry.verify(props, after)
+        assert not diagnostics, [d.message for d in diagnostics]
+        ir.assert_structural_equal(without_call_memrefs(after), without_call_memrefs(Expected))
+
+    def test_while_tensor_iter_arg_memref_offset_preserves_identity(self):
+        """Folding a use's MemRef offset must not invent a new carry definition."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                offset: pl.Scalar[pl.INDEX],
+                cond: pl.Scalar[pl.BOOL],
+                source: pl.Tensor[[8, 8], pl.FP32],
+            ):
+                view: pl.Tensor[[4, 8], pl.FP32, pl.MemRef("mem", offset * 8 * 4, 128)] = pl.tensor.slice(
+                    source, [4, 8], [offset, 0]
+                )
+                for (carry,) in pl.while_(init_values=(view,)):
+                    pl.cond(0 < offset)
+                    if cond:
+                        pl.tensor.write(carry, [0, 0], pl.const(1.0, pl.FP32))
+                    else:
+                        pl.tensor.write(carry, [0, 0], pl.const(2.0, pl.FP32))
+                    _result = pl.yield_(carry)
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                offset: pl.Scalar[pl.INDEX],
+                cond: pl.Scalar[pl.BOOL],
+                source: pl.Tensor[[8, 8], pl.FP32],
+            ):
+                view: pl.Tensor[[4, 8], pl.FP32, pl.MemRef("mem", offset * 8 * 4, 128)] = pl.tensor.slice(
+                    source, [4, 8], [offset, 0]
+                )
+                for (carry,) in pl.while_(init_values=(view,)):
+                    pl.cond(0 < offset)
+                    if cond:
+                        pl.tensor.write(carry, [0, 0], pl.const(1.0, pl.FP32))
+                    else:
+                        pl.tensor.write(carry, [0, 0], pl.const(2.0, pl.FP32))
+                    _result = pl.yield_(carry)
+
+        props = passes.IRPropertySet()
+        props.insert(passes.IRProperty.SSAForm)
+        props.insert(passes.IRProperty.UseAfterDef)
+        assert not passes.PropertyVerifierRegistry.verify(props, Before)
+        after = passes.simplify()(Before)
+        diagnostics = passes.PropertyVerifierRegistry.verify(props, after)
+        assert not diagnostics, [d.message for d in diagnostics]
+        ir.assert_structural_equal(without_call_memrefs(after), without_call_memrefs(Expected))
+
     def test_while_body_fold_does_not_leak_var_remap_past_the_loop(self):
         """A fold inside a while body must not rewrite uses after the loop.
 
@@ -921,6 +1025,29 @@ class TestScalarConstantPropagation:
             @pl.function
             def main(self, k: pl.Scalar[pl.INDEX]):  # noqa: ARG002
                 _t: pl.Tensor[[1, 8], pl.FP32] = pl.tensor.create([1, 8], dtype=pl.FP32)
+
+        after = passes.simplify()(Before)
+        ir.assert_structural_equal(after, Expected)
+
+    def test_alias_of_unfolded_param_keeps_the_param_type(self):
+        """Folding `N + 0` in an alias Var's own type would leave it unequal to
+        the parameter it aliases, whose type Simplify does not rebuild; the Var
+        keeps the parameter's type so the assignment stays symmetric."""
+        n = pl.dynamic("N")
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Tensor[[n + 0, 4], pl.FP32]) -> pl.Tensor[[n, 4], pl.FP32]:
+                y: pl.Tensor[[n + 0, 4], pl.FP32] = x
+                return y
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, x: pl.Tensor[[n + 0, 4], pl.FP32]) -> pl.Tensor[[n, 4], pl.FP32]:
+                y: pl.Tensor[[n + 0, 4], pl.FP32] = x
+                return y
 
         after = passes.simplify()(Before)
         ir.assert_structural_equal(after, Expected)
@@ -1357,6 +1484,35 @@ class TestConstantIfCollapse:
         after = passes.simplify()(Before)
         ir.assert_structural_equal(after, Expected)
 
+    def test_narrow_floormod_keeps_reachable_negative_branch(self):
+        """INT8 253 is -3 at runtime, so x=1 reaches the negative-remainder arm.
+
+        IntSet must not use the raw positive literal to prove the remainder
+        non-negative and discard the observable write in the else branch.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Scalar[pl.INT8], out: pl.Tensor[[1], pl.INT8]):
+                if x % pl.const(253, pl.INT8) >= pl.const(0, pl.INT8):
+                    pl.tensor.write(out, [0], pl.const(11, pl.INT8))
+                else:
+                    pl.tensor.write(out, [0], pl.const(22, pl.INT8))
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, x: pl.Scalar[pl.INT8], out: pl.Tensor[[1], pl.INT8]):
+                if pl.const(0, pl.INT8) <= x % pl.const(253, pl.INT8):
+                    pl.tensor.write(out, [0], pl.const(11, pl.INT8))
+                else:
+                    pl.tensor.write(out, [0], pl.const(22, pl.INT8))
+
+        after = passes.simplify()(Before)
+        # Preserve the FloorMod condition and both writes, allowing Ge -> Le.
+        ir.assert_structural_equal(after, Expected)
+
     def test_keeps_unprovable_condition(self):
         """`if i == 0` with i ∈ [0, 8): polarity unknown — IfStmt preserved."""
 
@@ -1382,6 +1538,36 @@ class TestConstantIfCollapse:
 
 
 class TestSingleTripLoopCollapse:
+    def test_single_iteration_preserves_enclosing_loop_carry(self):
+        """Lifting sibling inner loops must keep the outer tensor carry bound (#2955)."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, source: pl.Tensor[[8], pl.FP32]) -> pl.Tensor[[8], pl.FP32]:
+                for layer, (x,) in pl.range(2, init_values=(source,)):
+                    for c, (first_iter,) in pl.range(0, 8, 16, init_values=(x,)):
+                        first_value = pl.add(x, x)
+                        first = pl.yield_(first_value)
+                    for c, (second_iter,) in pl.range(0, 8, 16, init_values=(first,)):
+                        second_value = pl.add(x, second_iter)
+                        second = pl.yield_(second_value)
+                    result = pl.yield_(second)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, source: pl.Tensor[[8], pl.FP32]) -> pl.Tensor[[8], pl.FP32]:
+                for layer, (x,) in pl.range(2, init_values=(source,)):
+                    first = pl.add(x, x)
+                    second = pl.add(x, first)
+                    result = pl.yield_(second)
+                return result
+
+        after = passes.simplify()(Before)
+        ir.assert_structural_equal(after, Expected)
+
     def test_single_iteration_lifts_body(self):
         """`for _i in pl.range(1)`: trip 1, body lifted to function level.
 
@@ -1435,6 +1621,30 @@ class TestSingleTripLoopCollapse:
 
         after = passes.simplify()(Before)
         ir.assert_structural_equal(after, Expected)
+
+    def test_zero_trip_return_var_keeps_the_unfolded_init_type(self):
+        """The zero-trip fold emits ``acc_next = x``. Folding ``N + 0`` in the
+        return var's type would leave it unequal to the parameter, whose type
+        Simplify does not rebuild; the return var keeps the parameter's type."""
+        n = pl.dynamic("N")
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Tensor[[n + 0, 4], pl.FP32]) -> pl.Tensor[[n, 4], pl.FP32]:
+                for _i, (acc,) in pl.range(0, init_values=(x,)):
+                    acc_next = pl.yield_(acc)
+                return acc_next
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, x: pl.Tensor[[n + 0, 4], pl.FP32]) -> pl.Tensor[[n, 4], pl.FP32]:
+                acc_next: pl.Tensor[[n + 0, 4], pl.FP32] = x
+                return acc_next
+
+        after = passes.simplify()(passes.convert_to_ssa()(Before))
+        ir.assert_structural_equal(after, passes.convert_to_ssa()(Expected))
 
     def test_keeps_multi_iteration_loop(self):
         """Trip > 1: ForStmt preserved (control test)."""
@@ -1683,8 +1893,32 @@ class TestTensorViewFolding:
             def main(self, x: pl.Tensor[[8, 4], pl.FP32]) -> pl.Tensor[[8, 4], pl.FP32]:
                 # 21f11ecb dropped the alias-fold: the view Call still folds
                 # to ``x``, but the ``same = x`` residual is no longer removed.
-                same: pl.Tensor[[8, 4], pl.FP32, pl.TensorView(stride=[4, 1], layout=pl.TensorLayout.ND)] = x
+                # ``same`` takes ``x``'s type so the assignment stays symmetric.
+                same: pl.Tensor[[8, 4], pl.FP32] = x
                 return same
+
+        after = passes.simplify()(Before)
+        ir.assert_structural_equal(after, Expected)
+
+    def test_identity_view_inside_tuple_retypes_the_tuple(self):
+        """A folded view nested in a tuple changes the tuple's element type;
+        the tuple Var, and the projection read from it, follow."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Tensor[[8, 4], pl.FP32]) -> pl.Tensor[[8, 4], pl.FP32]:
+                pair = (pl.tensor.view(x, layout=pl.TensorLayout.ND), x)
+                first = pair[0]
+                return first
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, x: pl.Tensor[[8, 4], pl.FP32]) -> pl.Tensor[[8, 4], pl.FP32]:
+                pair: pl.Tuple[pl.Tensor[[8, 4], pl.FP32], pl.Tensor[[8, 4], pl.FP32]] = (x, x)
+                first: pl.Tensor[[8, 4], pl.FP32] = pair[0]
+                return first
 
         after = passes.simplify()(Before)
         ir.assert_structural_equal(after, Expected)

@@ -360,6 +360,10 @@ class TestDeclaration:
         assert legacy.get_memory_planner() is None, "the planner rides on the config only"
         assert from_legacy(legacy).get_memory_planner() == MemoryPlanner.DSA_RP
 
+    def test_from_legacy_preserves_buffer_representation(self):
+        legacy = AbsLegacyCase(enable_buffer_ir=True)
+        assert from_legacy(legacy).get_enable_buffer_ir()
+
     def test_from_legacy_prefers_the_explicit_planner(self):
         """``get_memory_planner()`` still outranks the config's planner."""
         legacy = AbsLegacyCase(
@@ -570,7 +574,7 @@ class TestPlatformMatrixCollection:
         for item in self._items(pinned):
             conf._collect_test_case_from_item(item, seen, None, "a2a3")
 
-        assert list(seen) == ["abs_pin_key@a5@default"]
+        assert list(seen) == ["abs_pin_key@a5@default@buffer_ir"]
         assert all(c is pinned for c in seen.values()), "a pinned case is never copied"
 
     def test_an_unpinned_case_still_spans_the_matrix(self):
@@ -583,7 +587,7 @@ class TestPlatformMatrixCollection:
         for item in items:
             conf._collect_test_case_from_item(item, seen, None, "a2a3")
 
-        assert sorted(seen) == [f"abs_free_key@{p}@default" for p in sorted(self.PLATFORMS)]
+        assert sorted(seen) == [f"abs_free_key@{p}@default@buffer_ir" for p in sorted(self.PLATFORMS)]
         assert len({id(c) for c in seen.values()}) == 4
         assert declared.get_platform() is None, "the declaration itself stays unbound"
 

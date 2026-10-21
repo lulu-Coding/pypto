@@ -513,7 +513,7 @@ class Test910BBlockOpsCodegen:
         """Test code generation for all tile-level operations."""
         # Set backend type for testing
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         dtype = DataType.FP32
 
@@ -614,7 +614,7 @@ class TestCarryFamilyCodegen:
                 return pl.store(result, [0, 0], out)
 
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(CarryPrograms)
         expected_ops = {
             "kernel_addc": "pto.taddc",
@@ -692,7 +692,7 @@ class TestBitwiseScalarFamilyCodegen:
                 return pl.store(pl.tile.xors(src_tile, scalar, tmp), [0, 0], out)
 
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(BitwiseScalarPrograms)
         expected_ops = {
             "kernel_ands": "pto.tands",
@@ -723,7 +723,7 @@ class TestRsqrtHighPrecisionCodegen:
 
     def _generate_mlir(self, program_cls) -> str:
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
         optimized = pm.run_passes(program_cls)
@@ -796,7 +796,7 @@ class TestRsqrtHighPrecisionCodegen:
 class TestB01PrecisionAndRowExpandAddCodegen:
     """Exact PTOAS forms added for the first op batch."""
 
-    def _generate_mlir(self, program_cls, backend_type=BackendType.Ascend910B) -> str:
+    def _generate_mlir(self, program_cls, backend_type=BackendType.Ascend910) -> str:
         backend.reset_for_testing()
         backend.set_backend_type(backend_type)
 
@@ -945,7 +945,7 @@ class TestB01PrecisionAndRowExpandAddCodegen:
 class TestB02SelectionAndPreluCodegen:
     """Exact PTOAS forms for TSELS and TPRELU."""
 
-    def _generate_mlir(self, program_cls, backend_type=BackendType.Ascend910B) -> str:
+    def _generate_mlir(self, program_cls, backend_type=BackendType.Ascend910) -> str:
         backend.reset_for_testing()
         backend.set_backend_type(backend_type)
 
@@ -997,12 +997,15 @@ class TestB02SelectionAndPreluCodegen:
                 out: pl.Tensor[[16, 16], pl.INT32],
             ) -> pl.Tensor[[16, 16], pl.INT32]:
                 src_tile: pl.Tile[[16, 16], pl.INT32] = pl.load(src, [0, 0], [16, 16])
-                mask: pl.Tile[[16, 32], pl.UINT8] = pl.tile.cmps(src_tile, 0, cmp_type=4)
+                # eq, not an ordering mode: A2/A3 has no int32 ordering compare
+                # and codegen now rejects that pairing. This test is about how
+                # pto.tsels spells its operands, so any valid mask will do.
+                mask: pl.Tile[[16, 32], pl.UINT8] = pl.tile.cmps(src_tile, 0, cmp_type=0)
                 tmp: pl.Tile[[1, 32], pl.UINT8] = pl.tile.create([1, 32], dtype=pl.UINT8)
                 result: pl.Tile[[16, 16], pl.INT32] = pl.tile.sels(mask, src_tile, tmp, -3)
                 return pl.store(result, [0, 0], out)
 
-        for backend_type in (BackendType.Ascend910B, BackendType.Ascend950):
+        for backend_type in (BackendType.Ascend910, BackendType.Ascend950):
             mlir = self._generate_mlir(Prog, backend_type)
             line = self._op_line(mlir, "pto.tsels")
             ins, outs = self._ins_outs_ssas(line)
@@ -1064,6 +1067,41 @@ class TestB02SelectionAndPreluCodegen:
         with pytest.raises(ValueError, match="only supported on the 'a5' backend"):
             self._generate_mlir(Prog)
 
+    def test_cmps_rejects_an_int32_ordering_compare_on_a2a3(self):
+        """A2/A3 has exactly one int32 comparator, and it is an equality one.
+
+        pto-isa's `GenCmpCall` short-circuits an int32 source onto `vcmpvs_eq`
+        and drops the requested mode, so `lt` / `le` / `gt` / `ge` silently
+        yield an equality mask (pto-isa issue #321). Reject the pairing in
+        codegen rather than emit it. `eq` / `ne` stay correct -- `ne` is `eq`
+        plus TCmps' `vnot` fix-up -- and A5 dispatches every mode generically.
+        """
+
+        def build(cmp_type: int):
+            @pl.program
+            class Prog:
+                @pl.function(type=pl.FunctionType.InCore)
+                def kernel(
+                    self,
+                    src: pl.Tensor[[16, 16], pl.INT32],
+                    out: pl.Tensor[[16, 16], pl.INT32],
+                ) -> pl.Tensor[[16, 16], pl.INT32]:
+                    src_tile: pl.Tile[[16, 16], pl.INT32] = pl.load(src, [0, 0], [16, 16])
+                    mask: pl.Tile[[16, 32], pl.UINT8] = pl.tile.cmps(src_tile, 0, cmp_type=cmp_type)
+                    tmp: pl.Tile[[1, 16], pl.INT32] = pl.tile.create([1, 16], dtype=pl.INT32)
+                    result: pl.Tile[[16, 16], pl.INT32] = pl.tile.sels(mask, src_tile, tmp, -3)
+                    return pl.store(result, [0, 0], out)
+
+            return Prog
+
+        for ordering in (2, 3, 4, 5):  # lt, le, gt, ge
+            with pytest.raises(ValueError, match="ordering comparison"):
+                self._generate_mlir(build(ordering), BackendType.Ascend910)
+
+        for equality in (0, 1):  # eq, ne
+            assert "pto.tcmps" in self._generate_mlir(build(equality), BackendType.Ascend910)
+        assert "pto.tcmps" in self._generate_mlir(build(4), BackendType.Ascend950)
+
     def test_tsels_tmp_may_alias_src_only_on_a5(self):
         @pl.program
         class Prog:
@@ -1080,7 +1118,7 @@ class TestB02SelectionAndPreluCodegen:
                 return pl.store(result, [0, 0], out)
 
         with pytest.raises(ValueError, match="tmp overlaps src"):
-            self._generate_mlir(Prog, BackendType.Ascend910B)
+            self._generate_mlir(Prog, BackendType.Ascend910)
 
         a5_line = self._op_line(self._generate_mlir(Prog, BackendType.Ascend950), "pto.tsels")
         a5_ins, a5_outs = self._ins_outs_ssas(a5_line)
@@ -1103,7 +1141,7 @@ class TestB02SelectionAndPreluCodegen:
                 return pl.store(result, [0, 0], out)
 
         with pytest.raises(ValueError, match="tmp overlaps mask"):
-            self._generate_mlir(Prog, BackendType.Ascend910B)
+            self._generate_mlir(Prog, BackendType.Ascend910)
 
         a5_line = self._op_line(self._generate_mlir(Prog, BackendType.Ascend950), "pto.tsels")
         a5_ins, a5_outs = self._ins_outs_ssas(a5_line)
@@ -1128,7 +1166,7 @@ class TestB02SelectionAndPreluCodegen:
                 return pl.store(result, [0, 0], out)
 
         with pytest.raises(ValueError, match="tmp overlaps src"):
-            self._generate_mlir(Prog, BackendType.Ascend910B)
+            self._generate_mlir(Prog, BackendType.Ascend910)
 
         assert "pto.tsels" in self._generate_mlir(Prog, BackendType.Ascend950)
 
@@ -1152,7 +1190,7 @@ class TestB02SelectionAndPreluCodegen:
                 keep_src_live: pl.Tile[[2, 16], pl.INT32] = pl.tile.add(src, result)
                 return pl.store(keep_src_live, [0, 0], out)
 
-        mlir = self._generate_mlir(Prog, BackendType.Ascend910B)
+        mlir = self._generate_mlir(Prog, BackendType.Ascend910)
         line = self._op_line(mlir, "pto.tsels")
         ins, outs = self._ins_outs_ssas(line)
         self._assert_named_ssas(ins[:3], ["mask", "src", "tmp"])
@@ -1174,7 +1212,7 @@ class TestB02SelectionAndPreluCodegen:
                 result: pl.Tile[[16, 16], pl.FP32] = pl.tile.prelu(src_tile, slope_tile, tmp)
                 return pl.store(result, [0, 0], out)
 
-        a3_line = self._op_line(self._generate_mlir(Prog, BackendType.Ascend910B), "pto.tprelu")
+        a3_line = self._op_line(self._generate_mlir(Prog, BackendType.Ascend910), "pto.tprelu")
         a3_ins, a3_outs = self._ins_outs_ssas(a3_line)
         self._assert_named_ssas(a3_ins, ["prelu_src_view", "prelu_slope_view", "prelu_tmp_view"])
         self._assert_named_ssas(a3_outs, ["prelu_dst_view"])
@@ -1204,7 +1242,7 @@ class TestB02SelectionAndPreluCodegen:
                 return pl.store(result, [0, 0], out)
 
         with pytest.raises(ValueError, match="UINT8 tmp scratch"):
-            self._generate_mlir(Prog, BackendType.Ascend910B)
+            self._generate_mlir(Prog, BackendType.Ascend910)
 
         a5_line = self._op_line(self._generate_mlir(Prog, BackendType.Ascend950), "pto.tprelu")
         a5_ins, a5_outs = self._ins_outs_ssas(a5_line)
@@ -1228,7 +1266,7 @@ class TestB02SelectionAndPreluCodegen:
                 return pl.store(result, [0, 0], out)
 
         with pytest.raises(ValueError, match="src overlaps slope"):
-            self._generate_mlir(Prog, BackendType.Ascend910B)
+            self._generate_mlir(Prog, BackendType.Ascend910)
 
         mlir = self._generate_mlir(Prog, BackendType.Ascend950)
         line = self._op_line(mlir, "pto.tprelu")
@@ -1261,7 +1299,7 @@ class TestB02SelectionAndPreluCodegen:
                 return pl.store(result, [0, 0], out)
 
         with pytest.raises(ValueError, match="physical rows"):
-            self._generate_mlir(Prog, BackendType.Ascend910B)
+            self._generate_mlir(Prog, BackendType.Ascend910)
 
         line = self._op_line(self._generate_mlir(Prog, BackendType.Ascend950), "pto.tprelu")
         ins, outs = self._ins_outs_ssas(line)
@@ -1288,7 +1326,7 @@ class TestB02SelectionAndPreluCodegen:
                 return pl.store(result, [0, 0], out)
 
         with pytest.raises(ValueError, match="valid columns"):
-            self._generate_mlir(Prog, BackendType.Ascend910B)
+            self._generate_mlir(Prog, BackendType.Ascend910)
 
         line = self._op_line(self._generate_mlir(Prog, BackendType.Ascend950), "pto.tprelu")
         ins, outs = self._ins_outs_ssas(line)
@@ -1316,7 +1354,7 @@ class TestB02SelectionAndPreluCodegen:
                 return pl.store(result, [0, 0], out)
 
         with pytest.raises(ValueError, match="physical rows"):
-            self._generate_mlir(Prog, BackendType.Ascend910B)
+            self._generate_mlir(Prog, BackendType.Ascend910)
 
     def test_tprelu_a2a3_rejects_unproven_dynamic_tmp_columns(self):
         @pl.program
@@ -1339,14 +1377,14 @@ class TestB02SelectionAndPreluCodegen:
                 return pl.store(result, [0, 0], out)
 
         with pytest.raises(ValueError, match="valid columns"):
-            self._generate_mlir(Prog, BackendType.Ascend910B)
+            self._generate_mlir(Prog, BackendType.Ascend910)
 
 
 class TestRemainderFamilyCodegen:
     """The four public tile APIs lower to their exact PTOAS instructions."""
 
     @staticmethod
-    def _generate_mlir(program_cls, backend_type=BackendType.Ascend910B) -> str:
+    def _generate_mlir(program_cls, backend_type=BackendType.Ascend910) -> str:
         backend.reset_for_testing()
         backend.set_backend_type(backend_type)
         optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(program_cls)
@@ -1601,6 +1639,10 @@ class TestRemainderFamilyCodegen:
             assert "%trem_rhs_fp32_view" in tcvt_line
             assert "f32" in tcvt_line and "i32" in tcvt_line
             assert "#pto<round_mode ROUND>" in tcvt_line
+            # Stamped, not left to the assembler's default for an omitted satmode --
+            # PTOAS v0.63 flipped that default from OFF to ON. INT32 is an integer
+            # destination, so the policy default (and what this restore wants) is ON.
+            assert "satmode = #pto<saturation_mode ON>" in tcvt_line, tcvt_line
         else:
             assert "pto.tcvt" not in mlir
 
@@ -1668,7 +1710,7 @@ class TestRemainderFamilyCodegen:
             program_cls = ZeroFmodsProgram
 
         with pytest.raises(ValueError, match="valid_shape extent to be provably positive"):
-            self._generate_mlir(program_cls, BackendType.Ascend910B)
+            self._generate_mlir(program_cls, BackendType.Ascend910)
         assert "pto." in self._generate_mlir(program_cls, BackendType.Ascend950)
 
     @pytest.mark.parametrize("op_name", ["rems", "fmods"])
@@ -1749,7 +1791,7 @@ class TestRemainderFamilyCodegen:
             program_cls = DynamicColumnFmodsProgram
 
         with pytest.raises(ValueError, match="valid_shape extent to be provably positive"):
-            self._generate_mlir(program_cls, BackendType.Ascend910B)
+            self._generate_mlir(program_cls, BackendType.Ascend910)
 
     @pytest.mark.parametrize("capacity_kind", ["physical-cols", "dynamic-rows", "independent-cols"])
     def test_a2a3_remainder_requires_proven_scratch_capacity(self, capacity_kind):
@@ -1819,7 +1861,7 @@ class TestRemainderFamilyCodegen:
             match = "tmp valid columns"
 
         with pytest.raises(ValueError, match=match):
-            self._generate_mlir(program_cls, BackendType.Ascend910B)
+            self._generate_mlir(program_cls, BackendType.Ascend910)
         assert "pto." in self._generate_mlir(program_cls, BackendType.Ascend950)
 
     @pytest.mark.parametrize("op_name", ["rem", "rems"])
@@ -1859,7 +1901,7 @@ class TestRemainderFamilyCodegen:
             program_cls = ExactAliasRemsProgram
 
         with pytest.raises(ValueError, match="tmp not to overlap source operand 0"):
-            self._generate_mlir(program_cls, BackendType.Ascend910B)
+            self._generate_mlir(program_cls, BackendType.Ascend910)
         assert "pto." in self._generate_mlir(program_cls, BackendType.Ascend950)
 
     def test_a2a3_rem_rejects_overlapping_tmp_subview(self):
@@ -1880,7 +1922,7 @@ class TestRemainderFamilyCodegen:
                 return pl.store(result, [0, 0], out)
 
         with pytest.raises(ValueError, match="tmp not to overlap source operand 0"):
-            self._generate_mlir(Program, BackendType.Ascend910B)
+            self._generate_mlir(Program, BackendType.Ascend910)
 
     def test_a2a3_rem_rejects_tmp_aliasing_rhs(self):
         @pl.program
@@ -1898,7 +1940,7 @@ class TestRemainderFamilyCodegen:
                 return pl.store(result, [0, 0], out)
 
         with pytest.raises(ValueError, match="tmp not to overlap source operand 1"):
-            self._generate_mlir(Program, BackendType.Ascend910B)
+            self._generate_mlir(Program, BackendType.Ascend910)
 
 
 class TestTileReadWriteOffsetCodegen:
@@ -1907,7 +1949,7 @@ class TestTileReadWriteOffsetCodegen:
     def _generate_mlir(self, program_cls) -> str:
         """Run PassManager and PTOCodegen on the given program, return MLIR string."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
         optimized = pm.run_passes(program_cls)
@@ -2058,7 +2100,7 @@ class TestTileReadWriteOffsetCodegen:
         )
 
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         mlir = codegen.PTOCodegen().generate(ir.Program([func], "dynamic_shape_tile_read_program", span))
 
         assert "pto.tgetval" in mlir, f"Expected pto.tgetval for tile.read, got:\n{mlir}"
@@ -2131,7 +2173,7 @@ class TestBroadcastOpsCodegen:
     def _generate_mlir(self, program_cls) -> str:
         """Run PassManager and PTOCodegen on the given program, return MLIR string."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
         optimized = pm.run_passes(program_cls)
@@ -2292,7 +2334,7 @@ class TestTileSliceCodegen:
     def _generate_mlir(self, program_cls) -> str:
         """Run PassManager and PTOCodegen on the given program, return MLIR string."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
         optimized = pm.run_passes(program_cls)
@@ -2883,7 +2925,7 @@ class TestTileSliceCodegen:
         InCore (AIC/AIV) leaf function, skipping the Group/orchestration wrapper that
         a mixed (cube+vector) kernel splits into (those are not PTOCodegen targets)."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(program_cls)
         return "\n".join(
             codegen.PTOCodegen().generate(ir.Program([func], func.name, optimized.span))
@@ -2932,7 +2974,7 @@ class TestTileAssembleCodegen:
     def _generate_mlir(self, program_cls) -> str:
         """Run PassManager and PTOCodegen on the given program, return MLIR string."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
         optimized = pm.run_passes(program_cls)
@@ -2986,7 +3028,7 @@ class TestTileAssembleCodegen:
         InCore (AIC/AIV) leaf function, skipping the Group/orchestration wrapper that
         a mixed (cube+vector) kernel splits into (those are not PTOCodegen targets)."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(program_cls)
         return "\n".join(
             codegen.PTOCodegen().generate(ir.Program([func], func.name, optimized.span))
@@ -3171,13 +3213,194 @@ class TestTileAssembleCodegen:
         )
 
 
+class TestFixpipeEpilogueCodegen:
+    """FIXPIPE pre-quant / pre-ReLU on the Acc->Mat and Acc->GM writebacks.
+
+    The emitted spelling is not symmetric and neither half is guessable from the
+    other: ``pto.tinsert`` takes the packed scale as a ``pre_quant <ssa> : i64``
+    clause *inside* ``ins(...)`` after the type list, while ``pto.tstore`` takes
+    it as a second ``ins(...)`` operand. Both forms below were round-tripped
+    through ptoas v0.61 (``--emit-pto-ir``) and assemble to device C++ carrying
+    ``ReluPreMode::NormalRelu``, so these assertions pin a verified contract
+    rather than a plausible one.
+    """
+
+    # float(1.0 / 1024) == 0x3A800000. The same constant appears in CANN's
+    # `SetFixpipePreQuantFlag(0x3a800000)` for this kernel family, which makes it
+    # an independent check on `EncodeFixpipePreQuant`'s bit layout.
+    SCALE_WORD = 0x3A800000
+
+    def _generate_mlir_all_incore(self, program_cls, *, backend_type=BackendType.Ascend910) -> str:
+        backend.reset_for_testing()
+        backend.set_backend_type(backend_type)
+        with ir.PassContext([], ir.VerificationLevel.BASIC):
+            optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(program_cls)
+        return "\n".join(
+            codegen.PTOCodegen().generate(ir.Program([func], func.name, optimized.span))
+            for func in optimized.functions.values()
+            if ir.is_incore_type(func.func_type)
+        )
+
+    @pytest.mark.parametrize("backend_type", [BackendType.Ascend910, BackendType.Ascend950])
+    def test_acc_to_mat_assemble_emits_pre_quant_clause_and_relu_attr(self, backend_type):
+        """An INT32 accumulator dequantized into an FP16 Mat scratch, then read by
+        a second matmul — the whole chain stays on the cube.
+
+        PTOAS 0.65 fixes the scaled ``TINSERT`` overload ambiguity, so this runs
+        with verification enabled on both A2/A3 and A5. The assertions also pin
+        the ``.pto`` spelling consumed by that corrected toolchain.
+        """
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                k: pl.Tensor[[128, 64], pl.INT8],
+                q: pl.Tensor[[128, 64], pl.INT8],
+                w: pl.Tensor[[128, 32], pl.FP16],
+                out: pl.Out[pl.Tensor[[128, 32], pl.FP32]],
+            ) -> pl.Tensor[[128, 32], pl.FP32]:
+                k_mat = pl.tile.load(k, [0, 0], [128, 64], target_memory=pl.Mem.Mat)
+                q_mat = pl.tile.load(q, [0, 0], [128, 64], target_memory=pl.Mem.Mat)
+                acc = pl.tile.matmul(
+                    pl.tile.move(k_mat, target_memory=pl.Mem.Left),
+                    pl.tile.move(pl.tile.transpose_view(q_mat), target_memory=pl.Mem.Right),
+                )
+                s_mat = pl.tile.create([128, 128], pl.FP16, target_memory=pl.Mem.Mat)
+                s_mat = pl.tile.assemble(s_mat, acc, [0, 0], pre_quant=1.0 / 1024, pre_relu=True)
+                w_mat = pl.tile.load(w, [0, 0], [128, 32], target_memory=pl.Mem.Mat)
+                y = pl.tile.matmul(
+                    pl.tile.move(s_mat, target_memory=pl.Mem.Left),
+                    pl.tile.move(w_mat, target_memory=pl.Mem.Right),
+                )
+                return pl.tile.store(y, [0, 0], out)
+
+        mlir = self._generate_mlir_all_incore(Prog, backend_type=backend_type)
+        tinserts = [line for line in mlir.splitlines() if "pto.tinsert" in line]
+        assert len(tinserts) == 1, f"one Acc->Mat writeback expected, got {len(tinserts)}:\n{mlir}"
+        line = tinserts[0]
+        assert f"arith.constant {self.SCALE_WORD} : i64" in mlir, (
+            f"pre_quant=1/1024 must encode as the FP32 bit pattern {self.SCALE_WORD:#x}:\n{mlir}"
+        )
+        assert "index, index pre_quant %" in line and " : i64)" in line, (
+            f"pre_quant belongs inside ins(...) after the type list:\n{line}"
+        )
+        # The debug `loc(...)` suffix follows the op, so match the dict itself
+        # rather than the end of the line.
+        assert ") {reluPreMode = #pto<relu_pre_mode normal_relu>}" in line, (
+            f"pre_relu must ride as an attribute dict after outs(...):\n{line}"
+        )
+        assert "loc=acc, dtype=i32" in line and "loc=mat, dtype=f16" in line, (
+            f"this writeback is the i32 -> f16 dequant (DEQF16):\n{line}"
+        )
+
+    def test_acc_to_gm_store_emits_pre_quant_operand_and_relu_attr(self):
+        """The same epilogue on the direct-to-GM path, where the packed scale is a
+        second ``ins(...)`` operand rather than a trailing clause."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                k: pl.Tensor[[128, 64], pl.INT8],
+                q: pl.Tensor[[128, 64], pl.INT8],
+                out: pl.Out[pl.Tensor[[128, 128], pl.FP16]],
+            ) -> pl.Tensor[[128, 128], pl.FP16]:
+                k_mat = pl.tile.load(k, [0, 0], [128, 64], target_memory=pl.Mem.Mat)
+                q_mat = pl.tile.load(q, [0, 0], [128, 64], target_memory=pl.Mem.Mat)
+                acc = pl.tile.matmul(
+                    pl.tile.move(k_mat, target_memory=pl.Mem.Left),
+                    pl.tile.move(pl.tile.transpose_view(q_mat), target_memory=pl.Mem.Right),
+                )
+                return pl.tile.store(acc, [0, 0], out, pre_quant=1.0 / 1024, pre_relu=True)
+
+        mlir = self._generate_mlir_all_incore(Prog)
+        stores = [line for line in mlir.splitlines() if "pto.tstore " in line]
+        assert len(stores) == 1, f"one Acc->GM writeback expected, got {len(stores)}:\n{mlir}"
+        line = stores[0]
+        assert f"arith.constant {self.SCALE_WORD} : i64" in mlir, (
+            f"pre_quant=1/1024 must encode as the FP32 bit pattern {self.SCALE_WORD:#x}:\n{mlir}"
+        )
+        ins_clause = line.split("ins(", 1)[1].split(") outs(", 1)[0]
+        assert ins_clause.endswith(" : i64"), (
+            f"pto.tstore takes the packed scale as a second ins(...) operand:\n{line}"
+        )
+        assert "reluPreMode = #pto<relu_pre_mode normal_relu>" in line, (
+            f"pre_relu must ride in the attribute dict:\n{line}"
+        )
+
+    def test_pre_relu_alone_rides_the_unscaled_writeback(self):
+        """``pre_relu`` without a scale is not a degenerate quantized store — it
+        attaches to the ordinary ``f32 -> bf16`` narrowing, which needs no
+        ``pre_quant`` operand at all. Emitting one would change the instruction
+        (and on A2/A3 there is no scaled ``f32 -> bf16`` mode to change it to)."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[128, 64], pl.BF16],
+                b: pl.Tensor[[64, 128], pl.BF16],
+                w: pl.Tensor[[128, 32], pl.BF16],
+                out: pl.Out[pl.Tensor[[128, 32], pl.FP32]],
+            ) -> pl.Tensor[[128, 32], pl.FP32]:
+                a_mat = pl.tile.load(a, [0, 0], [128, 64], target_memory=pl.Mem.Mat)
+                b_mat = pl.tile.load(b, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+                acc = pl.tile.matmul(
+                    pl.tile.move(a_mat, target_memory=pl.Mem.Left),
+                    pl.tile.move(b_mat, target_memory=pl.Mem.Right),
+                )
+                s_mat = pl.tile.create([128, 128], pl.BF16, target_memory=pl.Mem.Mat)
+                s_mat = pl.tile.assemble(s_mat, acc, [0, 0], pre_relu=True)
+                w_mat = pl.tile.load(w, [0, 0], [128, 32], target_memory=pl.Mem.Mat)
+                y = pl.tile.matmul(
+                    pl.tile.move(s_mat, target_memory=pl.Mem.Left),
+                    pl.tile.move(w_mat, target_memory=pl.Mem.Right),
+                )
+                return pl.tile.store(y, [0, 0], out)
+
+        mlir = self._generate_mlir_all_incore(Prog)
+        tinserts = [line for line in mlir.splitlines() if "pto.tinsert" in line]
+        assert len(tinserts) == 1, f"one Acc->Mat writeback expected, got {len(tinserts)}:\n{mlir}"
+        assert "pre_quant" not in mlir, f"relu alone must emit no scale operand:\n{mlir}"
+        assert "reluPreMode = #pto<relu_pre_mode normal_relu>" in tinserts[0], tinserts[0]
+
+    def test_plain_assemble_and_store_keep_their_byte_identical_form(self):
+        """No epilogue kwargs must mean no extra operand and no extra attribute —
+        an ordinary kernel's ``.pto`` is unchanged by this feature."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[128, 64], pl.FP16],
+                b: pl.Tensor[[64, 128], pl.FP16],
+                out: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                a_mat = pl.tile.load(a, [0, 0], [128, 64], target_memory=pl.Mem.Mat)
+                b_mat = pl.tile.load(b, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+                acc = pl.tile.matmul(
+                    pl.tile.move(a_mat, target_memory=pl.Mem.Left),
+                    pl.tile.move(b_mat, target_memory=pl.Mem.Right),
+                )
+                return pl.tile.store(acc, [0, 0], out)
+
+        mlir = self._generate_mlir_all_incore(Prog)
+        assert "pre_quant" not in mlir, f"an epilogue-free kernel must emit no pre_quant:\n{mlir}"
+        assert "relu_pre_mode" not in mlir, f"an epilogue-free kernel must emit no relu:\n{mlir}"
+
+
 class TestSetValidShapeCodegen:
     """Tests for tile.set_validshape PTO code generation."""
 
     def _generate_mlir(self, program_cls) -> str:
         """Run PassManager and PTOCodegen on the given program, return MLIR string."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
         optimized = pm.run_passes(program_cls)
@@ -3283,7 +3506,10 @@ class TestSetValidShapeCodegen:
                 )
                 return pl.store(narrowed, [0, 0], dst)
 
-        mlir = self._generate_mlir(Prog)
+        # This regression exercises the legacy Tile emitter's source-name
+        # aliasing; default Buffer SSA/metadata is covered by selector tests.
+        with passes.PassContext([], enable_buffer_ir=False):
+            mlir = self._generate_mlir(Prog)
         set_validshape_line = next(
             strip_loc(line) for line in mlir.splitlines() if "pto.set_validshape" in line
         )
@@ -3494,7 +3720,7 @@ class TestMatmulAccCompactCodegen:
     def _generate_mlir(self, program_cls) -> str:
         """Run PassManager and PTOCodegen on the given program, return MLIR string."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(program_cls)
         funcs = list(optimized.functions.values())
@@ -3558,7 +3784,7 @@ class TestMatmulAccCompactCodegen:
 class TestMrgSortCodegen:
     """Tests for mrgsort format1 code generation with constant and variable block_len."""
 
-    def _generate_mlir(self, program_cls, backend_type=BackendType.Ascend910B, *, emit_tile_addr=True) -> str:
+    def _generate_mlir(self, program_cls, backend_type=BackendType.Ascend910, *, emit_tile_addr=True) -> str:
         """Run PassManager and PTOCodegen on the given program, return MLIR string."""
         backend.reset_for_testing()
         backend.set_backend_type(backend_type)
@@ -3637,7 +3863,7 @@ class TestMrgSortCodegen:
         ("src_dtype", "output_cols"),
         [(pl.FP32, 128), (pl.FP16, 256)],
     )
-    @pytest.mark.parametrize("backend_type", [BackendType.Ascend910B, BackendType.Ascend950])
+    @pytest.mark.parametrize("backend_type", [BackendType.Ascend910, BackendType.Ascend950])
     def test_sort32_dynamic_valid_width_emits_level3_scratch(self, src_dtype, output_cols, backend_type):
         """A runtime valid width keeps logical output bounds and uses static TSORT capacity."""
 
@@ -3670,7 +3896,7 @@ class TestMrgSortCodegen:
 
     @pytest.mark.parametrize(
         ("backend_type", "emit_tile_addr"),
-        [(BackendType.Ascend950, True), (BackendType.Ascend910B, False)],
+        [(BackendType.Ascend950, True), (BackendType.Ascend910, False)],
     )
     def test_static_aligned_sort32_uses_static_views_without_tmp(self, backend_type, emit_tile_addr):
         """A5 level3 and the existing A2/A3 path expose static aligned widths."""
@@ -3706,7 +3932,7 @@ class TestConstDtypeCodegen:
 
     def _generate_mlir(self, program_cls) -> str:
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
         optimized = pm.run_passes(program_cls)
         codegen_instance = codegen.PTOCodegen()
@@ -3754,11 +3980,11 @@ class TestConstDtypeCodegen:
 
 
 class TestLevel3StaticViewCodegen:
-    """Codegen static-view bridges for explicit level-3 tmp forms on Ascend910B."""
+    """Codegen static-view bridges for explicit level-3 tmp forms on Ascend910."""
 
     def _generate_mlir(self, program_cls) -> str:
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
         optimized = pm.run_passes(program_cls)
         codegen_instance = codegen.PTOCodegen()
@@ -3837,12 +4063,17 @@ class TestLevel3StaticViewCodegen:
         assert "satmode = #pto<saturation_mode ON>" in tcvt_line, tcvt_line
         assert "tcvt_tmp_view" not in tcvt_line, tcvt_line
 
-    def test_tcvt_to_a_float_destination_emits_no_satmode(self):
-        """A float destination keeps the target's IEEE overflow, so nothing is stamped.
+    def test_tcvt_to_a_float_destination_emits_satmode_off(self):
+        """A float destination keeps the target's IEEE overflow, stamped explicitly.
 
         docs/en/user/precision/00-workflow.md asserts INT32 -> FP16 is bit-identical
         to torch, which means 65520 must overflow to inf rather than clamp to 65504.
         Emitting satmode ON here broke exactly that block on the a2a3 simulator.
+
+        OFF is *written out* rather than left to the assembler: PTOAS v0.63 flipped
+        its own default for an omitted `satmode` from OFF to ON, which would have
+        silently turned this cast into a clamping one. The assembled C++ for an
+        explicit OFF under v0.63 is byte-identical to the omitted form under v0.61.
         """
 
         @pl.program
@@ -3859,7 +4090,32 @@ class TestLevel3StaticViewCodegen:
 
         mlir = self._generate_mlir(Prog)
         tcvt_line = next(line for line in mlir.splitlines() if "pto.tcvt" in line)
-        assert "satmode" not in tcvt_line, tcvt_line
+        assert "satmode = #pto<saturation_mode OFF>" in tcvt_line, tcvt_line
+
+    def test_tcvt_float_destination_explicit_off_matches_the_default(self):
+        """Asking for the float destination's own behaviour emits the same attribute.
+
+        The resolution to OFF happens at the emission boundary, not in the IR
+        default, so an explicit ``"off"`` here is still a recorded deviation --
+        ``CastFoldableToFixpipeMat`` needs to keep seeing it. What it must not do is
+        emit a *different* ``satmode`` from the defaulted form above.
+        """
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[8, 256], pl.INT32],
+                out: pl.Tensor[[8, 256], pl.FP16],
+            ) -> pl.Tensor[[8, 256], pl.FP16]:
+                tile_in = pl.load(src, [0, 0], [8, 256])
+                result = pl.cast(tile_in, pl.FP16, saturation_mode="off")
+                return pl.store(result, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        tcvt_line = next(line for line in mlir.splitlines() if "pto.tcvt" in line)
+        assert "satmode = #pto<saturation_mode OFF>" in tcvt_line, tcvt_line
 
     def test_tcvt_saturation_preserves_explicit_scratch(self):
         """Only compiler-generated scratch is dropped; the explicit-tmp form still emits both."""
@@ -3935,7 +4191,7 @@ class TestColReductionCodegen:
 
     def _generate_mlir(self, program_cls) -> str:
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
         optimized = pm.run_passes(program_cls)
         codegen_instance = codegen.PTOCodegen()
@@ -3962,6 +4218,24 @@ class TestColReductionCodegen:
         mlir = self._generate_mlir(Prog)
         assert "pto.tcolsum" in mlir, f"Expected pto.tcolsum in codegen output:\n{mlir}"
         assert "isBinary" not in mlir, f"Expected no isBinary attribute in codegen output:\n{mlir}"
+
+    @pytest.mark.parametrize("is_binary", [False, True])
+    def test_tensor_col_sum_strategy_codegen(self, is_binary):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                input: pl.Tensor[[63, 32], pl.FP32],
+                output: pl.Out[pl.Tensor[[1, 32], pl.FP32]],
+            ) -> pl.Tensor[[1, 32], pl.FP32]:
+                result = pl.col_sum(input, is_binary=is_binary)
+                output[0:1, 0:32] = result
+                return output
+
+        mlir = self._generate_mlir(Prog)
+        assert "pto.tcolsum" in mlir
+        assert ("isBinary = true" in mlir) == is_binary
 
     def test_col_sum_codegen_binary(self):
         """tile.col_sum with tmp_tile emits isBinary = true."""
@@ -4028,7 +4302,7 @@ class TestTileExtractCodegen:
     def _generate_mlir(self, program_cls) -> str:
         """Run PassManager and PTOCodegen on the given program, return MLIR string."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
         optimized = pm.run_passes(program_cls)
@@ -4097,7 +4371,7 @@ class TestTileMoveAccAddressInvariant:
         concatenate their MLIR so regression assertions cover every variant.
         """
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
         optimized = pm.run_passes(program_cls)
@@ -4249,7 +4523,7 @@ class TestTileMoveAccAddressInvariant:
         # split, so without this guard a split-lowering regression would make
         # the test pass vacuously and stop covering #1352.
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(PipelineGateUpProg)
         incore = [f for f in optimized.functions.values() if ir.is_incore_type(f.func_type)]
         assert len(incore) >= 2, (
@@ -4261,6 +4535,136 @@ class TestTileMoveAccAddressInvariant:
         assert not self._has_acc_to_acc_tmov(mlir), (
             f"Generated MLIR contains invalid pto.tmov acc→acc (regression #1352):\n{mlir}"
         )
+
+
+class TestCastAddressValidation:
+    """Explicit MemRefs must not bypass cast source/destination separation."""
+
+    @pytest.mark.parametrize(
+        ("source_dtype", "result_dtype"),
+        [(DataType.FP32, DataType.BF16), (DataType.BF16, DataType.FP32), (DataType.FP32, DataType.INT32)],
+    )
+    @pytest.mark.parametrize("backend_type", [BackendType.Ascend910, BackendType.Ascend950])
+    @pytest.mark.parametrize("dst_offset", [0, 32, 33792])
+    @pytest.mark.parametrize("shared_base", [False, True])
+    @pytest.mark.parametrize("symbolic", [False, True])
+    def test_cast_physical_ranges(
+        self, backend_type, dst_offset, shared_base, symbolic, source_dtype, result_dtype
+    ):
+        span = ir.Span.unknown()
+        shape = [16, 528]
+        source_size = 16 * 528 * source_dtype.get_byte()
+        result_size = 16 * 528 * result_dtype.get_byte()
+        source_base = ir.Var("source_base", ir.PtrType(), span)
+        result_base = source_base if shared_base else ir.Var("result_base", ir.PtrType(), span)
+        address = ir.Var("address", ir.ScalarType(DataType.INT64), span)
+        source_offset = address if symbolic else ir.ConstInt(0, DataType.INT64, span)
+        result_offset = ir.ConstInt(dst_offset, DataType.INT64, span)
+        if symbolic:
+            result_offset = ir.Add(address, result_offset, DataType.INT64, span)
+        source_type = ir.TileType(
+            shape,
+            source_dtype,
+            ir.MemRef(source_base, source_offset, source_size, span),
+            None,
+            ir.MemorySpace.Vec,
+        )
+        result_type = ir.TileType(
+            shape,
+            result_dtype,
+            ir.MemRef(result_base, result_offset, result_size, span),
+            None,
+            ir.MemorySpace.Vec,
+        )
+        x = ir.Var("x", ir.TensorType(shape, source_dtype), span)
+        y = ir.Var("y", ir.TensorType(shape, result_dtype), span)
+        source = ir.Var("source", source_type, span)
+        result = ir.Var("result", result_type, span)
+        output = ir.Var("output", y.type, span)
+        offsets = ir.MakeTuple([ir.ConstInt(0, DataType.INDEX, span)] * 2, span)
+        sizes = ir.MakeTuple([ir.ConstInt(n, DataType.INDEX, span) for n in shape], span)
+        load = ir.Call(ir.get_op("tile.load"), [x, offsets, sizes], {}, source_type, span)
+        cast = ir.Call(
+            ir.get_op("tile.cast"), [source], {"target_type": result_dtype, "mode": 1}, result_type, span
+        )
+        store = ir.Call(ir.get_op("tile.store"), [result, offsets, y], y.type, span)
+        body = ir.SeqStmts(
+            [
+                ir.AssignStmt(source, load, span),
+                ir.AssignStmt(result, cast, span),
+                ir.AssignStmt(output, store, span),
+                ir.ReturnStmt([output], span),
+            ],
+            span,
+        )
+        function = ir.Function(
+            "cast_ranges",
+            [(x, ir.ParamDirection.In), (y, ir.ParamDirection.Out), (address, ir.ParamDirection.In)],
+            [y.type],
+            body,
+            span,
+            ir.FunctionType.InCore,
+        )
+        program = ir.Program([function], "cast_ranges", span)
+        backend.set_backend_type(backend_type)
+        requires_disjoint = result_dtype.get_bit() > source_dtype.get_bit() or (
+            backend_type == BackendType.Ascend910 and result_dtype.get_bit() < source_dtype.get_bit()
+        )
+        if requires_disjoint and dst_offset < source_size:
+            with pytest.raises(ValueError, match="tile.cast.*requires non-overlapping"):
+                codegen.PTOCodegen().generate(program)
+        else:
+            assert "pto.tcvt" in codegen.PTOCodegen().generate(program)
+
+    @pytest.mark.parametrize("backend_type", [BackendType.Ascend910, BackendType.Ascend950])
+    @pytest.mark.parametrize("source_dtype,result_dtype", [(pl.FP32, pl.BF16), (pl.BF16, pl.FP32)])
+    @pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.DSA_RP])
+    def test_cast_from_pipe_owned_tile_and_view(self, backend_type, source_dtype, result_dtype, planner):
+        """TPOP storage has no MemRef; casts must still allocate and emit normally."""
+        backend.set_backend_type(backend_type)
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.AIV)
+            def consumer(self):
+                pipe = pl.reserve_buffer(name="c2v_slot_buffer", size=4096, base=0x1000)
+                pl.aiv_initialize_pipe(dir_mask=1, slot_size=512, c2v_consumer_buf=pipe)
+                received: pl.Tile[[16, 16], source_dtype, pl.Mem.Vec] = pl.tpop_from_aic(split=0)
+                _direct: pl.Tile[[16, 16], result_dtype, pl.Mem.Vec] = pl.cast(received, result_dtype)
+                viewed: pl.Tile[[8, 32], source_dtype, pl.Mem.Vec] = pl.tile.reshape(received, [8, 32])
+                _converted: pl.Tile[[8, 32], result_dtype, pl.Mem.Vec] = pl.cast(viewed, result_dtype)
+                pl.tfree_to_aic(received)
+
+        with passes.PassContext([], memory_planner=planner, enable_buffer_ir=False):
+            after = passes.init_mem_ref()(Program)
+            after = passes.materialize_semantic_aliases()(after)
+            if planner == passes.MemoryPlanner.PYPTO:
+                after = passes.memory_reuse()(after)
+            after = passes.allocate_memory_addr()(after)
+            # Cross-core frees inherit their split from TPOP before codegen.
+            after = passes.stamp_tfree_split()(after)
+
+        memrefs = {}
+
+        class CollectMemRefs(ir.IRVisitor):
+            def visit_assign_stmt(self, op):
+                if isinstance(op.var.type, ir.TileType):
+                    memrefs[op.var.name_hint] = op.var.type.memref
+                super().visit_assign_stmt(op)
+
+        CollectMemRefs().visit_stmt(next(iter(after.functions.values())).body)
+        assert memrefs["received"] is None
+        assert memrefs["viewed"] is None
+        for name in ("_direct", "_converted"):
+            assert memrefs[name] is not None
+            offset = memrefs[name].byte_offset_
+            assert isinstance(offset, ir.ConstInt)
+            assert offset.value + memrefs[name].size_ <= 0x1000 or offset.value >= 0x2000
+
+        mlir = codegen.PTOCodegen().generate(after)
+        assert "pto.tpop_from_aic" in mlir
+        assert mlir.count("pto.tcvt") == 2
+        assert "pto.treshape" in mlir
 
 
 class TestTileMoveAddressValidation:
@@ -4339,7 +4743,7 @@ class TestTileMoveAddressValidation:
     @staticmethod
     def _generate_mlir(program: ir.Program) -> str:
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         return codegen.PTOCodegen().generate(program)
 
     @pytest.mark.parametrize(
@@ -4434,7 +4838,7 @@ class TestTileStoreAttrsCodegen:
     def _generate_mlir(self, program_cls) -> str:
         """Run PassManager and PTOCodegen on the given program, return MLIR string."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
         optimized = pm.run_passes(program_cls)
@@ -4605,7 +5009,7 @@ class TestTensorAssembleAtomicCodegen:
     def _generate_mlir(self, program_cls) -> str:
         """Run PassManager and PTOCodegen on the given program, return MLIR string."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
         optimized = pm.run_passes(program_cls)
@@ -4703,7 +5107,7 @@ class TestScatterCodegen:
     def _generate_mlir(self, program_cls) -> str:
         """Run PassManager and PTOCodegen on the given program, return MLIR string."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
         optimized = pm.run_passes(program_cls)
@@ -4790,7 +5194,7 @@ class TestCrossCoreSyncCodegen:
 
     def _generate_mlir(self, program_cls) -> str:
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
         optimized = pm.run_passes(program_cls)
@@ -4853,12 +5257,76 @@ class TestCrossCoreSyncCodegen:
         assert "pto.sync.wait <PIPE_MTE2>, %" in mlir
 
 
+def test_pipeline_flags_codegen_static_and_dynamic():
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend910B)
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.AIV)
+        def kernel(
+            self, x: pl.Tensor[[16], pl.FP32], event_id: pl.Scalar[pl.INDEX]
+        ) -> pl.Tensor[[16], pl.FP32]:
+            pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.V, 3)
+            pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.V, 3)
+            pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE3, event_id)
+            pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE3, event_id)
+            return x
+
+    optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
+    func = next(iter(optimized.functions.values()))
+    mlir = codegen.PTOCodegen().generate(ir.Program([func], func.name, optimized.span))
+    assert 'pto.set_flag["PIPE_MTE2", "PIPE_V", "EVENT_ID3"]' in mlir
+    assert 'pto.wait_flag["PIPE_MTE2", "PIPE_V", "EVENT_ID3"]' in mlir
+    assert "pto.set_flag_dyn [#pto.pipe<PIPE_V>, #pto.pipe<PIPE_MTE3>, %" in mlir
+    assert "pto.wait_flag_dyn [#pto.pipe<PIPE_V>, #pto.pipe<PIPE_MTE3>, %" in mlir
+
+
+def test_pipeline_flags_folded_dynamic_event_round_trip():
+    """Folding an INDEX event must preserve the dynamic form through IR dumps."""
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend910B)
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.AIV)
+        def kernel(self, x: pl.Tensor[[16], pl.FP32]) -> pl.Tensor[[16], pl.FP32]:
+            event_id: pl.Scalar[pl.INDEX] = pl.const(3, pl.INDEX)
+            pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.V, event_id, core_type=pl.KernelType.AIV)
+            pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.V, event_id, core_type=pl.KernelType.AIV)
+            return x
+
+    # Simplify substitutes a ConstInt operand; it does not turn it into the
+    # static event_id attribute. RoundtripInstrument must preserve that choice.
+    folded = passes.simplify()(Prog)
+    replayed = pl.parse_program(folded.as_python())
+    ir.assert_structural_equal(folded, replayed)
+    replayed_func = next(iter(replayed.functions.values()))
+    assert isinstance(replayed_func.body, ir.SeqStmts)
+    calls = [stmt.expr for stmt in replayed_func.body.stmts if isinstance(stmt, ir.EvalStmt)]
+    assert len(calls) == 2
+    for call in calls:
+        assert isinstance(call, ir.Call)
+        assert len(call.args) == 1
+        assert isinstance(call.args[0], ir.ConstInt)
+        assert call.args[0].value == 3
+        assert "event_id" not in call.kwargs
+
+    optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(replayed)
+    func = next(iter(optimized.functions.values()))
+    mlir = codegen.PTOCodegen().generate(ir.Program([func], func.name, optimized.span))
+    assert "pto.set_flag_dyn [#pto.pipe<PIPE_MTE2>, #pto.pipe<PIPE_V>, %" in mlir
+    assert "pto.wait_flag_dyn [#pto.pipe<PIPE_MTE2>, #pto.pipe<PIPE_V>, %" in mlir
+    assert 'pto.set_flag["' not in mlir
+    assert 'pto.wait_flag["' not in mlir
+
+
 class TestSyncAllCodegen:
     """Tests that pl.system.syncall lowers to pto.syncall (hard/FFTS form)."""
 
     def _generate_mlir(self, program_cls) -> str:
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
         optimized = pm.run_passes(program_cls)
@@ -4994,7 +5462,7 @@ class TestFenceCodegen:
 
     def _generate_mlir(self, program_cls) -> str:
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
         optimized = pm.run_passes(program_cls)
@@ -5031,7 +5499,7 @@ class TestPipeBarrierCodegen:
 
     def _generate_mlir(self, program_cls) -> str:
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
         optimized = pm.run_passes(program_cls)
@@ -5113,7 +5581,7 @@ class TestCacheInvalidCodegen:
 
     def _generate_mlir(self, program_cls) -> str:
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
 
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
         optimized = pm.run_passes(program_cls)
@@ -5214,7 +5682,7 @@ class TestB03TriAndGatherCodegen:
     """Exact PTOAS spellings and attributes for the B03 operators."""
 
     @staticmethod
-    def _generate_mlir(program_cls, backend_type=BackendType.Ascend910B) -> str:
+    def _generate_mlir(program_cls, backend_type=BackendType.Ascend910) -> str:
         backend.reset_for_testing()
         backend.set_backend_type(backend_type)
         optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(program_cls)

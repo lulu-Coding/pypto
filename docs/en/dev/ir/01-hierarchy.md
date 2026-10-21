@@ -208,7 +208,7 @@ field from the `Stmt` base class. See [Leading comments on statements](#leading-
 | **ClusterScopeStmt** | `name_hint_`, `body_` | Cluster region; outlined to `Function(Group)` |
 | **HierarchyScopeStmt** | `name_hint_`, `body_`, `level_`, `role_` (optional) | Pipeline-stage region for a given Level/Role |
 | **SpmdScopeStmt** | `name_hint_`, `body_`, `core_num_` (integer-typed `Expr`), `sync_start_` | SPMD launch region; outlined to `Function(Spmd)` |
-| **SplitAivScopeStmt** | `name_hint_`, `body_`, `split_` (`SplitMode`, never `None`), `count_` (= 2) | Explicit AIV-split region (`pl.split_aiv`); nestable; consumed and erased by `LowerAutoVectorSplit` (pass 23) |
+| **SplitAivScopeStmt** | `name_hint_`, `body_`, `split_` (`SplitMode`, never `None`), `count_` (= 2) | Explicit AIV-split region (`pl.split_aiv`); nestable; lowered by `LowerAutoVectorSplit`, consumed by `ExpandMixedKernel` |
 | **GraphScopeStmt** | `name_hint_`, `body_` | Recordable orchestration region (`pl.graph`); `name_hint_` is required — it names the function `OutlineGraphScopes` outlines it into, and hence the runtime's graph key |
 | **RuntimeScopeStmt** | `name_hint_`, `body_`, `manual_` | Orchestrator runtime region (`SIMPLER_SCOPE`); `manual_=true` selects manual dependency mode |
 | **YieldStmt** | `values_` | Yield values in loop iteration |
@@ -376,8 +376,9 @@ runtime = ir.RuntimeScopeStmt(manual=True, name_hint="", body=body, span=span)
     scope form and `@pl.jit.graph` converge before any later pass sees them
   - `SplitAivScopeStmt` is **non-outlined**: it is transparent to SSA and to the
     outliners (it survives inside an outlined `Function(InCore)` body), then is
-    consumed and **erased** by `LowerAutoVectorSplit` (pass 23). It never reaches
-    `ExpandMixedKernel` (pass 24) or codegen — those see only the per-op
+    lowered in place by `LowerAutoVectorSplit` (pass 23), which retains the
+    wrapper. `ExpandMixedKernel` (pass 24) consumes and **erases** it; subsequent
+    passes and codegen see only the per-op
     `aiv_shard` / `aic_gather` / `tpush` / `tpop` markers. A PTO codegen guard
     fails loudly if a `SplitAivScopeStmt` ever survives that far.
   - `SplitAivScopeStmt` is **nestable**: built via the generic
@@ -388,7 +389,7 @@ runtime = ir.RuntimeScopeStmt(manual=True, name_hint="", body=body, span=span)
     mode**: the regions are authoritative for vector placement, and the
     `AivSplitValid` verifier rejects vector compute outside every region (write
     a `mode=None` region per full-width phase — see
-    [LowerAutoVectorSplit](../passes/23-lower_auto_vector_split.md)). A
+    [LowerAutoVectorSplit](../passes/24-lower_auto_vector_split.md)). A
     top-level `for aiv_id in pl.split_aiv(...)` is wrapped by the parser in an
     enclosing `InCoreScopeStmt` (so `OutlineIncoreScopes` can outline it), i.e.
     `InCoreScopeStmt{ body: SplitAivScopeStmt{...} }`.
@@ -463,6 +464,9 @@ aliasing is answered by `MemRef.same_allocation(a, b)` and `MemRef.may_alias(a, 
 | `slot_count_` | uint64_t | Equally-sized slots the declaration holds (`pl.MemRef("name", slots=N)`); 1 when `slots` is omitted |
 | `slot_index_` | ExprPtr \| None | Which slot this MemRef denotes (`l0c[k]`); None until a slot is selected, and may be a runtime value |
 
+Omitting the Python constructor's `slot` argument or passing `slot=None`
+produces the same absent slot index as the C++ constructor's default.
+
 ```python
 # base allocation name, byte offset within it, size in bytes
 memref = ir.MemRef("mem_left_0", 0, 1024)
@@ -517,6 +521,7 @@ func_orch = ir.Function("orchestrator", params, return_types, body, span, ir.Fun
 | ----- | ---- | ----------- |
 | `name_` | string | Function name |
 | `func_type_` | FunctionType | Function type (see the FunctionType table below) |
+| `ir_stage_` | FunctionIRStage | Body representation: `Functional` (default) or `Buffer` |
 | `params_` | list[VarPtr] | Parameter variables (DefField) |
 | `param_directions_` | list[ParamDirection] | Parameter directions, same length as params_ |
 | `return_types_` | list[TypePtr] | Return types |
@@ -524,6 +529,33 @@ func_orch = ir.Function("orchestrator", params, return_types, body, span, ir.Fun
 | `level_` | optional[Level] | Hierarchy level (auto-derived from `func_type_` for InCore/AIC/AIV/Group/Orchestration/Graph; see below) |
 | `role_` | optional[Role] | Hierarchy role (auto-derived from `func_type_` for InCore/AIC/AIV/Group/Orchestration/Graph; see below) |
 | `attrs_` | list[(str, Any)] | Ordered free-form metadata, exposed as `UsualField` (participates in structural traversal) |
+
+### Function body representation
+
+`FunctionIRStage` is a typed, reflected field independent of `FunctionType`,
+`level`, and `role`. Python exposes it as `function.ir_stage`; both `ir.Function`
+and `IRBuilder.function` accept `ir_stage=ir.FunctionIRStage.Buffer`.
+
+- `Functional` represents Tensor/Tile value semantics and is the default for
+  existing constructors and serialized functions without the field.
+- `Buffer` marks the final explicit storage representation. It selects Buffer
+  validation and emission even for an empty or scalar-only device kernel.
+  Logical Tile operations in a marked kernel are rejected.
+- The final lowering boundary applies to `InCore`, `AIC`, and `AIV` functions;
+  orchestration and `Group`/`Spmd` wrappers retain their functional representation.
+  The marker alone does not perform lowering or make a body valid Buffer IR.
+
+The stage participates in structural equality/hash and binary serialization;
+a malformed present serialized value is rejected. Generic mutators and
+same-function rebuilds preserve it together with the other function metadata.
+This preservation does not make functional optimization passes legal after the
+Buffer boundary. The marker holds no buffer bindings or storage decisions.
+
+Python printing adds `# ir_stage: Buffer` as a diagnostic comment. This is not a
+DSL decorator option or a text roundtrip contract; binary serialization preserves
+the stage. Functional output remains unchanged. During the staged migration,
+unmarked, manually constructed Buffer kernels still use operand detection for
+compatibility. This API does not enable automatic Tile-to-Buffer conversion.
 
 ### Reserved `attrs_` keys
 

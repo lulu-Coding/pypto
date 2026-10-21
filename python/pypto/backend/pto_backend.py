@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import textwrap
 import time
 from collections import OrderedDict
@@ -31,9 +32,13 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from importlib import resources
 
-try:
-    from importlib.resources.abc import Traversable  # pyright: ignore[reportMissingImports]
-except ImportError:  # pragma: no cover - fallback for older interpreters
+# importlib.resources.abc is new in 3.11; older interpreters expose the same
+# protocol from importlib.abc. The version check keeps the import statically
+# decidable, so pyright resolves the branch matching the configured
+# pythonVersion instead of reporting a missing module under 3.10 environments.
+if sys.version_info >= (3, 11):
+    from importlib.resources.abc import Traversable
+else:  # pragma: no cover - exercised only on Python < 3.11
     from importlib.abc import Traversable
 from typing import Any
 
@@ -44,7 +49,10 @@ from pypto._function_attrs import (
     DUAL_AIV_DISPATCH_ATTR,
     EXTERNAL_SOURCE_ATTR,
 )
+from pypto.backend._host_tensor_args import host_tensor_indices as _host_tensor_indices
 from pypto.backend._ptoas_locate import PTOAS_RELATIVE_PATHS as _PTOAS_RELATIVE_PATHS
+from pypto.backend._ptoas_locate import PTOAS_RELEASES_URL as _PTOAS_RELEASES_URL
+from pypto.backend._ptoas_locate import check_ptoas_version as _check_ptoas_version
 from pypto.backend._ptoas_locate import find_ptoas_binary as _find_ptoas_binary
 from pypto.backend._ptoas_preprocess import preprocess_ptoas_output as _preprocess_ptoas_output
 from pypto.compile_profiling import CompileProfiler, StageRecord
@@ -55,8 +63,6 @@ from pypto.pypto_core import ir as _ir_core
 from pypto.pypto_core import passes as _passes
 
 logger = logging.getLogger(__name__)
-
-_PTOAS_RELEASE_URL = "https://github.com/zhangstevenunity/PTOAS/releases"
 
 _EMIT_SOURCE_LOC_ENV = "PYPTO_EMIT_PTO_LOC"
 _FALSY_ENV_VALUES = frozenset({"0", "false", "no", "off"})
@@ -126,7 +132,7 @@ def _get_error_summary(exc: Exception, func_name: str) -> str:
     ptoas_prefix = "ptoas compilation failed:"
     if first_line.startswith(ptoas_prefix):
         first_detail = first_line[len(ptoas_prefix) :].strip()
-        detail_lines = []
+        detail_lines: list[str] = []
         if first_detail:
             detail_lines.append(first_detail)
         detail_lines.extend(lines[1:])
@@ -208,7 +214,7 @@ def _run_ptoas(
 
     Raises:
         FileNotFoundError: If the ptoas binary cannot be found
-        RuntimeError: If ptoas compilation fails
+        RuntimeError: If ptoas is older than the pinned minimum, or compilation fails
     """
     ptoas_bin = _find_ptoas_binary()
     if ptoas_bin is None:
@@ -221,8 +227,9 @@ def _run_ptoas(
             )
         raise FileNotFoundError(
             "ptoas binary not found. Set PTOAS_ROOT to the extracted release directory, "
-            f"or add ptoas to your PATH.\nDownload from: {_PTOAS_RELEASE_URL}"
+            f"or add ptoas to your PATH.\nDownload from: {_PTOAS_RELEASES_URL}"
         )
+    _check_ptoas_version(ptoas_bin)
 
     cmd = [ptoas_bin, pto_path, "-o", output_path]
     if ptoas_flags:
@@ -239,7 +246,9 @@ def _run_ptoas(
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"ptoas compilation timed out after {exc.timeout}s") from exc
     if result.returncode != 0:
-        raise RuntimeError(f"ptoas compilation failed: {result.stderr.strip()}")
+        status = f"signal {-result.returncode}" if result.returncode < 0 else f"exit code {result.returncode}"
+        detail = result.stderr.strip() or result.stdout.strip() or "no diagnostic output"
+        raise RuntimeError(f"ptoas compilation failed: ({status}) {detail}")
 
 
 _KERNEL_HEADER = """\
@@ -306,13 +315,23 @@ static __aicore__ void pypto_register_counter_completion(
         // A supported dispatcher always supplies a live task token and slab.
         // If the token is corrupted but the slab pointers remain coherent,
         // publish a scheduler-visible error instead of returning as an
-        // ordinary completed task. defer_flush validates the token, so mark
-        // only this local AsyncCtx copy valid after recording the error.
+        // ordinary completed task. The task handle is opaque and remains
+        // invalid: flush the two error fields directly instead of minting one.
         if (ctx.completion_count != nullptr && ctx.completion_error_code != nullptr) {
             *ctx.completion_count = 0;
             *ctx.completion_error_code = SIMPLER_ERROR_ASYNC_COMPLETION_INVALID;
-            ctx.task_token.raw = 0;
-            pto2::detail::defer_flush(ctx);
+            pto2::detail::defer_flush_range(ctx.completion_count, sizeof(*ctx.completion_count));
+            pto2::detail::defer_flush_range(ctx.completion_error_code, sizeof(*ctx.completion_error_code));
+#if defined(__CCE_KT_TEST__) || defined(__CCE_AICORE__) || defined(__DAV_C220__)
+#if defined(__CPU_SIM)
+            dsb(0);
+#else
+            dsb(DSB_DDR);
+#endif
+            pipe_barrier(PIPE_ALL);
+#else
+            __asm__ __volatile__("" ::: "memory");
+#endif
             return;
         }
 #if defined(__CPU_SIM)
@@ -659,17 +678,24 @@ def _get_fixed_subblock_id(func: _ir_core.Function) -> int | None:
 
 
 # Op-name sets for SPMD identity detection. Detection must stay in lockstep
-# with the C++ MemRefCollectorVisitor (src/codegen/pto/pto_codegen.cpp), which
-# decides which synthetic params to append to the func.func signature — a
+# with the functional collector and Buffer preflight in PTOCodegen, which
+# decide which synthetic params to append to the func.func signature — a
 # mismatch would desync the wrapper's forwarded call args from the callee
 # signature.
 # Routing each literal through get_op validates it at import (a typo raises), then
 # we keep the canonical names: ops are matched by name, not identity, because IR
 # reaching codegen may carry Op instances built outside the registry.
 _SPMD_BLOCK_OPS = frozenset(
-    {_ir_core.get_op("tile.get_block_idx").name, _ir_core.get_op("tile.get_block_num").name}
+    {
+        _ir_core.get_op("tile.get_block_idx").name,
+        _ir_core.get_op("tile.get_block_num").name,
+        _ir_core.get_op("buffer.get_block_idx").name,
+        _ir_core.get_op("buffer.get_block_num").name,
+    }
 )
-_SUBBLOCK_OPS = frozenset({_ir_core.get_op("tile.get_subblock_idx").name})
+_SUBBLOCK_OPS = frozenset(
+    {_ir_core.get_op("tile.get_subblock_idx").name, _ir_core.get_op("buffer.get_subblock_idx").name}
+)
 _AIV_FIFO_ENDPOINT_OPS = frozenset(
     {
         _ir_core.get_op("tile.tpop_from_aic").name,
@@ -678,6 +704,7 @@ _AIV_FIFO_ENDPOINT_OPS = frozenset(
 )
 _SDMA_WORKSPACE_OPS = frozenset({_ir_core.get_op("prefetch.make_context").name})
 _DEFERRED_COMPLETION_OPS = frozenset({_ir_core.get_op("pld.system.defer_wait").name})
+_TILE_LOAD_OP = _ir_core.get_op("tile.load").name
 
 
 def _function_uses_ops(func: _ir_core.Function, op_names: frozenset[str]) -> bool:
@@ -726,6 +753,40 @@ def _uses_sdma_workspace(func: _ir_core.Function) -> bool:
 def _uses_deferred_completion(func: _ir_core.Function) -> bool:
     """Return whether the wrapper must expose the scheduler AsyncCtx."""
     return _function_uses_ops(func, _DEFERRED_COMPLETION_OPS)
+
+
+def _uses_l2_cache_offset(func: _ir_core.Function) -> bool:
+    """Return whether the wrapper must forward the device L2 no-cache alias offset.
+
+    True when the function contains a ``tile.load`` that declared
+    ``CachePolicy.BYPASS`` and the target reaches the uncached mapping through
+    an address alias — a2a3 only. Mirrors the C++ condition in
+    ``PTOCodegen``'s signature emission (``MemRefCollectorVisitor::
+    UsesL2BypassLoad`` gated on ``GetPtoTargetArch()``), because the wrapper's
+    forwarded call args must match the callee signature exactly.
+    """
+
+    if _backend_core.get_handler().get_pto_target_arch() != "a2a3":
+        return False
+
+    class _BypassLoadFinder(_ir_core.IRVisitor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.found = False
+
+        def visit_call(self, op: _ir_core.Call) -> None:
+            if self.found:
+                return
+            ir_op = getattr(op, "op", None)
+            if isinstance(ir_op, _ir_core.Op) and ir_op.name == _TILE_LOAD_OP:
+                if int(op.kwargs.get("cache", 0)) == int(_ir_core.CachePolicy.BYPASS):
+                    self.found = True
+                    return
+            super().visit_call(op)
+
+    finder = _BypassLoadFinder()
+    finder.visit_stmt(func.body)
+    return finder.found
 
 
 def _requires_dual_aiv_dispatch(func: _ir_core.Function) -> bool:
@@ -944,6 +1005,7 @@ def _generate_kernel_header(
     uses_spmd: bool | None = None,
     uses_subblock: bool | None = None,
     uses_sdma: bool | None = None,
+    uses_l2_cache_offset: bool | None = None,
     uses_deferred_completion: bool | None = None,
 ) -> str:
     """Generate the wrapper header, including split lane overrides when needed."""
@@ -971,9 +1033,11 @@ def _generate_kernel_header(
         uses_subblock = _uses_dynamic_subblock_id(func)
     if uses_sdma is None:
         uses_sdma = _uses_sdma_workspace(func)
+    if uses_l2_cache_offset is None:
+        uses_l2_cache_offset = _uses_l2_cache_offset(func)
     if uses_deferred_completion is None:
         uses_deferred_completion = _uses_deferred_completion(func)
-    needs_intrinsic = uses_spmd or uses_subblock or uses_sdma
+    needs_intrinsic = uses_spmd or uses_subblock or uses_sdma or uses_l2_cache_offset
     spmd_override = '#include "intrinsic.h"\n' if needs_intrinsic else ""
     deferred_completion_include = _DEFERRED_COMPLETION_INCLUDE if uses_deferred_completion else ""
 
@@ -1002,6 +1066,7 @@ def _generate_kernel_wrapper(
     uses_spmd = group_uses_spmd or func_uses_spmd
     func_uses_subblock = _uses_dynamic_subblock_id(func)
     func_uses_sdma = _uses_sdma_workspace(func)
+    func_uses_l2_cache_offset = _uses_l2_cache_offset(func)
     func_uses_deferred_completion = _uses_deferred_completion(func)
     ptoas_body = _preprocess_ptoas_output(ptoas_code)
     ptoas_body, fifo_uses_subblock = _forward_runtime_lane_to_split_fifo_calls(func, ptoas_body)
@@ -1011,6 +1076,7 @@ def _generate_kernel_wrapper(
         uses_spmd=uses_spmd,
         uses_subblock=wrapper_uses_subblock,
         uses_sdma=func_uses_sdma,
+        uses_l2_cache_offset=func_uses_l2_cache_offset,
         uses_deferred_completion=func_uses_deferred_completion,
     )
     unpacking_code, var_names = _generate_arg_unpacking(func, uses_spmd=uses_spmd)
@@ -1063,15 +1129,30 @@ def _generate_kernel_wrapper(
             "get_dma_workspace(args, DMA_WORKSPACE_SDMA));\n\n"
         )
 
+    # The A2/A3 driver maps every GM page twice, and a load against the uncached
+    # alias does not allocate in L2. The distance between the two mappings is a
+    # per-device value the runtime carries in the dispatch payload, so read it
+    # once here rather than per load: it cannot change during the dispatch, and
+    # a per-load read would go back through GM for a constant. Zero means the
+    # device exposes no alias, which leaves every bypassing load ordinary.
+    l2_cache_offset_setup = ""
+    if func_uses_l2_cache_offset:
+        l2_cache_offset_setup = (
+            "    // Read the device L2 no-cache alias offset from runtime dispatch payload\n"
+            "    uint64_t __pypto_l2_cache_offset = get_l2_cache_offset(args);\n\n"
+        )
+
     # PTOCodegen appends raw dispatch args for deferred completion after
-    # user-derived arguments, then the SDMA workspace and synthetic i32
-    # identity params in canonical order (block_idx, block_num, subblock_idx).
-    # Mirror that exact order here.
+    # user-derived arguments, then the SDMA workspace, the device L2 no-cache
+    # alias offset, and the synthetic i32 identity params in canonical order
+    # (block_idx, block_num, subblock_idx). Mirror that exact order here.
     call_args_list = list(var_names)
     if func_uses_deferred_completion:
         call_args_list.append("args")
     if func_uses_sdma:
         call_args_list.append("__pypto_sdma_workspace")
+    if func_uses_l2_cache_offset:
+        call_args_list.append("__pypto_l2_cache_offset")
     if func_uses_spmd:
         call_args_list = call_args_list + ["__pypto_spmd_block_idx", "__pypto_spmd_block_num"]
     if wrapper_uses_subblock:
@@ -1087,10 +1168,15 @@ def _generate_kernel_wrapper(
         "    // Reset AI Core atomic mode inherited from a prior kernel.\n"
         "    set_atomic_none();\n"
         "#endif\n\n"
+        "#if defined(__DAV_CUBE__) && !defined(__CPU_SIM) && !defined(__COSTMODEL)\n"
+        "    // Start cube tasks in FP32 mode, independent of a prior task's HF32 setting.\n"
+        "    set_ctrl(sbitset0(get_ctrl(), pto::MAD_MODE_BIT));\n"
+        "#endif\n\n"
         f"{spmd_args_setup}"
         f"{subblock_arg_setup}"
         f"{unpacking_code}\n"
         f"{sdma_setup}"
+        f"{l2_cache_offset_setup}"
         f"    // Forward to ptoas-generated function\n"
         f"    {func.name}({call_args});\n"
         "}\n"
@@ -1114,26 +1200,20 @@ def _format_signature(directions: list[str]) -> str:
 
 def _generate_config_file(
     orch_func_name: str,
-    func_name_to_id: dict[str, int],
-    func_name_to_core_type: dict[str, _ir_core.CoreType],
-    func_name_to_signature: dict[str, list[str]] | None = None,
+    kernel_registrations: list[_codegen_core.KernelRegistration],
     orchestration_signature: list[str] | None = None,
     func_name_to_external_source: dict[str, str] | None = None,
     func_name_to_external_include_dirs: dict[str, tuple[str, ...]] | None = None,
     enable_sdma: bool = False,
     runtime: _passes.RuntimeKind = _passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER,
+    host_tensor_indices: list[int] | None = None,
+    unshared_code_names: set[str] | None = None,
 ) -> str:
     """Generate kernel_config.py content.
 
-    ``func_name_to_signature`` maps each kernel name to its runtime
-    ``ArgDirection`` names ("IN"/"OUT"/"INOUT") for its tensor args, in
-    task-payload (tensors-first) order. Scalars are excluded: the CoreCallable
-    signature array is sized to CORE_MAX_TENSOR_ARGS (a per-tensor-arg list), so
-    each entry lines up 1:1 with a payload tensor. When present, each KERNELS
-    entry gains a ``"signature"`` field of ``ArgDirection`` members so the
-    runtime builds a non-empty CoreCallable signature — required for the tensor
-    dump to match the task payload tensor_count. Kernels without an entry fall
-    back to an empty signature (the pre-existing behavior).
+    Each registration carries a final tensor signature and a code name. Several
+    registrations may reference the same generated source with different tensor
+    directions. Scalars are excluded from runtime tensor signatures.
 
     ``orchestration_signature`` is the orchestration entry's per-tensor
     ``ArgDirection`` names ("IN"/"OUT"/"INOUT"), in ``orch_args`` tensor order
@@ -1148,6 +1228,9 @@ def _generate_config_file(
     ``func_name_to_external_include_dirs`` maps external kernel names to their
     ordered CCEC include search paths. Non-external kernels ignore this map.
 
+    ``unshared_code_names`` excludes builtin-template kernels from generated-code
+    sharing; their existing compilation/cache contract is preserved.
+
     ``enable_sdma`` records that at least one emitted kernel consumes the
     runtime-owned SDMA workspace.
 
@@ -1157,17 +1240,18 @@ def _generate_config_file(
     program compiled for one runtime never binds to a worker running another.
     """
     runtime_name = _passes.runtime_kind_to_name(runtime)
-    func_name_to_signature = func_name_to_signature or {}
     func_name_to_external_source = func_name_to_external_source or {}
     func_name_to_external_include_dirs = func_name_to_external_include_dirs or {}
     orchestration_signature = orchestration_signature or []
-    has_signatures = any(func_name_to_signature.values()) or bool(orchestration_signature)
+    has_signatures = any(r.signature for r in kernel_registrations) or bool(orchestration_signature)
 
     runtime_lines = [
         "RUNTIME_CONFIG = {",
         f'\t"runtime": "{runtime_name}",',
         '\t"aicpu_thread_num": 0,',
     ]
+    if host_tensor_indices:
+        runtime_lines.append(f'\t"host_tensor_indices": {host_tensor_indices},')
     if enable_sdma:
         runtime_lines.append('\t"enable_sdma": True,')
     runtime_lines.append("}\n")
@@ -1198,8 +1282,9 @@ def _generate_config_file(
         "KERNELS = [",
     ]
 
-    for name, func_id in sorted(func_name_to_id.items(), key=lambda x: x[1]):
-        core_type = func_name_to_core_type[name]
+    for registration in sorted(kernel_registrations, key=lambda r: r.func_id):
+        name, func_id = registration.code_name, registration.func_id
+        core_type = registration.core_type
         ct_str = "aiv" if core_type == _ir_core.CoreType.VECTOR else "aic"
         # External kernels are referenced in place at their original path so the
         # entry .cpp keeps its sibling files (relative #include "../..." resolve);
@@ -1217,7 +1302,12 @@ def _generate_config_file(
             include_dirs = func_name_to_external_include_dirs.get(name)
             if include_dirs:
                 entry += f', "extra_include_dirs": {list(include_dirs)!r}'
-        signature = func_name_to_signature.get(name)
+        if ext_source is None:
+            if name in (unshared_code_names or set()):
+                entry += ', "builtin": True'
+            else:
+                entry += f', "code_name": "{name}"'
+        signature = registration.signature
         if signature:
             entry += f', "signature": [{_format_signature(signature)}]'
         entry += "},"
@@ -1926,6 +2016,13 @@ def _materialize_builtin_next_levels(
             "kernel_name": spec.entry_symbol + "_kernel",
             "template_package": spec.template_dir[1:],
             "runtime": _passes.runtime_kind_to_name(runtime),
+            # HBG orchestration has a host-only context; TMR uses its runtime
+            # context. Templates must select the API of their compiled runtime.
+            "orchestration_context_accessor": (
+                "current_orch_context"
+                if runtime == _passes.RuntimeKind.HOST_BUILD_GRAPH
+                else "current_runtime"
+            ),
         }
         variables.update(spec.template_vars)
         for template in sorted(templates_dir.iterdir(), key=lambda item: item.name):
@@ -2238,18 +2335,23 @@ def _generate_single_chip(
             codegen_free_kernels = {
                 f.name for f in transformed_program.functions.values() if _skips_pto_codegen(f)
             }
-            all_kernels_external = all(name in codegen_free_kernels for name in orch_result.func_name_to_id)
+            all_kernels_external = all(
+                r.code_name in codegen_free_kernels for r in orch_result.kernel_registrations
+            )
             if not skip_ptoas or all_kernels_external:
+                host_indices = (
+                    _host_tensor_indices(orch_func) if runtime == _passes.RuntimeKind.HOST_BUILD_GRAPH else []
+                )
                 result_files["kernel_config.py"] = _generate_config_file(
                     orch_func.name,
-                    orch_result.func_name_to_id,
-                    orch_result.func_name_to_core_type,
-                    orch_result.func_name_to_signature,
+                    orch_result.kernel_registrations,
                     orch_result.orchestration_signature,
                     func_name_to_external_source,
                     func_name_to_external_include_dirs,
                     enable_sdma=any(_uses_sdma_workspace(func) for func in emitted_incore_funcs),
                     runtime=runtime,
+                    host_tensor_indices=host_indices,
+                    unshared_code_names=codegen_free_kernels,
                 )
         except Exception as e:
             logger.error("Failed to generate orchestration '%s': %s", orch_func.name, e)

@@ -32,14 +32,18 @@ program_inlined = inline_pass(program)
 ## 算法
 
 1. **收集**所有 `func_type == FunctionType::Inline` 的函数。
-2. **环检测** Inline → Inline 调用图;若发现环,抛出 `pypto::ValueError` 并在消息中标明环路径。
-3. **迭代到不动点** — 每次迭代遍历所有函数(包括 Inline 函数本身,以便嵌套的 Inline-calls-Inline 也能传递展开):
+2. **环检测与排序** Inline → Inline 调用图;若发现环,抛出 `pypto::ValueError` 并在消息中标明环路径。否则按被调函数先于调用方的顺序访问。
+3. **缓存形参分类**,再展开调用方。按被调函数优先的顺序,为每个内联 helper 构建一个展开后的分析副本,缓存其别名分类以及原始函数体中的语法形参定义。每个 helper 只分析一次,克隆调用点通过索引查询结果。生成代码时仍克隆原始 helper 函数体,使调用方特定的类型和 dump 选择继续经过每一层嵌套调用:
    - 对函数体中每个顶层 `LHS = inline_call(args)` 或 `EvalStmt(inline_call(args))`:
-     - 构建参数替换映射(形参 `Var` → 实参 `Expr`)。
-     - 对内联体中每个本地绑定的 `Var` 做 alpha 重命名(`<orig>_inline<counter>`,并去掉 `<orig>` 末尾的 `_`),避免多个调用点之间冲突。
+     - 构建参数替换映射(形参 `Var` → 实参 `Expr`)。该映射同时作用于使用点**和**定义点,因此被调函数中的重绑定 `out = pl.tensor.assemble(out, ...)` 会重绑定调用方的实参 `Var` —— 但仅限于带有原地(in-place)契约的形参(见[重绑定形参](#重绑定形参))。有三类实参会先在展开体之前绑定到新的 `<param>_inline<counter>` `Var`,再用该 `Var` 替换:被重绑定形参的非可赋值 `Var` 实参(切片 `c[r]`、`IterArg`、计算得到的标量);被重绑定的按值传递形参的实参(即既非 `pl.Out` 也非 `pl.InOut` 的普通标量,或绑定可能改变的 tensor / tile);以及任何计算得到的 tensor / tile 实参(如 `a[r]` 这样的 `Call`),Python 在调用点对其只求值一次。其余实参 —— 绑定到只读形参的 `Var`、标量表达式、常量 —— 仍直接替换,因此读取形参的形状表达式仍可折叠。
+     - 复用跨函数返回类型的绑定收集逻辑,将被调函数形参类型中的动态符号绑定到实参的形状和视图元数据。绑定后的表达式属于调用方,替换时保持原样。内联保留各实参自身的类型,不会施加保留函数调用时的重复维度相等检查:辅助函数可以用同一个符号标注逻辑缓冲区和填充后的缓冲区。尺寸冲突时,根据每个算子的实际操作数分别推导结果,不任意选择一个全局绑定。
+     - 对内联体中每个本地绑定的 `Var` 做 alpha 重命名(`<orig>_inline<counter>`,并去掉 `<orig>` 末尾的 `_`),避免多个调用点之间冲突。`DeepClone` 创建这些局部变量时同步重映射其类型,包括循环和分支结果;映射中预置的调用方实参保持不变。例如,当输入的实参形状为 `[caller_extent, 4]` 时,被调函数中形状为 `[N, 4]` 的局部变量会变为 `[caller_extent, 4]`,不会在调用方留下仅属于被调函数的 `N`。
+     - 在现有 `InlineCallsMutator` 遍历中先访问克隆体,再将返回值接入调用方。接收变量和后续使用复用同一份变量映射,无需单独扫描整个调用方进行类型特化。通过算子注册表重新推导动态算子和写回操作的结果,保留分配元数据、tile 内存空间及调用属性。首次赋值与 SSA 共用 `GetAuthoritativeAssignmentType` 规则推导局部变量类型:右侧为类型已知的变量、带形状值或元组时,采用右侧的形状、数据类型和视图元数据;否则保留左侧类型,且选定类型缺少 MemRef 时补回左侧的 MemRef。根据实际初始值推导 `For`/`While` 携带的 tensor 类型,并更新相应合流结果。将返回类型传播到接收变量及后续使用,包括 `Submit` 结果和依赖,同时保留后续重绑定的变量身份。若特化后仍残留无法解析的被调函数专属维度,则报错;需要显式使用有歧义的维度时应使用不同形参符号。
      - 在调用点之前插入重命名+替换后的函数体语句。
-     - 用 `LHS = renamed_return`(单返回值)或 `LHS = MakeTuple([renamed_returns...])`(多返回值)替换调用。当 `LHS` 与替换后的返回 `Var` 是同一个 `Var` 时,赋值被省略以避免冗余 SSA 拷贝。
+     - 按调用点形态接线被内联函数的尾部返回值:`LHS = renamed_return`(单返回值赋值;当 `LHS` 与替换后的返回 `Var` 是同一个 `Var` 时省略该赋值,以避免冗余 SSA 拷贝)、逐元素替换 `TupleGetItemExpr` 而不发出 `MakeTuple` 绑定(多返回值赋值)、新的 `ReturnStmt`(`return inline_call(...)`),或者当返回值被丢弃但其求值可观测时发出新的 `EvalStmt`(`EvalStmt` 调用点 — 参见[边界情况](#边界情况))。
 4. **删除**所有 Inline 函数。
+
+调用图排序的复杂度与函数数和调用边数呈线性关系。分类对每个原始函数体和展开后的分析体各遍历一次;其开销按这些物化 IR 的大小计算,该大小可能超过源程序。因此,嵌套调用仅返回别名时会保留调用方绑定,返回新值时仍需要局部句柄。即使分析展开消除了无效的自赋值,原始语法定义仍然重要:常量或计算得到的实参不能直接替换赋值目标。
 
 重命名后缀使用单下划线(`_inline`),因为 `__` 被 IR 自动命名约定保留(参见 `auto_name_utils.h`)。
 
@@ -112,16 +116,144 @@ def main(self, a, b):
 
 scope 被原样保留,稍后由 `OutlineIncoreScopes` 提取为独立的 InCore 函数,与直接写在调用点处效果一致。
 
+## 重绑定形参
+
+Tensor 存储与调用方共享,但给被调函数的形参名赋新值不能重绑定调用方的名字。克隆前通过一次定义/使用遍历记录别名边和值定义。线性遍历别名图,仅在所有定义都保持同一个形参存储时允许直接替换;来源冲突、分支和循环回边均保守地使用局部绑定:
+
+| 形参 / 定义 | 重绑定落在 | 原因 |
+| ----------- | ---------- | ---- |
+| 仅有已证明自更新的 tensor / tile,例如 `t = pl.tensor.assemble(t, x, [0])` | 调用方的 `Var` | `ResultAliasedArgIndex` 声明结果与当前目标共享存储。也保留现有 `set_validshape` 精化行为。 |
+| 含其他任意定义的 tensor / tile,包括 `t = pl.add(t, t)`、`t = other` 或控制流结果 | 新的 `<param>_inline<counter>` `Var` | 被调函数可能改变形参指向的值。无论是否标注 `Out` / `InOut` 都适用。 |
+| `Array` | 调用方的 `Var` | 保留现有元素更新约定;编排代码生成无法声明裸数组别名。 |
+| 显式 `pl.Out` / `pl.InOut` 标量 | 调用方的 `Var` | 保留显式标量调用约定。 |
+| 普通标量 | 新的 `<param>_inline<counter>` `Var` | 重绑定保持局部。 |
+
+需要局部绑定的带形状形参会在整个展开体之前初始化一次。在局部名字绑定到其他值之前,通过它写入仍会到达实参的存储。分支和循环通过常规 SSA 转换携带该局部句柄,包括零次迭代的循环。未知结果和定义存在冲突的别名也保守地使用局部绑定;仅凭算子可以复用输入缓冲区(`IsInplaceSafe`)无法建立写回契约。
+
+调用点的 `pl.dump_tag` 选择会跟随这些局部形参绑定,传入作用域和嵌套调度,包括 `pl.submit` 和 `pl.spmd_submit`。标记在递归展开嵌套内联调用之前转移,因此每个 helper 都可以通过自己的局部句柄映射该选择。Submit 节点保留其启动属性、任务依赖和已有的 dump 选择。
+
+例如,内联 helper 包含 `t = pl.add(t, t); return t`,调用形式为 `u = self.twice(a)`,会展开为:
+
+```python
+t_inline0 = a
+t_inline0 = pl.add(t_inline0, t_inline0)
+u = t_inline0
+w = pl.add(a, u)                         # original a + doubled result
+```
+
+最后一行计算 `3A`,不会替换调用方的 `a` 而算出 `4A`。`@pl.jit.inline` 仍接受普通 tensor 形参:其直线代码的 alpha 重命名已能分离局部绑定,但循环体中的赋值仍需要本 pass 的保护。
+
+普通标量这一行最容易出错。给定:
+
+```python
+@pl.function(type=pl.FunctionType.Inline)
+def bump(self, n: pl.Scalar[pl.INDEX]) -> pl.Scalar[pl.INDEX]:
+    n = n + 1
+    return n
+
+@pl.function
+def main(self, k: pl.Scalar[pl.INDEX]) -> pl.Scalar[pl.INDEX]:
+    m: pl.Scalar[pl.INDEX] = self.bump(k)
+    return k + m                              # k + (k + 1)
+```
+
+调用点会先绑定一个临时变量,因此其后调用方的 `k` 仍可读到原值:
+
+```python
+n_inline0: pl.Scalar[pl.INDEX] = k
+n_inline0 = n_inline0 + 1
+m: pl.Scalar[pl.INDEX] = n_inline0
+s: pl.Scalar[pl.INDEX] = k + m                # 原始的 k
+```
+
+若改为在定义点替换 `k`,则会把 `k = k + 1` 插入调用方,静默算出 `2k + 2`。注意 JIT specializer 的 alpha 重命名**覆盖不到**这种情况:它只在名字首次绑定的作用域深度上重命名重绑定,因此写在 `pl.range` / `pl.spmd` 内的重绑定会以形参真实定义点的形式到达本 pass。
+
 ## 边界情况
 
 | 情况 | 行为 |
 | ---- | ---- |
 | 无调用点的 Inline 函数 | 静默从程序中移除。 |
 | 作为程序入口的 Inline 函数 | 此处不视为错误 — 但因为没有任何 Call 指向它,清理阶段会像任何无调用者函数那样移除。 |
-| Inline 调用 Inline(传递) | 迭代到不动点。 |
+| Inline 调用 Inline(传递) | 被调函数优先的分析暴露嵌套别名;生成代码时递归克隆原始 helper 函数体。 |
+| 计算得到的 tensor / tile 实参,如 `f(a[r], c[r])`,被调函数读取 `x` 并写入 `c[0:4, j] = v` | 每个实参在调用点只绑定一次 —— `x_inline0 = a[r]`、`c_inline1 = c[r]`,再 `c_inline1 = pl.tensor.assemble(c_inline1, v, ...)` —— 与调用方自行为切片命名时解析器生成的 IR 相同。直接替换 `c[r]` 会把 `Call` 放到重绑定的左值上;直接替换 `a[r]` 会在被调函数的 `pl.spmd` / `pl.pipeline` 体内重复求值,并把它移入外提的 kernel。切片是其源张量的视图,因此写入会到达调用方的 `c`。 |
+| 被重绑定的按值传递形参,例如内联被调函数对标量形参执行 `n = n + 1` | 实参在调用点绑定一次(`n_inline0 = k`),重绑定只作用在该临时变量上,因此其后调用方的 `k` 保持不变。见[重绑定形参](#重绑定形参)。 |
 | 递归 Inline(自递归或互相调用) | 在任何展开发生之前抛出 `pypto::ValueError`,消息中标明环路径(`a -> b -> a`)。 |
-| 多返回值 Inline | 在调用点发出 `LHS = MakeTuple([rets...])`。后续 `Simplify` 可能把 `TupleGetItemExpr(MakeTuple(...), i)` 折叠掉。 |
-| 嵌套 Call 到 Inline(如 `pl.add(inline_fn(x), y)`) | v1 不处理 — 保持原样。`InlineFunctionsEliminated` verifier 会标记任何残留的 Call。 |
+| 多返回值 Inline | **不**发出 `LHS = MakeTuple([rets...])` — 编排层 codegen 无法 lower `MakeTuple`。改为把克隆后的返回值记录在 LHS `Var` 上,并把下游 `TupleGetItemExpr(LHS, i)` 的使用改写为第 `i` 个值,使该 LHS 绑定最终无人引用(参见 `SpliceInlineCallAsTupleSub`)。 |
+| 嵌套 Call 到 Inline(如 `pl.add(inline_fn(x), y)`,以及解析器把 `arr[i] = inline_fn(x)` 脱糖成的 `array.update_element(arr, i, inline_fn(x))`) | 先提升为独立的 `AssignStmt`,并在同一轮迭代中展开 — 参见[嵌套调用点](#嵌套调用点)。 |
+| 指向**返回元组**的 Inline,或位于 `WhileStmt` 条件、`IterArg` 初值、裸(非 `SeqStmts`)`ForStmt` / `IfStmt` body 中的嵌套 Call | 不提升。`InlineFunctionsEliminated` verifier 会在本 pass 之后立即在其源码行上报告残留的 Call。 |
+| `EvalStmt(inline_call(...))` — 返回值被忽略 | 被丢弃的是返回**值**,不是它的**求值**。参见下方[丢弃返回值](#丢弃返回值)。 |
+
+## 嵌套调用点
+
+`HandleTopLevelInlineCall` 只在 `Call` **就是**整个语句值时才识别调用点 —— `LHS = f(...)`、`EvalStmt(f(...))`、`return f(...)`。位于其他位置的 `Call` 会被跳过,而第 5 步仍会删除被调用函数,于是留下一个指向已删除函数的引用,直到 `GenerateOrchestration preconditions` 才以 `references undefined function` 失败。
+
+这类调用来自普通 DSL,有时用户根本没有写嵌套调用。`arr[i] = f(x)` 没有对应的 IR 语句,解析器将其脱糖为函数式更新:
+
+```python
+arr[i] = f(x)                              # 用户写的
+arr = pl.array.update_element(arr, i, f(x))  # 解析器存下的 —— f 变成了实参
+```
+
+因此 `NestedInlineCallHoister` 会在调用点匹配之前遍历每条语句自身的表达式,把每个嵌套的 inline `Call` 提升到该语句之前的新绑定 `t__inline_arg_vN` 上:
+
+```python
+# 之前                                      # 提升之后、展开之前
+k = self.half(n) + 1                       t__inline_arg_v0 = self.half(n)
+                                           k = t__inline_arg_v0 + 1
+```
+
+随后 `SpliceHoisted` 立即展开每个提升出来的绑定,在同一次遍历中处理提升及其触发的展开,无需后续不动点扫描。
+
+修改这部分时需要记住三点:
+
+- **已处于顶层位置的 Call 保持原样**(`HoistInArgs` 只改写它的实参)。否则每个已有调用点都会多出一次冗余拷贝,并打乱所有 before/after 测试。
+- **不触碰 body。** 提升器只改写语句自身的表达式;`InlineCallsMutator` 仍会递归进入循环与分支 body,因此 body 内的提升落在该 body 内。
+- **每个被提升的位置都只求值一次**,即提升后语句所在的位置 —— 调用实参、二元操作数、循环边界、`if` 条件、`yield` 值。`WhileStmt` 条件不是如此,因此被排除:提升它会把展开后的 body 变成只求值一次,而非每轮迭代求值。
+- **返回元组的被调函数不会被提升。** `SpliceInlineCallAsTupleSub` 刻意不发出 `tmp = ...` 绑定 —— 它把克隆后的返回值记录在 LHS `Var` 上,并改写下游的 `TupleGetItemExpr(tmp, i)`。嵌套消费者持有的是 `tmp` 本身而非 `TupleGetItemExpr`,因此提升会留下未定义的临时变量:`return self.pair(x), y` 会打印出 `t__inline_arg_v0__FREE_VAR`。保持该 `Call` 原样即维持提升前的行为,并由 verifier 指名报告。
+
+这比 `FlattenCallExpr`(pass 06)有意更窄,后者对**所有**调用执行同样的提升。该 pass 声明 `.required = {SSAForm, NormalizedStmtStructure}`,两者都在本 pass 之后才建立,因此它无法直接提前运行。
+
+## 丢弃返回值
+
+`EvalStmt` 调用点(`self.wrapper(x, out)`,没有 LHS)无处安放被调用者的尾部返回值。丢弃那个**值**是对的,丢弃它的**求值**则不对 —— 求值过程可能通过 `Out` / `InOut` 参数写入、启动任务、阻塞等待信号,或完成硬件设置。因此每个被丢弃的值都要分类:
+
+| 被丢弃的值 | 行为 |
+| ---------- | ---- |
+| `Call` —— 无论被调用者是跨函数还是 builtin | 按 return 顺序重新发出为 `EvalStmt`。嵌套内联调用在克隆函数体时递归展开;其余调用保持为普通派发,与作者在调用点直接写出来完全一致。 |
+| `Submit` | 重新发出为 `EvalStmt`。任务启动本身就是有副作用的,与被调用者做什么无关。 |
+| 其它不藏有调用的值 —— `Var`、常量 | 丢弃。 |
+| 本身不是 call-like、但**包裹**了调用的值 —— `self.bump(n) + 1` 这类标量算术、`MakeTuple`、`TupleGetItemExpr` | 抛出 `pypto::ValueError`。它无法变成 `EvalStmt`,而删除它会连带删除内层的调用。请直接返回该调用,或在调用点绑定 wrapper 的结果。 |
+
+**为什么是"所有调用",而不只是"会写的调用"。** IR 里没有任何东西能回答"这次调用可以安全删除吗"。最接近的注册表数据 `OpRegistryEntry::WritesAnyArg` 回答的是另一个问题 —— 算子是否**通过参数**写入 —— 以它为删除依据在两个方向上都会出错:
+
+- 大多数算子根本没有分类 —— 撰写时 315 个里有 263 个,其中就包括被 `dce::IsSideEffectOp` 列为副作用算子的 `tile.tpush_to_aiv` 和 `system.aic_initialize_pipe`。`OpRegistryEntry::HasDeclaredArgEffects` 存在的意义正是让分析能区分"已声明不写"和"尚无人查看"。
+- **正面**的 `no_arg_writes()` 判定也不等于可删除。`pld.system.wait` 会阻塞直到信号槽满足阈值,`pld.system.defer_wait` 注册任务完成条件,`system.set_ffts` 把 workspace 指针交给 FFTS 单元 —— 三者都声明了 `no_arg_writes()`,却都承担同步或硬件设置语义。
+
+因此该 pass 保留所有调用。被丢弃的真·纯调用会留下一条无用的 `EvalStmt`,流水线可以无害地带着它走完。要收窄这一点,需要一个真正的"可安全删除"算子属性 —— 逐算子声明,而不是从写入行为反推。
+
+**变换前**:
+
+```python
+@pl.function(type=pl.FunctionType.Inline)
+def writeout(self, t, out: pl.Out[...]):
+    return pl.tile.store(t, [0, 0], out)   # 写入本身就是返回表达式
+
+@pl.function(type=pl.FunctionType.InCore)
+def kernel(self, a, out: pl.Out[...]):
+    t = pl.tile.load(a, [0, 0], [64, 64])
+    self.writeout(t, out)                  # 返回值被忽略
+    return out
+```
+
+**变换后** —— store 被保留:
+
+```python
+@pl.function(type=pl.FunctionType.InCore)
+def kernel(self, a, out: pl.Out[...]):
+    t = pl.tile.load(a, [0, 0], [64, 64])
+    pl.tile.store(t, [0, 0], out)
+    return out
+```
 
 ## 验证
 

@@ -1,5 +1,9 @@
 # 在设备上运行
 
+> **旧 Python 接口示例：** 本页为兼容现有用法保留 `platform=` 调用，
+> 这些调用会发出 `DeprecationWarning`；新代码应使用 `backend_type` 和
+> `execution_mode`。参见[目标映射](../dev/08-entry-points.md#迁移旧-platform-示例)。
+
 数据常驻 worker、显式派发、性能测量，以及分布式程序的运行。
 
 > **本页处于过渡状态。** 其入门部分已迁至 [快速上手](02-quickstart.md)。这里保留的是设备执行
@@ -141,20 +145,74 @@ compiled = prefill_fwd.compile()
 - **静态维**（`HIDDEN`、`VOCAB` …）来自注解常量。
 - **动态维**（`pl.dynamic` / `bind_dynamic`）无需给值 —— 编译产物与具体 extent
   无关，`compile()` 与等价的 `compile(sample_tensors)` 共享同一 cache 条目。
-- **标量参数**在签名里没有值 —— 用关键字参数传入。传字面量会把该值**特化**进
-  产物，例如 `kernel.compile(num_tokens=128)` 编出的内核只认 128。改传
-  `pl.RUNTIME` —— `kernel.compile(num_tokens=pl.RUNTIME)` —— 则**不特化**：该参数
-  在生成的程序里仍是真正的 `pl.Scalar` 参数，值在 dispatch 时给出；它与动态维一样
-  不进 cache key，一份产物服务所有取值。该值要通过编译产物给出 —— `compiled(...)`
-  或 `worker.register(compiled)` 拿到的 handle —— 而不是直接调用内核：
-  `kernel(x, out, 128)` 会按 128 重新特化并编出另一份产物。`pl.RUNTIME` 也可以写成
-  签名默认值（`num_tokens: pl.Scalar[pl.INT32] = pl.RUNTIME`），这样每个 `compile()`
-  调用点都不必再传关键字。
+- **标量参数**完全不需要给值。`pl.Scalar[...]` 参数是**运行期值**：它在编译产物里
+  仍是真正的参数，值在 dispatch 时给出；它与动态维一样不进 cache key，一份产物
+  服务所有取值。`kernel.compile()` 即可，值通过 `compiled(x, out, 128)` 或
+  `worker.register(compiled)` 拿到的 handle 给出。直接调用内核也一样：
+  `kernel(x, out, 128)` 与 `kernel(x, out, 256)` 复用同一份编译结果。
+  `pl.RUNTIME` 仍被接受（它正是现在每个标量的默认行为）；向 `compile()` 传字面量
+  会给出告警，因为这个写法过去表示相反的含义。
+- **`pl.constexpr` 参数**位于这条轴的另一端 —— 见下文"编译期参数"一节。
 - **bare `pl.Tensor`**（无 shape）无从读取，会给出明确报错；请补全
   `pl.Tensor[[...], dtype]` 注解，或回退到 `compile(*sample_tensors)`。
 
 完整三种使用模式（推理服务、训练循环、register/dispatch 开销验证）见
 `examples/runtime/explicit_dispatch.py`。
+
+### 编译期参数（`pl.constexpr`）
+
+`pl.Scalar[dtype]` 参数是运行期值，但有些值不可能是：tile 形状、展开次数、
+需要被编译期消解掉的分支。把这些参数标注为 `pl.constexpr`，编译器会把调用点的值
+折叠进函数体、并以它作为产物身份的一部分，同时**把该参数删除**——constexpr 参数
+既不出现在生成的程序里，也不出现在 dispatch ABI 里。
+
+```python
+@pl.jit
+def kernel(
+    x: pl.Tensor[[32, 32], pl.FP32],
+    out: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+    scale: pl.Scalar[pl.FP32],   # 运行期：一份产物服务所有取值
+    BLOCK: pl.constexpr,         # 编译期：每个取值一份产物
+):
+    with pl.at(level=pl.Level.CORE_GROUP):
+        pl.store(pl.add(pl.load(x, [0, 0], [BLOCK, BLOCK]), scale), [0, 0], out)
+    return out
+
+kernel(x, out, scale=1.0, BLOCK=16)
+kernel(x, out, scale=2.0, BLOCK=16)   # 同一份产物——只有标量变了
+kernel(x, out, scale=2.0, BLOCK=32)   # 第二份产物
+```
+
+要点：
+
+- **支持的值类型**与模块级常量完全一致，因为两者走同一条折叠规则：`int`、`float`、
+  `bool`、`str`、`pl.FP32` 这类 dtype、`pl.Mem.Vec` 这类枚举成员，以及它们的列表。
+  无法渲染成源码的值会被拒绝，报错里点名该参数。
+- **cache 身份**是折叠后的源文本：文本相同则共用产物，任何差异都会分裂产物——
+  进程内与[持久缓存](../dev/10-jit-cache.md)一致。
+- **必须给值。** 与标量不同，它没有 dispatch 这条退路，所以 `compile()` /
+  `lower()` / `warmup()` 需要通过关键字或签名默认值给出。
+- **跨 dep** 时，值可以转发（`helper(x, out, BLOCK)`），也可以在调用点直接写
+  （`helper(x, out, 64)`）。生成的函数按**绑定**而非按 dep 计数：取值一致的调用点
+  共用一个函数，同一个 dep 用两个不同常量调用则各编译一份，每个调用点分别接到自己
+  那份上。分裂会向下传播——转发该值的 dep，其下游也一并分裂。
+
+与其他做法的关系：固定配置仍然推荐模块级常量，多配置也仍可用闭包工厂。
+`constexpr` 适用于"配置本该属于调用"的场景：
+
+```python
+# 之前：一个配置一个工厂，调用方还要自己管理这些 kernel 对象。
+def build(block: int):
+    BLOCK = block
+    @pl.jit
+    def kernel(x, out): ...   # BLOCK 从闭包折叠
+    return kernel
+kernels = {b: build(b) for b in (64, 128, 256)}
+kernels[128](x, out)
+
+# 之后：一个 kernel，配置就是一个实参。
+kernel(x, out, BLOCK=128)
+```
 
 ### 读取单次 launch 的计时
 

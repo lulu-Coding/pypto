@@ -23,13 +23,18 @@
  * This pass is the CHIP/L2 rail. It rewrites
  *
  *     target = pld.tensor.all_to_all_v(input, target, signal,
- *                                      send_counts, recv_counts, core_num=1)
+ *                                      send_counts, recv_counts, core_num=L)
  *
  * into a call to a synthesized AIV kernel function backed by the *same*
  * hand-written builtin kernel source the HOST rail uses:
  *
  *     target = __builtin_all_to_all_v__fp32(input, target, signal,
  *                                           send_counts, recv_counts)
+ *
+ * ``L`` must be a compile-time constant. The pass folds the admitted block count
+ * ``B = CalAllToAllVBlocks(P, L)`` (``P`` is the signal's static ``NR``) and, for
+ * ``B > 1``, attaches it to the call as the ``core_num`` / ``sync_start`` launch
+ * spec — call attrs, not kernel parameters, so the ABI below is unchanged.
  *
  * The result is one ``rt_submit_aiv_task`` inside the caller's own pipeline —
  * no nested L2 -> L2 dispatch — and the collective participates in the normal
@@ -67,6 +72,8 @@
 
 #include <any>
 #include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -81,6 +88,7 @@
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/program.h"
+#include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/mutator.h"
@@ -113,22 +121,31 @@ constexpr const char* kAllToAllV = "pld.tensor.all_to_all_v";
          *func->level_ == Level::CHIP;
 }
 
+/// The admitted block count ``B`` for a requested limit ``L`` over ``P`` ranks
+/// (RFC #2521 frozen item #3): ``L`` while ``L < P``, otherwise the largest
+/// multiple of ``P`` not exceeding ``L``. Payload size never enters.
+///
+/// This is the compiler-side copy of the formula. The HOST rail evaluates it in
+/// its generated entry (``entry.cpp.in``), which is compiled standalone and cannot
+/// link against this file, so the two sites are kept in step by tests that run
+/// the RFC's worked-example table through both.
+[[nodiscard]] int64_t CalAllToAllVBlocks(int64_t p, int64_t l) { return l < p ? l : (l / p) * p; }
+
 /// Variant suffix and C++ element type the builtin kernel template is
 /// instantiated with.
 ///
-/// Deliberately the same single-dtype support the HOST rail declares
-/// (``Fp32VariantSuffix`` / ``Fp32TypeCpp`` in distributed_ops_codegen.cpp):
-/// both rails render the same template, so widening the dtype set is one change
-/// for both, not a CHIP-only divergence.
+/// Both rails use DataType's string conversions to render the same template.
+/// FP32 and INT8 are the current pair; INT8 is the RFC #2521 A1 canonical payload.
 struct BuiltinDType {
-  const char* suffix;
-  const char* cpp;
+  std::string suffix;
+  std::string cpp;
 };
 
 [[nodiscard]] BuiltinDType ResolveBuiltinDType(const DataType& dtype, const Span& span) {
-  CHECK_SPAN(dtype == DataType::FP32, span)
-      << "managed pld.tensor.all_to_all_v currently supports only dtype=FP32, got " << dtype.ToString();
-  return {"fp32", "float"};
+  CHECK_SPAN(dtype == DataType::FP32 || dtype == DataType::INT8, span)
+      << "managed pld.tensor.all_to_all_v currently supports only dtype=FP32 or INT8, got "
+      << dtype.ToString();
+  return {dtype.ToString(), dtype.ToCTypeString()};
 }
 
 /// Encode the template substitutions as a ``k=v`` list for the Function attr.
@@ -174,12 +191,27 @@ struct BuiltinKernelSpec {
       {ParamDirection::In, ParamDirection::InOut, ParamDirection::InOut, ParamDirection::In,
        ParamDirection::InOut},
       {"input", "target", "signal", "send_counts", "recv_counts"},
-      // `input` and `send_counts` are Tensor-like on the public op: either a
-      // plain Tensor or a DistributedTensor. The kernel sees a flat `Tensor*`
-      // for both, so the synthesized signature fixes them as plain Tensor and
-      // the variant stays keyed on dtype alone. The three genuinely
-      // window-bound operands stay distributed, which is also what gives
-      // MaterializeDistTensorCtx the CommCtx parameters the kernel needs.
+      // `input` stays Tensor-like on the public op (plain Tensor or
+      // DistributedTensor — the kernel only reads it locally as the TPUT
+      // source). `send_counts` is required to be window-bound at the call site
+      // on this rail (peers pull it through CommRemotePtr; see LowerCollective),
+      // but BOTH are declared as plain `Tensor*` here: the synthesized
+      // signature fixes the ABI and the variant stays keyed on dtype alone. The
+      // three genuinely window-bound operands stay distributed, which is also
+      // what gives MaterializeDistTensorCtx the CommCtx parameters the kernel
+      // needs.
+      //
+      // The public op's trailing `core_num` arg is deliberately NOT a kernel
+      // parameter. This rail's kernel args come from the managed pipeline's own
+      // dispatch (see LowerCollective), where every parameter becomes an
+      // `add_scalar` slot *ahead* of the CommCtx suffix that
+      // MaterializeDistTensorCtx appends, and the shared `kernel.cpp.in` reads
+      // its CommContext from `args[5]` — the first ctx. Making `core_num` part
+      // of the kernel ABI pushed every ctx one slot to the right, so the kernel
+      // reinterpreted the integer `1` as a `CommContext*` and derived a garbage
+      // rankNum/rankId on every rank (one AIV block then spins in
+      // `ExchangeBarrier` until the scheduler's watchdog fires). Kernel ABI
+      // parity with the HOST rail is five operands plus the ctx, nothing more.
       {false, true, true, false, true},
   };
 }
@@ -187,9 +219,11 @@ struct BuiltinKernelSpec {
 /// The parameter type the synthesized signature declares, which is deliberately
 /// *not* whatever the call site passed.
 ///
-/// `input` and `send_counts` accept either a Tensor or a DistributedTensor, and
-/// the two are indistinguishable to the kernel — both arrive as a flat
-/// `Tensor*`. Copying the first call's types would make one cached function
+/// `input` and `send_counts` are both rendered as a flat `Tensor*` — the two
+/// kinds are indistinguishable to the kernel — and `send_counts` is additionally
+/// pinned to a window-bound DistributedTensor at the call site (LowerCollective),
+/// so the canonical declaration cannot depend on the call. Copying the first
+/// call's types would make one cached function
 /// carry an accidental ABI: a later call passing the other kind would inherit a
 /// signature whose CommCtx parameter count no longer matches its arguments,
 /// because MaterializeDistTensorCtx appends one per DistributedTensor
@@ -208,10 +242,16 @@ struct BuiltinKernelSpec {
 }
 
 /// Build the header-only AIV function that stands in for the builtin kernel.
+///
+/// The signature covers the five kernel operands only. `core_num` is the public
+/// op's 6th argument, but it stops at this rail's gate (LowerCollective): every
+/// parameter here becomes a dispatch slot ahead of the CommCtx suffix
+/// MaterializeDistTensorCtx appends, and the shared `kernel.cpp.in` reads its
+/// CommContext from the fixed index `args[5]`.
 [[nodiscard]] FunctionPtr MakeBuiltinKernelFunction(const BuiltinKernelSpec& spec, const CallPtr& call) {
   std::vector<VarPtr> params;
-  params.reserve(call->args_.size());
-  for (size_t i = 0; i < call->args_.size(); ++i) {
+  params.reserve(spec.param_names.size());
+  for (size_t i = 0; i < spec.param_names.size(); ++i) {
     params.push_back(std::make_shared<Var>(
         spec.param_names[i], CanonicalParamType(spec.param_distributed[i], call->args_[i], call->span_),
         call->span_));
@@ -290,21 +330,79 @@ class LowerL2TensorCollectivesMutator : public IRMutator {
   }
 
   [[nodiscard]] CallPtr LowerCollective(const CallPtr& call) {
-    INTERNAL_CHECK_SPAN(call->args_.size() == 5, call->span_)
-        << "LowerL2TensorCollectives: " << call->op_->name_ << " must have 5 args, got "
+    INTERNAL_CHECK_SPAN(call->args_.size() == 6, call->span_)
+        << "LowerL2TensorCollectives: " << call->op_->name_ << " must have 6 args, got "
         << call->args_.size();
 
-    // core_num is the requested block limit L. The first version launches a
-    // single block, so anything else would silently under-deliver; the dynamic
-    // L -> B mapping lands with the multi-AIV entry work.
-    const auto core_num = call->GetKwarg<int>("core_num", 1);
-    CHECK_SPAN(core_num == 1, call->span_)
-        << "CHIP pld.tensor.all_to_all_v currently supports only core_num=1, got core_num=" << core_num
-        << "; multi-AIV launch is not implemented yet";
+    // core_num (args_[5]) is the requested block limit L, carried as a
+    // Scalar[INDEX] argument. It is consumed here and then dropped from the
+    // kernel call — it never reaches the kernel, whose argument layout must stay
+    // identical to the HOST rail's. What it becomes instead is the launch spec on
+    // the call (see the end of this function).
+    //
+    // Only a compile-time L is accepted. A runtime L would need the block count
+    // computed in the emitted orchestration, plus a runtime `signal stride >= B`
+    // check, and orchestration has no surface for raising that fatal today; the
+    // HOST rail takes a runtime L because its entry runs on the host.
+    auto core_num_const = As<ConstInt>(call->args_[5]);
+    CHECK_SPAN(core_num_const != nullptr, call->span_)
+        << "CHIP pld.tensor.all_to_all_v: a runtime core_num is not supported on this rail yet; pass a "
+           "compile-time core_num (the HOST rail accepts a runtime value)";
+    const int64_t requested_blocks = core_num_const->value_;
+    // The launch width is a 32-bit count, and the HOST entry bounds `core_num` to
+    // the same [1, INT32_MAX] at runtime; a static request outside it can never
+    // be honoured, so say so here instead of folding it into an overflowing B.
+    CHECK_SPAN(requested_blocks >= 1 && requested_blocks <= std::numeric_limits<int32_t>::max(), call->span_)
+        << "CHIP pld.tensor.all_to_all_v: core_num must be in [1, " << std::numeric_limits<int32_t>::max()
+        << "], got " << requested_blocks;
 
     auto target_type = As<DistributedTensorType>(call->args_[1]->GetType());
     INTERNAL_CHECK_SPAN(target_type, call->span_)
         << "LowerL2TensorCollectives: pld.tensor.all_to_all_v target must be DistributedTensorType";
+
+    // The rank count P is a compile-time constant on this rail: the deducer
+    // requires `signal` to be [NR, S] with static NR and S, and the program is
+    // built once per rank count. That is what lets the compiler fold
+    // B = CalAllToAllVBlocks(P, L) here instead of in a generated entry. The
+    // kernel itself still reads the rank count from the CommContext, so NR must
+    // equal the runtime domain size — an invariant this rail already relies on
+    // for correctness (every counts address derives from NR), now also for width.
+    auto signal_type = As<DistributedTensorType>(call->args_[2]->GetType());
+    INTERNAL_CHECK_SPAN(signal_type && signal_type->shape_.size() == 2, call->span_)
+        << "LowerL2TensorCollectives: pld.tensor.all_to_all_v signal must be a 2D DistributedTensor";
+    auto nranks_const = As<ConstInt>(signal_type->shape_[0]);
+    auto stride_const = As<ConstInt>(signal_type->shape_[1]);
+    INTERNAL_CHECK_SPAN(nranks_const && stride_const, call->span_)
+        << "LowerL2TensorCollectives: pld.tensor.all_to_all_v signal must have a static [NR, S] shape "
+           "(deducer-enforced)";
+    const int64_t nranks = nranks_const->value_;
+    const int64_t signal_stride = stride_const->value_;
+    // Deducer-enforced positive; stated here because CalAllToAllVBlocks divides by P.
+    INTERNAL_CHECK_SPAN(nranks >= 1 && signal_stride >= 1, call->span_)
+        << "LowerL2TensorCollectives: pld.tensor.all_to_all_v signal [NR, S] must be positive, got ["
+        << nranks << ", " << signal_stride << "]";
+    const int64_t launched_blocks = CalAllToAllVBlocks(nranks, requested_blocks);
+
+    // A stride narrower than the launched gang is a defect, not something the
+    // kernel should clamp its way past (RFC #2521 §13.3). Compare against the
+    // folded B, never the raw L: L=10, P=8 launches 8 blocks, so S=8 is enough.
+    // Same condition and wording as the HOST rail's entry.
+    CHECK_SPAN(signal_stride >= launched_blocks, call->span_)
+        << "CHIP pld.tensor.all_to_all_v: signal stride (" << signal_stride
+        << ") is smaller than the admitted block count (" << launched_blocks
+        << ") for core_num=" << requested_blocks << ", nranks=" << nranks;
+
+    // send_counts is read REMOTELY by every peer (the hand-written kernel
+    // resolves each peer's copy through CommRemotePtr for the counts pull), so
+    // it must be a DistributedTensor on this rail: a distributed operand is
+    // what the managed rail materializes as a window at runtime. The public
+    // op's deducer accepts a plain Tensor for the InCore composite path, where
+    // counts are consumed locally; reaching this rail with one is user error.
+    auto counts_type = As<DistributedTensorType>(call->args_[3]->GetType());
+    CHECK_SPAN(counts_type != nullptr, call->span_)
+        << "CHIP pld.tensor.all_to_all_v send_counts must be a DistributedTensor: peers read this "
+           "rank's send vector through CommRemotePtr, so a plain Tensor (accepted only on the InCore "
+           "composite path) is not supported on this rail";
 
     auto spec = MakeAllToAllVKernelSpec(target_type->dtype_, call->span_);
     // One kernel per dtype, shared by every call site in the Program. The
@@ -327,7 +425,8 @@ class LowerL2TensorCollectivesMutator : public IRMutator {
     //            CommCtx suffix MaterializeDistTensorCtx appends is driven by
     //            the callee's params, so args and params cannot disagree on it.
     //   rank   - the deducer pins every operand but send_counts to 2D, and
-    //            send_counts is addressed flatly (`send_counts_base[dest]`).
+    //            send_counts is addressed flatly (`send_counts_base[dest]`
+    //            locally; the remote pull word is `send_counts_base[my_rank]`).
     //
     // Relaxing any of those - a second dtype variant, a rank-3 payload - breaks
     // the sharing itself, not just this comment.
@@ -335,7 +434,33 @@ class LowerL2TensorCollectivesMutator : public IRMutator {
     if (inserted == kernels_->end()) {
       kernels_->emplace(spec.function_name, MakeBuiltinKernelFunction(spec, call));
     }
-    return std::make_shared<Call>(std::make_shared<GlobalVar>(spec.function_name), call->args_,
+    // Drop the public op's trailing `core_num` from the kernel call: the kernel
+    // sees the five operands (plus the CommCtx suffix MaterializeDistTensorCtx
+    // appends from the callee's params), exactly as the HOST rail's entry-built
+    // dispatch passes them.
+    INTERNAL_CHECK_SPAN(call->args_.size() == spec.param_names.size() + 1, call->span_)
+        << "LowerL2TensorCollectives: kernel signature must cover every call argument except the "
+           "trailing core_num scalar";
+    std::vector<ExprPtr> kernel_args(
+        call->args_.begin(), call->args_.begin() + static_cast<std::ptrdiff_t>(spec.param_names.size()));
+    auto kernel_callee = std::make_shared<GlobalVar>(spec.function_name);
+    if (launched_blocks == 1) {
+      // One block needs no gang launch; leave the call exactly as it was.
+      return std::make_shared<Call>(kernel_callee, std::move(kernel_args), call->args_[1]->GetType(),
+                                    call->span_);
+    }
+    // The launch spec rides the call's attrs, which are not kernel parameters, so
+    // the five-operand ABI above is untouched. `require_sync_start` is not
+    // optional: the block-aware barrier needs every admitted block resident
+    // together, and the runtime rejects an over-capacity sync-start launch
+    // rather than part-starting it.
+    auto core_num_dtype = As<ScalarType>(core_num_const->GetType())->dtype_;
+    std::vector<std::pair<std::string, std::any>> launch_attrs;
+    launch_attrs.emplace_back(
+        kAttrCoreNum, ExprPtr(std::make_shared<ConstInt>(launched_blocks, core_num_dtype, call->span_)));
+    launch_attrs.emplace_back(kAttrSyncStart, true);
+    return std::make_shared<Call>(kernel_callee, std::move(kernel_args),
+                                  std::vector<std::pair<std::string, std::any>>{}, std::move(launch_attrs),
                                   call->args_[1]->GetType(), call->span_);
   }
 
@@ -364,7 +489,7 @@ class ResidualCollectiveChecker : public IRVisitor {
       CHECK_SPAN(false, op->span_)
           << op->op_->name_ << " in function '" << func_name_
           << "' was not lowered. The managed CHIP/L2 rail currently supports only " << kAllToAllV
-          << " with core_num=1; write any other collective in a HOST orchestrator (builtin "
+          << " with a compile-time core_num; write any other collective in a HOST orchestrator (builtin "
              "dispatch rail) or an InCore function (composite rail)";
     }
     IRVisitor::VisitExpr_(op);

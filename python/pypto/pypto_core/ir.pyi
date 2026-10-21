@@ -9,7 +9,7 @@
 """Type stubs for PyPTO IR (Intermediate Representation) module."""
 
 import enum
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Final, overload
 
 from pypto import DataType
@@ -295,6 +295,16 @@ class UnknownType(Type):
             The singleton UnknownType instance
         """
 
+class VoidType(Type):
+    """Known absence of an SSA result, distinct from UnknownType."""
+
+    def __init__(self) -> None:
+        """Create a void type."""
+
+    @staticmethod
+    def get() -> VoidType:
+        """Get the singleton VoidType instance."""
+
 class ScalarType(Type):
     """Scalar type representation."""
 
@@ -430,12 +440,17 @@ class TensorView:
     @overload
     def __init__(
         self,
-        stride: Sequence[Expr | int | Scalar],
-        layout: TensorLayout,
-        valid_shape: Sequence[Expr | int | Scalar] = ...,
+        stride: Sequence[Expr | int | Scalar] | None = ...,
+        layout: TensorLayout | None = ...,
+        valid_shape: Sequence[Expr | int | Scalar] | None = ...,
         pad: PadValue = ...,
     ) -> None:
         """Create a tensor view with stride, layout, optional valid shape, and optional pad.
+
+        Models the ``pypto.ir`` factory surface: every field is optional
+        (stride/valid_shape default to empty), but ``layout`` is required
+        whenever any other field is given. Scalars/DynVars are unwrapped to
+        their expressions and ints to ConstInt by the factory.
 
         Args:
             stride: Stride for each dimension (Expr, int, or Scalar/DynVar)
@@ -497,73 +512,18 @@ class TensorType(ShapedType):
     tensor_view: Final[TensorView | None]
     """Optional tensor view information."""
 
-    @overload
-    def __init__(self, shape: Sequence[Expr], dtype: DataType) -> None:
-        """Create a tensor type without memory reference.
-
-        Args:
-            shape: Shape dimensions as Expr nodes
-            dtype: Element data type
-        """
-
-    @overload
-    def __init__(self, shape: Sequence[Expr], dtype: DataType, memref: MemRef | None) -> None:
-        """Create a tensor type with memory reference.
-
-        Args:
-            shape: Shape dimensions as Expr nodes
-            dtype: Element data type
-            memref: Optional memory reference
-        """
-
-    @overload
     def __init__(
         self,
-        shape: Sequence[Expr],
+        shape: Sequence[Expr | int],
         dtype: DataType,
-        memref: MemRef | None,
-        tensor_view: TensorView | None,
+        memref: MemRef | None = ...,
+        tensor_view: TensorView | None = ...,
     ) -> None:
-        """Create a tensor type with memory reference and tensor view.
+        """Create a tensor type with optional memory reference and tensor view.
 
         Args:
-            shape: Shape dimensions as Expr nodes
-            dtype: Element data type
-            memref: Optional memory reference
-            tensor_view: Optional tensor view information
-        """
-
-    @overload
-    def __init__(self, shape: Sequence[int], dtype: DataType) -> None:
-        """Create a tensor type without memory reference.
-
-        Args:
-            shape: Shape dimensions as integers (automatically converted to ConstInt)
-            dtype: Element data type
-        """
-
-    @overload
-    def __init__(self, shape: Sequence[int], dtype: DataType, memref: MemRef | None) -> None:
-        """Create a tensor type with memory reference.
-
-        Args:
-            shape: Shape dimensions as integers (automatically converted to ConstInt)
-            dtype: Element data type
-            memref: Optional memory reference
-        """
-
-    @overload
-    def __init__(
-        self,
-        shape: Sequence[int],
-        dtype: DataType,
-        memref: MemRef | None,
-        tensor_view: TensorView | None,
-    ) -> None:
-        """Create a tensor type with memory reference and tensor view.
-
-        Args:
-            shape: Shape dimensions as integers (automatically converted to ConstInt)
+            shape: Shape dimensions as Expr nodes or integers (ints are
+                auto-converted to ConstInt by the ``pypto.ir`` wrapper)
             dtype: Element data type
             memref: Optional memory reference
             tensor_view: Optional tensor view information
@@ -591,12 +551,18 @@ class DistributedTensorType(TensorType):
     ``pld.DistributedTensor[[N], pl.FP32]``."""
 
     @overload
-    def __init__(self, shape: Sequence[Expr], dtype: DataType) -> None:
-        """Create a distributed tensor type."""
+    def __init__(
+        self,
+        shape: Sequence[Expr | int],
+        dtype: DataType,
+        memref: MemRef | None = ...,
+        tensor_view: TensorView | None = ...,
+    ) -> None:
+        """Create a distributed tensor type with optional memref and tensor_view."""
 
     @overload
-    def __init__(self, shape: Sequence[Expr], dtype: DataType, memref: MemRef | None) -> None:
-        """Create a distributed tensor type with optional memref."""
+    def __init__(self, shape: Sequence[Expr], dtype: DataType, window_buffer: WindowBuffer) -> None:
+        """Create a distributed tensor type bound to a specific WindowBuffer (produced by ``pld.window``)."""
 
     @overload
     def __init__(
@@ -605,30 +571,9 @@ class DistributedTensorType(TensorType):
         dtype: DataType,
         memref: MemRef | None,
         tensor_view: TensorView | None,
+        window_buffer: WindowBuffer | None,
     ) -> None:
-        """Create a distributed tensor type with optional memref and tensor_view."""
-
-    @overload
-    def __init__(self, shape: Sequence[int], dtype: DataType) -> None:
-        """Create a distributed tensor type with constant shape."""
-
-    @overload
-    def __init__(self, shape: Sequence[int], dtype: DataType, memref: MemRef | None) -> None:
-        """Create a distributed tensor type with constant shape and optional memref."""
-
-    @overload
-    def __init__(
-        self,
-        shape: Sequence[int],
-        dtype: DataType,
-        memref: MemRef | None,
-        tensor_view: TensorView | None,
-    ) -> None:
-        """Create a distributed tensor type with constant shape, optional memref and tensor_view."""
-
-    @overload
-    def __init__(self, shape: Sequence[Expr], dtype: DataType, window_buffer: WindowBuffer) -> None:
-        """Create a distributed tensor type bound to a specific WindowBuffer (produced by ``pld.window``)."""
+        """Create a distributed tensor type preserving all optional metadata."""
 
 class TileView:
     """Tile view: read-only representation of valid shape, stride, start offset,
@@ -706,79 +651,19 @@ class TileType(ShapedType):
     tile_view: Final[TileView | None]
     """Optional tile view information."""
 
-    memory_space: Final[MemorySpace | None]
-    """Memory space (None = not yet inferred)."""
-
-    @overload
-    def __init__(self, shape: Sequence[Expr], dtype: DataType) -> None:
-        """Create a tile type without memory reference.
-
-        Args:
-            shape: Shape dimensions as Expr nodes
-            dtype: Element data type
-        """
-
-    @overload
-    def __init__(self, shape: Sequence[Expr], dtype: DataType, memref: MemRef | None) -> None:
-        """Create a tile type with memory reference.
-
-        Args:
-            shape: Shape dimensions as Expr nodes
-            dtype: Element data type
-            memref: Optional memory reference
-        """
-
-    @overload
     def __init__(
         self,
-        shape: Sequence[Expr],
+        shape: Sequence[Expr | int],
         dtype: DataType,
-        memref: MemRef | None,
-        tile_view: TileView | None,
-        memory_space: MemorySpace | None = None,
+        memref: MemRef | None = ...,
+        tile_view: TileView | None = ...,
+        memory_space: MemorySpace | None = ...,
     ) -> None:
-        """Create a tile type with memory reference, tile view, and memory space.
+        """Create a tile type with optional memory reference, tile view, and memory space.
 
         Args:
-            shape: Shape dimensions as Expr nodes (supports multi-dimensional tensors)
-            dtype: Element data type
-            memref: Optional memory reference
-            tile_view: Optional tile view information
-            memory_space: Optional memory space
-        """
-
-    @overload
-    def __init__(self, shape: Sequence[int], dtype: DataType) -> None:
-        """Create a tile type without memory reference.
-
-        Args:
-            shape: Shape dimensions as integers (automatically converted to ConstInt)
-            dtype: Element data type
-        """
-
-    @overload
-    def __init__(self, shape: Sequence[int], dtype: DataType, memref: MemRef | None) -> None:
-        """Create a tile type with memory reference.
-
-        Args:
-            shape: Shape dimensions as integers (automatically converted to ConstInt)
-            dtype: Element data type
-            memref: Optional memory reference
-        """
-
-    @overload
-    def __init__(
-        self,
-        shape: Sequence[int],
-        dtype: DataType,
-        memref: MemRef | None,
-        tile_view: TileView | None,
-        memory_space: MemorySpace | None = None,
-    ) -> None:
-        """Create a tile type with memory reference, tile view, and memory space.
-
-        Args:
-            shape: Shape dimensions as integers (automatically converted to ConstInt)
+            shape: Shape dimensions as Expr nodes or integers (ints are
+                auto-converted to ConstInt by the ``pypto.ir`` wrapper)
             dtype: Element data type
             memref: Optional memory reference
             tile_view: Optional tile view information
@@ -814,6 +699,47 @@ class ArrayType(ShapedType):
     def extent(self) -> Expr:
         """Number of elements (always a ConstInt)."""
 
+class BufferType(Type):
+    """Physical descriptor for a final device buffer, without a MemRef or address.
+
+    Physical extents are static positive integers. ``valid_shape`` entries are
+    static nonnegative extents or -1 for a runtime valid extent carried by an op
+    operand. An empty valid shape is normalized to the physical shape.
+    """
+
+    shape: Final[Sequence[int]]
+    dtype: Final[DataType]
+    memory_space: Final[MemorySpace]
+    valid_shape: Final[Sequence[int]]
+    blayout: Final[TileLayout]
+    slayout: Final[TileLayout]
+    fractal: Final[int]
+    pad: Final[PadValue]
+    compact: Final[CompactMode]
+
+    def __init__(
+        self,
+        shape: Sequence[int],
+        dtype: DataType,
+        memory_space: MemorySpace,
+        valid_shape: Sequence[int] = (),
+        blayout: TileLayout = TileLayout.row_major,
+        slayout: TileLayout = TileLayout.none_box,
+        fractal: int = 512,
+        pad: PadValue = PadValue.null,
+        compact: CompactMode = CompactMode.null,
+    ) -> None:
+        """Create a static physical buffer descriptor with explicit memory space."""
+
+class MultiBufferType(Type):
+    """Descriptor for an explicit multi-slot allocation of identical buffers."""
+
+    element_type: Final[BufferType]
+    slot_count: Final[int]
+
+    def __init__(self, element_type: BufferType, slot_count: int) -> None:
+        """Create a multi-buffer descriptor with a positive slot count."""
+
 class TupleType(Type):
     """Tuple type representation (contains multiple types)."""
 
@@ -844,6 +770,15 @@ class CoreType(enum.IntEnum):
 
     VECTOR = ...
     CUBE = ...
+
+class FunctionIRStage(enum.Enum):
+    """Function body representation, independent of its execution context."""
+
+    Functional = ...
+    """Tensor/Tile value semantics (default)."""
+
+    Buffer = ...
+    """Explicit storage handles and destination writes."""
 
 class FunctionType(enum.Enum):
     """Function type classification.
@@ -1224,7 +1159,7 @@ class MemRef(Var):
     def __init__(
         self, memory_space: MemorySpace, addr: Expr | int, size: int, id: int, span: Span = ...
     ) -> None: ...
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         """Create a memory reference.
 
         New API: MemRef(base, byte_offset, size)
@@ -1382,7 +1317,7 @@ class ConstBool(Expr):
         """Data type of the expression (always DataType.BOOL)."""
 
 class Call(Expr):
-    """Function call expression."""
+    """Function call expression. Expressions in args, attrs, and kwargs must produce a value."""
 
     op: Final[Op]
     """Operation/function."""
@@ -1410,7 +1345,7 @@ class Call(Expr):
           :attr:`arg_directions` shortcut for typed access).
         """
 
-    kwargs: Final[Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue]]
+    kwargs: Final[Mapping[str, Any]]
     """Keyword arguments (metadata)."""
 
     @overload
@@ -1448,7 +1383,7 @@ class Call(Expr):
         self,
         op: Op,
         args: Sequence[Expr],
-        kwargs: Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue],
+        kwargs: Mapping[str, object],
         span: Span,
     ) -> None:
         """Create a function call expression with kwargs.
@@ -1466,7 +1401,7 @@ class Call(Expr):
         self,
         op: Op,
         args: Sequence[Expr],
-        kwargs: Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue],
+        kwargs: Mapping[str, object],
         type: Type,
         span: Span,
     ) -> None:
@@ -1486,7 +1421,7 @@ class Call(Expr):
         self,
         op: Op,
         args: Sequence[Expr],
-        kwargs: Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue],
+        kwargs: Mapping[str, object],
         attrs: Mapping[str, object] | Sequence[tuple[str, object]] | None,
         type: Type,
         span: Span,
@@ -1519,6 +1454,8 @@ class Submit(Expr):
     ``Tuple[<callee return>..., Scalar[TASK_ID]]`` (or just
     ``Scalar[TASK_ID]`` when the callee has no value return); callers unpack
     as ``out, tid = pl.submit(...)``.
+
+    Expressions in attrs and kwargs must produce a value.
 
     ``deps`` is a first-class field carrying the explicit cross-task
     dependencies passed as ``deps=[tid1, tid2, ...]``.
@@ -1568,7 +1505,7 @@ class Submit(Expr):
     def attrs(self) -> Mapping[str, Any]:
         """Compiler-internal node metadata (see :attr:`Call.attrs`)."""
 
-    kwargs: Final[Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue]]
+    kwargs: Final[Mapping[str, Any]]
     """Keyword arguments (metadata)."""
 
     @overload
@@ -1597,7 +1534,7 @@ class Submit(Expr):
         op: Op,
         args: Sequence[Expr],
         deps: Sequence[Expr],
-        kwargs: Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue],
+        kwargs: Mapping[str, object],
         attrs: Mapping[str, object] | Sequence[tuple[str, object]] | None,
         type: Type,
         span: Span,
@@ -2553,10 +2490,10 @@ class CommDomainScopeStmt(ScopeStmt):
     buffers=[CommBufferSpec(...)]) as __comm_d<n>:`` block at the top of the
     host orchestration function, then emits ``body`` inside that block.
 
-    Synthesized by the ``MaterializeCommDomainScopes`` pass; no user DSL surface.
-    The Python printer is
-    transparent over this stmt — reparse + re-run the pass pipeline restores
-    the scope. ``.pto`` binary round-trip is lossless via reflection.
+    Synthesized by the ``MaterializeCommDomainScopes`` pass. The Python printer
+    preserves it with private ``pl._dump.comm_domain(...)`` syntax, including
+    shared window references. Parsing a self-contained printed Program restores
+    the scope directly without rerunning materialization.
     """
 
     devices: Final[list[int]]
@@ -2590,6 +2527,9 @@ class SeqStmts(Stmt):
 
     stmts: Final[list[Stmt]]
     """List of statements."""
+
+    def __iter__(self) -> Iterator[Stmt]:
+        """Iterate the statements in order (the C++ binding exposes iteration)."""
 
     def __init__(self, stmts: list[Stmt], span: Span) -> None:
         """Create a sequence of statements.
@@ -2706,6 +2646,9 @@ class Function(IRNode):
     attrs: Final[dict[str, Any]]
     """Function-level attributes (key-value metadata)."""
 
+    ir_stage: Final[FunctionIRStage]
+    """Function body representation; defaults to Functional."""
+
     requires_runtime_binding: Final[bool]
     """True for an abstract SubWorker (``...`` body) bound at runtime via callbacks."""
 
@@ -2736,6 +2679,7 @@ class Function(IRNode):
         role: Role | None = None,
         attrs: dict[str, Any] | None = None,
         requires_runtime_binding: bool = False,
+        ir_stage: FunctionIRStage = FunctionIRStage.Functional,
     ) -> None:
         """Create a function definition.
 
@@ -2751,6 +2695,7 @@ class Function(IRNode):
             attrs: Function-level attributes dict (default: None)
             requires_runtime_binding: True for an abstract SubWorker (``...``
                 body) whose implementation is bound at runtime (default: False)
+            ir_stage: Function body representation (default: Functional)
         """
 
     def __str__(self) -> str:
@@ -2884,71 +2829,95 @@ class WindowBuffer(Var):
     ) -> None:
         """Create a WindowBuffer wrapping the given Ptr ``base`` Var."""
 
+def _without_type_memref(type: Type) -> Type:
+    """Remove allocation annotations from shaped and tuple value types."""
+    ...
+
+def verify_structural_bindings(node: IRNode) -> None:
+    """Verify local definition uniqueness and lexical visibility; allow open captures."""
+    ...
+
+class StructuralComparisonUnsupported(TypeError):
+    """Structural comparison cannot safely represent the input; this is not inequality."""
+
+    reason: str
+    field_path: str
+
 @overload
-def structural_hash(node: IRNode, enable_auto_mapping: bool = False) -> int: ...
+def structural_hash(
+    node: IRNode,
+    enable_auto_mapping: bool = False,
+) -> int: ...
 @overload
-def structural_hash(node: Type, enable_auto_mapping: bool = False) -> int: ...
-def structural_hash(node: IRNode | Type, enable_auto_mapping: bool = False) -> int:
-    """Compute deterministic structural hash of an IR node or type.
+def structural_hash(
+    node: Type,
+    enable_auto_mapping: bool = False,
+) -> int: ...
+@overload
+def structural_hash(
+    *,
+    type: Type,
+    enable_auto_mapping: bool = False,
+) -> int:
+    """Compute a process-local structural hash; equal structures have equal hashes.
 
-    Hashes based on node structure; variable identity is part of the hash unless
-    auto-mapping is enabled. The hash is deterministic within a single process run.
-    For IR nodes: ignores source location (Span).
-    If enable_auto_mapping=True, variable names are ignored (e.g., x+1 and y+1 hash the same).
-    If enable_auto_mapping=False (default), different variable objects produce different hashes.
-    For types: enable_auto_mapping only affects variables embedded in the type (e.g., shape expressions).
-
-    Args:
-        node: IR node or type to compute hash for
-        enable_auto_mapping: Whether to ignore variable identity and auto-map variables
-
-    Returns:
-        Hash value of the object structure
+    Bound variables are alpha-renamed. Free variables preserve identity unless
+    enable_auto_mapping is True. Span, function names and bound names are ignored.
+    Compares exact dtype, float bits, operator kind and semantic fields;
+    Storage is included. Unsupported attribute payloads raise StructuralComparisonUnsupported.
+    Always use identical options for hashing and equality.
     """
 
 @overload
-def structural_equal(lhs: IRNode, rhs: IRNode, enable_auto_mapping: bool = False) -> bool: ...
+def structural_equal(
+    lhs: IRNode,
+    rhs: IRNode,
+    enable_auto_mapping: bool = False,
+) -> bool: ...
 @overload
-def structural_equal(lhs: Type, rhs: Type, enable_auto_mapping: bool = False) -> bool: ...
-def structural_equal(lhs: IRNode | Type, rhs: IRNode | Type, enable_auto_mapping: bool = False) -> bool:
-    """Check if two IR nodes or types are structurally equal.
+def structural_equal(
+    lhs: Type,
+    rhs: Type,
+    enable_auto_mapping: bool = False,
+) -> bool: ...
+def structural_equal(
+    lhs: IRNode | Type,
+    rhs: IRNode | Type,
+    enable_auto_mapping: bool = False,
+) -> bool:
+    """Check structural equality under the selected comparison policy.
 
-    Ignores source location (Span). Returns True if objects have identical structure.
-    If enable_auto_mapping=True, automatically map variables (e.g., x+1 equals y+1).
-    If enable_auto_mapping=False (default), variable objects must be exactly the same (not just same name).
-
-    Args:
-        lhs: Left-hand side IR node or type
-        rhs: Right-hand side IR node or type
-        enable_auto_mapping: Whether to automatically map variables
-
-    Returns:
-        True if objects are structurally equal, False otherwise
+    Bound variables are alpha-renamed. Free variables preserve identity unless
+    enable_auto_mapping is True. Span, function names and bound names are ignored.
+    Compares exact dtype, float bits, operator kind and semantic fields;
+    Storage is included. Unsupported attribute payloads raise StructuralComparisonUnsupported.
+    Always use identical options for hashing and equality.
     """
 
 @overload
-def assert_structural_equal(lhs: IRNode, rhs: IRNode, enable_auto_mapping: bool = False) -> None: ...
-@overload
-def assert_structural_equal(lhs: Type, rhs: Type, enable_auto_mapping: bool = False) -> None: ...
 def assert_structural_equal(
-    lhs: IRNode | Type, rhs: IRNode | Type, enable_auto_mapping: bool = False
+    lhs: IRNode,
+    rhs: IRNode,
+    enable_auto_mapping: bool = False,
+) -> None: ...
+@overload
+def assert_structural_equal(
+    lhs: Type,
+    rhs: Type,
+    enable_auto_mapping: bool = False,
+) -> None: ...
+def assert_structural_equal(
+    lhs: IRNode | Type,
+    rhs: IRNode | Type,
+    enable_auto_mapping: bool = False,
 ) -> None:
-    """Assert two IR nodes or types are structurally equal.
+    """Assert structural equality, raising ValueError with the first mismatch path.
 
-    Like structural_equal but raises ValueError with detailed error message showing
-    the first mismatch location and Python-printed IR context. Useful for debugging.
-
-    Ignores source location (Span).
-    If enable_auto_mapping=True, automatically map variables (e.g., x+1 equals y+1).
-    If enable_auto_mapping=False (default), variable objects must be exactly the same (not just same name).
-
-    Args:
-        lhs: Left-hand side IR node or type
-        rhs: Right-hand side IR node or type
-        enable_auto_mapping: Whether to automatically map variables
-
-    Raises:
-        ValueError: If objects are not structurally equal, with detailed diagnostic message
+    Bound variables are alpha-renamed. Free variables preserve identity unless
+    enable_auto_mapping is True. Span, function names and bound names are ignored.
+    Compares exact dtype, float bits, operator kind and semantic fields;
+    Storage is included. Unsupported attribute payloads raise StructuralComparisonUnsupported.
+    Always use identical options for hashing and equality.
     """
 
 def attach_leading_comments(stmt: Stmt, comments: list[str]) -> Stmt:
@@ -3123,6 +3092,7 @@ def create_op_call(
         Exception: If operator is not registered, is internal-only, or type deduction fails
     """
 
+@overload
 def _create_internal_op_call(
     op_name: str,
     args: Sequence[Expr],
@@ -3152,6 +3122,20 @@ def _create_internal_op_call(
 
     Raises:
         Exception: If operator is not registered or type deduction fails
+    """
+
+@overload
+def _create_internal_op_call(
+    op_name: str,
+    args: Sequence[Expr],
+    kwargs: Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue],
+    type: Type,
+    span: Span,
+) -> Call:
+    """Create an internal Buffer call with a validated explicit result descriptor.
+
+    Only operators registered with explicit type validation accept this form.
+    The descriptor is stored in the result type; runtime values stay in args.
     """
 
 def set_call_attrs(call: Call, attrs: Mapping[str, object]) -> Call:
@@ -3251,6 +3235,61 @@ def get_op_memory_spec(op_name: str) -> dict[str, Any] | None:
           consumer demand (e.g. `tile.load`, `tile.create`).
         * ``None`` — no resolver registered for this op.
     """
+
+class OpIRStage(enum.Enum):
+    """Representation consumed and produced by an operator."""
+
+    Functional = ...
+    Buffer = ...
+
+class BufferAccess(enum.Enum):
+    """Access to buffer data or descriptor metadata; absence is explicit."""
+
+    None_ = ...
+    Read = ...
+    Write = ...
+    ReadWrite = ...
+
+class BufferResultBehavior(enum.Enum):
+    """Storage ownership of each actual SSA result."""
+
+    None_ = ...
+    Allocate = ...
+    Alias = ...
+    Borrow = ...
+    Value = ...
+
+class BufferArgEffect:
+    """Explicit data and metadata effects of one buffer-stage operand."""
+
+    @property
+    def data(self) -> BufferAccess:
+        """Access to lane data; Write does not imply full coverage."""
+    @property
+    def metadata(self) -> BufferAccess:
+        """Access to descriptor state, including dynamic valid extents."""
+    @property
+    def non_memory(self) -> bool:
+        """Whether the operand contains only non-memory scalar values."""
+
+class BufferResultSpec:
+    """Storage ownership and alias source of one actual SSA result."""
+
+    @property
+    def behavior(self) -> BufferResultBehavior:
+        """The declared ownership behavior."""
+    @property
+    def alias_arg(self) -> int | None:
+        """Source operand for Alias/Borrow, absent for other behaviors."""
+
+def get_op_ir_stage(op_name: str) -> OpIRStage:
+    """Get the operator's typed representation stage."""
+
+def get_op_buffer_arg_effect(op_name: str, arg_index: int) -> BufferArgEffect:
+    """Get declared buffer data/metadata effects; fail on missing classification."""
+
+def get_op_buffer_result_spec(op_name: str, result_index: int = 0) -> BufferResultSpec:
+    """Get one buffer result's ownership; zero-result ops declare None_ at index 0."""
 
 class ArgEffect(enum.Enum):
     """What executing an operator does to the buffer one argument names."""
@@ -3373,7 +3412,8 @@ def get_op_lane_invariant_arg(op_name: str, arg_index: int) -> LaneInvariantArg 
 def get_op_output_arity(op_name: str) -> int:
     """Number of values an operator produces.
 
-    1 for an ordinary operator; N > 1 for a multi-output operator, whose deduced
+    0 for a buffer operator returning ``VoidType``; 1 for an ordinary operator;
+    N > 1 for a multi-output operator, whose deduced
     result is a ``TupleType`` of exactly N elements. Codegen reads the arity from
     here rather than restating it per emitter.
 
@@ -3390,7 +3430,7 @@ def get_op_output_arity(op_name: str) -> int:
 def op_arg_is_workspace(op_name: str, arg_index: int) -> bool:
     """Whether an argument is compiler-supplied scratch rather than a result.
 
-    A multi-output operator may write through an argument only when that
+    A Functional-stage multi-output operator may write through an argument only when that
     argument is declared a workspace; an undeclared written argument is a
     destination tile leaked into the argument list.
 
@@ -3466,6 +3506,7 @@ class IRBuilder:
         role: Role | None = None,
         attrs: dict[str, Any] | None = None,
         requires_runtime_binding: bool = False,
+        ir_stage: FunctionIRStage = FunctionIRStage.Functional,
     ) -> None:
         """Begin building a function.
 
@@ -3477,6 +3518,7 @@ class IRBuilder:
             role: Function role (default: None)
             attrs: Function-level attributes dict (default: None)
             requires_runtime_binding: True for abstract SubWorkers bound at runtime (default: False)
+            ir_stage: Function body representation (default: Functional)
         """
 
     def func_arg(
@@ -3673,6 +3715,7 @@ class IRBuilder:
         core_num: Expr | None = None,
         sync_start: bool | None = None,
         manual: bool | None = None,
+        attrs: list[tuple[str, Any]] | None = None,
     ) -> None:
         """Begin building a scope statement.
 
@@ -3689,11 +3732,20 @@ class IRBuilder:
                 auto dependency tracking. Must be None for other scope kinds.
         """
 
-    def end_scope(self, end_span: Span) -> ScopeStmt:
+    def end_scope(
+        self,
+        end_span: Span,
+        devices: Sequence[int] = (),
+        slots: Sequence[WindowBuffer] = (),
+        attrs: dict[str, Any] | list[tuple[str, Any]] | None = None,
+    ) -> ScopeStmt:
         """End building a scope statement.
 
         Args:
             end_span: Source location for end of scope
+            devices: Device indices for a communication-domain scope.
+            slots: Window allocations for a communication-domain scope.
+            attrs: Additional metadata resolved after body-local definitions.
 
         Returns:
             The built scope statement

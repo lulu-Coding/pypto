@@ -30,9 +30,9 @@ from pypto.backend import BackendType
 
 @pytest.fixture(autouse=True)
 def _setup_backend():
-    """Configure Ascend910B backend; the MemoryReuse hazard guard needs one."""
+    """Configure Ascend910 backend; the MemoryReuse hazard guard needs one."""
     backend.reset_for_testing()
-    backend.set_backend_type(BackendType.Ascend910B)
+    backend.set_backend_type(BackendType.Ascend910)
     yield
     backend.reset_for_testing()
 
@@ -100,6 +100,33 @@ class TestFoldNoOpReshape:
         After = _run_prereqs_and_fold(Before)
         ExpectedIR = _run_prereqs_only(Expected)
         ir.assert_structural_equal(After, ExpectedIR)
+
+    def test_rank_change_with_same_physical_signature_is_kept(self):
+        """[N] and [1, N] share a PTO signature but require a typed reshape."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                source: pl.Tensor[[64], pl.FP32],
+                output: pl.Out[pl.Tensor[[1, 64], pl.FP32]],
+            ) -> pl.Tensor[[1, 64], pl.FP32]:
+                tile_a: pl.Tile[[64], pl.FP32, pl.MemRef("shared", 0, 256), pl.MemorySpace.Vec] = (
+                    pl.tile.load(source, [0], [64])
+                )
+                tile_b: pl.Tile[[1, 64], pl.FP32, pl.MemRef("shared", 0, 256), pl.MemorySpace.Vec] = (
+                    pl.tile.reshape(tile_a, [1, 64])
+                )
+                result = pl.tile.store(tile_b, [0, 0], output)
+                return result
+
+        after = passes.fold_no_op_reshape()(Before)
+        ir.assert_structural_equal(after, Before)
+        props = passes.IRPropertySet()
+        props.insert(passes.IRProperty.AssignTypeSymmetry)
+        diagnostics = passes.PropertyVerifierRegistry.verify(props, after)
+        assert not diagnostics, [d.message for d in diagnostics]
 
     def test_genuine_reshape_kept(self):
         """A reshape that changes physical shape must NOT be folded."""

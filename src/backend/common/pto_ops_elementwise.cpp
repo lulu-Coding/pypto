@@ -30,6 +30,7 @@
 #include "pypto/backend/common/backend_handler.h"
 #include "pypto/codegen/codegen_base.h"
 #include "pypto/codegen/pto/pto_codegen.h"
+#include "pypto/codegen/pto/pto_type_utils.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/cast_saturation.h"
@@ -65,8 +66,8 @@ using pto_ops_detail::EnsureTileViewSsa;
 using pto_ops_detail::GenerateInsOutsClause;
 using pto_ops_detail::GetTileViewTypeAnnotation;
 using pto_ops_detail::MaterializeSubviewOperandIfNeeded;
+using pto_ops_detail::MutableTileViewShape;
 using pto_ops_detail::RequireStaticValidShapeForPtoas;
-using pto_ops_detail::round_modes;
 
 /// Operators whose PTOAS lowering walks every operand and the result as one flat
 /// run of elements. A `col_major` operand reaching such an op is read with the
@@ -184,7 +185,6 @@ static const std::unordered_set<std::string_view>& LayoutAwareOps() {
       "tile.row_expand_expdif",
       // Padding writes the tile's physical edge.
       "tile.fillpad",
-      "tile.fillpad_inplace",
       // Fractal / window / index addressed.
       "tile.matmul",
       "tile.matmul_mx",
@@ -304,13 +304,6 @@ static std::string MakeGemvCodegenPTO(const std::string& pto_op_name, size_t ari
   return "";
 }
 
-static std::string MakeTileSelCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
-  auto& codegen = AsPto(codegen_base);
-  CheckArity(op, "pto.tsel", 4);
-  codegen.Emit("pto.tsel " + GenerateInsOutsClause(op, codegen));
-  return "";
-}
-
 // pto.ttrans ins(%src, %tmp : tile_type, tile_type). IR form: tile.transpose(src, axis0, axis1, tmp).
 // tmp is pre-allocated by an IR-level tile.create so the memory allocator gives it a real UB
 // address before codegen (required at --pto-level=level3).
@@ -378,6 +371,37 @@ static std::string MakeModalCodegenPTO(const std::string& pto_op_name, size_t ar
   return "";
 }
 
+// Shared gate for tile.cmp / tile.cmps. Both lower onto pto-isa's `GenCmpCall`,
+// which on A2/A3 short-circuits an int32 source onto `vcmpvs_eq` / `vcmpv_eq`
+// and DISCARDS the requested mode -- an ordering compare then returns an
+// equality mask with no diagnostic anywhere (pto-isa issue #321). Reject the
+// pairing here so the user gets an error instead of wrong data.
+static std::string MakeCmpCodegenPTO(const std::string& pto_op_name, const CallPtr& op,
+                                     codegen::CodegenBase& codegen_base) {
+  auto& codegen = AsPto(codegen_base);
+  CheckArity(op, pto_op_name, 2);
+  // cmp_modes is {eq, ne, lt, le, gt, ge}; indices 2..5 are the ordering forms.
+  // eq is the instruction actually issued and ne is eq plus TCmps' vnot
+  // fix-up, so both stay correct for every dtype the ISA admits.
+  constexpr int kFirstOrderingMode = 2;
+  const int mode = op->GetKwarg<int>("cmp_type");
+  if (mode >= kFirstOrderingMode) {
+    auto src_type = As<ir::TileType>(op->args_[0]->GetType());
+    INTERNAL_CHECK_SPAN(src_type, op->span_)
+        << "Internal error: " << pto_op_name << " requires a TileType first operand";
+    const auto* handler = codegen.GetBackendHandler();
+    CHECK_SPAN(handler->SupportsOrderingCompareDataType(src_type->dtype_), op->span_)
+        << pto_op_name << " cannot evaluate an ordering comparison (cmp_type " << kFirstOrderingMode
+        << "-5: lt/le/gt/ge) on " << src_type->dtype_.ToString() << " values for target arch '"
+        << handler->GetPtoTargetArch()
+        << "', which has no ordering compare for that element type and would silently produce an "
+           "EQUALITY mask instead. Use cmp_type=0 (eq) or cmp_type=1 (ne), or cast the source to "
+           "FP32 with tile.cast first (exact for |value| < 2^24)";
+  }
+  return MakeModalCodegenPTO(pto_op_name, 2, "cmp_type", cmp_modes, "Tile cmp", "cmpMode", "cmp", op,
+                             codegen_base);
+}
+
 // Emit the default PTO form without an explicit precision attribute, or append
 // the exact PTOAS enum attribute after outs(...) for high-precision mode.
 // Unlike cmp/cvt attributes, precision-op assembly formats place their
@@ -393,59 +417,9 @@ static std::string MakePrecisionCodegenPTO(const std::string& pto_op_name, size_
     code += " {precisionType = #pto<";
     code += attr_kind;
     code += " high_precision>}";
+    codegen.WarnIfHighPrecisionIgnored(op->op_->name_, pto_op_name, op->span_);
   }
   codegen.Emit(code);
-  return "";
-}
-
-// The level3 explicit-tmp form verifies tcvt scratch against src capacity and
-// dst valid_shape. alloc_tile types keep v_row=?, v_col=?, so bridge to
-// static-valid views the same way tprelu / tcolsum do.
-//
-// Both forms carry the same config attr-dict, so the rounding mode and the
-// destination saturation are rendered once, before the form splits. The IR
-// records only a deviation from the destination's default, so the default is
-// read through here -- an integer destination emits an explicit `satmode` even
-// when the cast said nothing, while a float destination emits none and keeps the
-// target's own IEEE overflow behavior.
-static std::string MakeTcvtCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
-  auto& codegen = AsPto(codegen_base);
-  INTERNAL_CHECK_SPAN(op->args_.size() == 1 || op->args_.size() == 2, op->span_)
-      << "tile.cast requires 1 or 2 arguments (src[, tmp]), but got " << op->args_.size();
-
-  const int mode = op->GetKwarg<int>("mode");
-  INTERNAL_CHECK_SPAN(mode >= 0 && mode < static_cast<int>(round_modes.size()), op->span_)
-      << "Internal error: tile.cast round mode out of range: " << mode;
-  std::string config_attr = "{rmode = #pto<round_mode " + round_modes.at(mode) + ">";
-  if (const auto saturation_mode = ir::GetSaturationMode(op)) {
-    INTERNAL_CHECK_SPAN(ir::IsValidSaturationMode(*saturation_mode), op->span_)
-        << "Internal error: tile.cast saturation_mode out of range: " << *saturation_mode;
-    config_attr +=
-        ", satmode = #pto<saturation_mode " + ir::SaturationModeToPTOString(*saturation_mode) + ">";
-  }
-  config_attr += "}";
-
-  if (op->args_.size() == 2 && codegen.GetBackendHandler()->RequiresLevel3TmpScratch()) {
-    auto src_type = ir::As<ir::TileType>(op->args_[0]->GetType());
-    auto tmp_type = ir::As<ir::TileType>(op->args_[1]->GetType());
-    auto dst_var = codegen.GetCurrentResultVar();
-    auto dst_type = dst_var ? ir::As<ir::TileType>(dst_var->GetType()) : nullptr;
-    INTERNAL_CHECK(src_type && tmp_type && dst_type);
-    RequireStaticValidShapeForPtoas(src_type, "tile.cast", "src", op->span_);
-    RequireStaticValidShapeForPtoas(tmp_type, "tile.cast", "tmp", op->args_[1]->span_);
-    RequireStaticValidShapeForPtoas(dst_type, "tile.cast", "dst", op->span_);
-
-    const std::string src_ssa = EnsureStaticViewTileSsa(op->args_[0], codegen, "tcvt_src_view");
-    const std::string tmp_ssa = EnsureStaticViewTileSsa(op->args_[1], codegen, "tcvt_tmp_view");
-    const std::string dst_ssa = EnsureStaticViewTileSsa(dst_var, codegen, "tcvt_dst_view");
-
-    EmitInsOutsWithViewTypes(codegen, "pto.tcvt",
-                             {{src_ssa, GetTileViewTypeAnnotation(op->args_[0], codegen)},
-                              {tmp_ssa, GetTileViewTypeAnnotation(op->args_[1], codegen)}},
-                             dst_ssa, dst_type, config_attr);
-    return "";
-  }
-  codegen.Emit("pto.tcvt " + GenerateInsOutsClause(op, codegen, config_attr));
   return "";
 }
 
@@ -556,9 +530,22 @@ static std::string MakeRemainderCodegenPTO(const std::string& pto_op_name, size_
     const std::string rhs_fp32 =
         EnsureTileViewSsa(op->args_[1], rhs_fp32_type, codegen, "trem_rhs_fp32_view");
     const std::string rhs_int32 = EnsureStaticViewTileSsa(op->args_[1], codegen, "trem_rhs_int32_view");
-    EmitInsOutsWithViewTypes(codegen, "pto.tcvt",
-                             {{rhs_fp32, codegen.GetViewTileBufTypeStringFromTileType(rhs_fp32_type)}},
-                             rhs_int32, rhs_type, "{rmode = #pto<round_mode ROUND>}");
+    // `satmode` is stamped for the same reason `tile.cast` stamps it (see
+    // MakeTcvtCodegenPTO): PTOAS v0.63 flipped its default for an omitted attribute
+    // from OFF to ON, so leaving it out hands the decision to the assembler release.
+    // This arm only runs for an INT32 `tile.rem`, whose operands share a dtype, so
+    // the destination is INT32 and resolves to ON -- which is also what this restore
+    // wants: an `|rhs|` above 2^24 already lost precision on the way into FP32, and
+    // INT32_MAX rounds up to 2^31, which is out of range. Clamping puts it back at
+    // INT32_MAX; the non-saturating result there is architecture-defined.
+    INTERNAL_CHECK_SPAN(rhs_type->dtype_ == DataType::INT32, op->span_)
+        << "Internal error: A2/A3 INT32 tile.rem rhs must be INT32, got " << rhs_type->dtype_.ToString();
+    const std::string satmode =
+        ir::SaturationModeToPTOString(static_cast<int>(ir::EmittedSaturationModeFor(rhs_type->dtype_)));
+    EmitInsOutsWithViewTypes(
+        codegen, "pto.tcvt", {{rhs_fp32, codegen.GetViewTileBufTypeStringFromTileType(rhs_fp32_type)}},
+        rhs_int32, rhs_type,
+        "{rmode = #pto<round_mode ROUND>, satmode = #pto<saturation_mode " + satmode + ">}");
   }
   return result;
 }
@@ -674,10 +661,12 @@ static std::string MakeGatherbCodegenPTO(const CallPtr& op, codegen::CodegenBase
   INTERNAL_CHECK(src_type) << "tile.gatherb src must be a TileType";
   const std::string src_ssa = codegen.GetExprAsCode(op->args_[0]);
   if (const auto* subview = codegen.GetSubviewMaterialization(src_ssa)) {
+    // Covers the whole address: the source's placed base plus the slice offset.
+    // The view's own MemRef address may be symbolic (a runtime row), so it is not
+    // re-checked below.
     CHECK_SPAN(subview->byte_offset_mod_32 == 0, op->span_)
         << "tile.gatherb source subview byte offset must be provably 32-byte aligned";
-  }
-  if (src_type->memref_.has_value()) {
+  } else if (src_type->memref_.has_value()) {
     auto byte_offset = As<ir::ConstInt>((*src_type->memref_)->byte_offset_);
     CHECK_SPAN(byte_offset, op->span_)
         << "tile.gatherb source base byte offset must be statically known and 32-byte aligned";
@@ -754,49 +743,6 @@ static std::string MakePrintCodegenPTO(const std::string& pto_op_name, const Cal
   std::string src = codegen.GetExprAsCode(op->args_[0]);
   codegen.Emit(pto_op_name + " ins(" + src + " | !pto.partition_tensor_view<MxNxdtype>)");
   return "";
-}
-
-static std::string MakeSelsCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
-  auto& codegen = AsPto(codegen_base);
-  CheckArity(op, "pto.tsels", 4);
-  auto mask_type = As<ir::TileType>(op->args_[0]->GetType());
-  auto src_type = As<ir::TileType>(op->args_[1]->GetType());
-  auto tmp_type = As<ir::TileType>(op->args_[2]->GetType());
-  INTERNAL_CHECK(mask_type && src_type && tmp_type);
-  const auto* handler = codegen.GetBackendHandler();
-  const bool is_a5 = handler->GetPtoTargetArch() == "a5";
-  const auto dtype = src_type->dtype_;
-  const bool supported_on_a2a3 = dtype == DataType::INT16 || dtype == DataType::UINT16 ||
-                                 dtype == DataType::INT32 || dtype == DataType::UINT32 ||
-                                 dtype == DataType::FP16 || dtype == DataType::FP32;
-  CHECK_SPAN(supported_on_a2a3 || is_a5, op->span_)
-      << "tile.sels with integer src dtype " << src_type->dtype_.ToString()
-      << " is only supported on the 'a5' backend; A2/A3 supports 16/32-bit integers, FP16, and FP32";
-
-  auto dst_var = codegen.GetCurrentResultVar();
-  INTERNAL_CHECK_SPAN(dst_var, op->span_) << "Internal error: tile.sels requires an assignment target";
-  auto dst_type = As<ir::TileType>(dst_var->GetType());
-  INTERNAL_CHECK_SPAN(dst_type, op->span_) << "Internal error: tile.sels result must be a TileType";
-
-  std::vector<std::pair<std::string_view, std::shared_ptr<const ir::TileType>>> operands = {
-      {"mask", mask_type}, {"src", src_type}, {"tmp", tmp_type}, {"dst", dst_type}};
-  std::vector<std::pair<std::string_view, ir::MemRefPtr>> regions;
-  regions.reserve(operands.size());
-  for (const auto& [name, type] : operands) {
-    INTERNAL_CHECK_SPAN(type->memref_.has_value(), op->span_)
-        << "Internal error: tile.sels " << name << " must carry a MemRef before PTO codegen";
-    regions.emplace_back(name, *type->memref_);
-  }
-  CHECK_SPAN(!ir::MemRef::MayAlias(regions[0].second, regions[3].second), op->span_)
-      << "tile.sels requires mask and dst to use non-overlapping memory regions";
-  if (!is_a5) {
-    for (const size_t other : {size_t{0}, size_t{1}}) {
-      CHECK_SPAN(!ir::MemRef::MayAlias(regions[2].second, regions[other].second), op->span_)
-          << "tile.sels on A2/A3 requires tmp not to overlap mask or src, but tmp overlaps "
-          << regions[other].first;
-    }
-  }
-  return MakeNaryCodegenPTO("pto.tsels", 4, op, codegen_base);
 }
 
 static std::string MakePreluCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
@@ -976,8 +922,6 @@ static const SimpleOpEntry kSimpleOps[] = {
     {"tile.row_expand_expdif", "pto.trowexpandexpdif", 2},
     // Padding operations
     {"tile.fillpad",         "pto.tfillpad",         1},
-    // Inplace variant: set_output_reuses_input(0) makes src/dst share UB addr.
-    {"tile.fillpad_inplace", "pto.tfillpad",         1},
     // Matrix multiplication operations (PipeType::M → CUBE/AIC core)
     {"tile.matmul",          "pto.tmatmul",          2},
     {"tile.matmul_mx",       "pto.tmatmul.mx",       4},
@@ -1051,15 +995,6 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
     reg_entry.set_output_layout(ir::TileLayout::row_major);
   }
 
-  if (exclude_ops.count("tile.sels") == 0) {
-    auto entry = backend.RegisterOp("tile.sels");
-    entry.f_codegen(MakeSelsCodegenPTO);
-    for (size_t i = 0; i < 4; ++i) {
-      entry.set_input_layout(i, ir::TileLayout::row_major);
-    }
-    entry.set_output_layout(ir::TileLayout::row_major);
-  }
-
   if (exclude_ops.count("tile.prelu") == 0) {
     auto entry = backend.RegisterOp("tile.prelu");
     entry.f_codegen(MakePreluCodegenPTO);
@@ -1074,6 +1009,35 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
     if (exclude_ops.count(op_name) > 0) return;
     backend.RegisterOp(op_name).f_codegen(std::move(fn));
   };
+
+  reg("tile.fillpad_inplace", [](const CallPtr& op, codegen::CodegenBase& codegen_base) {
+    auto& codegen = AsPto(codegen_base);
+    CheckArity(op, "pto.tfillpad", 1);
+    if (!codegen.EmitTileAddr()) {
+      const auto& result_var = codegen.GetCurrentResultVar();
+      INTERNAL_CHECK_SPAN(result_var, op->span_)
+          << "Internal error: tile.fillpad_inplace requires a result variable";
+      auto result_type = As<ir::TileType>(result_var->GetType());
+      INTERNAL_CHECK_SPAN(result_type, op->span_)
+          << "Internal error: tile.fillpad_inplace requires a TileType result";
+      // Filling reads the source's original extent and makes the entire result
+      // valid. Preserve that distinction even when both use the same pad mode.
+      // Local allocations support later validity updates; subviews and loop-
+      // carried values keep their existing static-valid view lowering.
+      const std::string src = codegen.GetExprAsCode(op->args_[0]);
+      std::optional<MutableTileViewShape> valid_shape;
+      if (codegen.IsMutableTileName(src)) {
+        const auto dims =
+            codegen::ExtractTileTypeInfo(*result_type, codegen.GetTypeString(result_type->dtype_));
+        valid_shape = MutableTileViewShape{codegen.GetOrEmitConstant(dims.rows, DataType::INDEX),
+                                           codegen.GetOrEmitConstant(dims.cols, DataType::INDEX)};
+      }
+      codegen.SetCurrentResultBuf(
+          EnsureTileViewSsa(op->args_[0], result_type, codegen, "fillpad_dst_view", valid_shape));
+    }
+    codegen.Emit("pto.tfillpad " + GenerateInsOutsClause(op, codegen));
+    return std::string("");
+  });
 
   auto register_precision_op = [&](const char* op_name, const char* pto_op_name, size_t arity,
                                    const char* attr_kind) {
@@ -1164,18 +1128,6 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
     return MakeTileTransposeCodegenPTO(op, codegen);
   });
 
-  if (exclude_ops.count("tile.sel") == 0) {
-    backend.RegisterOp("tile.sel")
-        .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
-          return MakeTileSelCodegenPTO(op, codegen);
-        })
-        .set_input_layout(0, ir::TileLayout::row_major)
-        .set_input_layout(1, ir::TileLayout::row_major)
-        .set_input_layout(2, ir::TileLayout::row_major)
-        .set_input_layout(3, ir::TileLayout::row_major)
-        .set_output_layout(ir::TileLayout::row_major);
-  }
-
   reg("tile.col_expand", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
     return MakeSingleOperandCodegenPTO({"tile.col_expand", "pto.tcolexpand", 1, ""}, op, codegen);
   });
@@ -1194,22 +1146,10 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
   if (exclude_ops.count("tile.cmp") == 0) {
     backend.RegisterOp("tile.cmp")
         .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
-          return MakeModalCodegenPTO("pto.tcmp", 2, "cmp_type", cmp_modes, "Tile cmp", "cmpMode", "cmp", op,
-                                     codegen);
+          return MakeCmpCodegenPTO("pto.tcmp", op, codegen);
         })
         .set_input_layout(0, ir::TileLayout::row_major)
         .set_input_layout(1, ir::TileLayout::row_major)
-        .set_output_layout(ir::TileLayout::row_major);
-  }
-
-  // tile.cast (TCVT): pto.tcvt mis-orders elements on a col_major source, so per
-  // ISA the input and output must be row_major (see #1549).
-  if (exclude_ops.count("tile.cast") == 0) {
-    backend.RegisterOp("tile.cast")
-        .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
-          return MakeTcvtCodegenPTO(op, codegen);
-        })
-        .set_input_layout(0, ir::TileLayout::row_major)
         .set_output_layout(ir::TileLayout::row_major);
   }
 
@@ -1276,8 +1216,7 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
   if (exclude_ops.count("tile.cmps") == 0) {
     backend.RegisterOp("tile.cmps")
         .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
-          return MakeModalCodegenPTO("pto.tcmps", 2, "cmp_type", cmp_modes, "Tile cmp", "cmpMode", "cmp", op,
-                                     codegen);
+          return MakeCmpCodegenPTO("pto.tcmps", op, codegen);
         })
         .set_input_layout(0, ir::TileLayout::row_major)
         .set_output_layout(ir::TileLayout::row_major);

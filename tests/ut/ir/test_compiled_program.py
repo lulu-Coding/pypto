@@ -17,11 +17,13 @@ import pathlib
 import sys
 import types
 import warnings
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 from pypto import DataType, backend, ir
+from pypto._artifact_contract import ArtifactExecutionMode, ExecutionCapabilities
 from pypto.backend import BackendType
 from pypto.ir.compiled_program import (
     _COMPILED_META_FILENAME,
@@ -29,12 +31,17 @@ from pypto.ir.compiled_program import (
     CompiledProgram,
     _build_full_args,
     _extract_param_infos,
+    _param_info_from_dict,
+    _param_info_to_dict,
+    _validate_device_tensor,
+    _validate_stacked_tensor,
 )
 from pypto.ir.distributed_compiled_program import (
     _DISTRIBUTED_META_FILENAME,
     DistributedCompiledProgram,
 )
-from pypto.runtime import DeviceTensor, RunConfig
+from pypto.ir.param_info import _ParamInfo, bind_complete_args
+from pypto.runtime import DeviceTensor, ExecutionMode, RunConfig, StackedDeviceTensor
 
 
 @contextlib.contextmanager
@@ -471,10 +478,19 @@ class TestCompileReturnsCompiledProgram:
         # Metadata works on the original program
         assert result.param_names == ["a", "b", "c"]
 
-    def test_compile_platform_selects_codegen_backend(self, tmp_path):
+    @pytest.mark.parametrize("arch_name", ["a2a3", "a5"])
+    @pytest.mark.parametrize("mode_name", ["SIM", "ONBOARD"])
+    @pytest.mark.parametrize("legacy", [True, False])
+    def test_compile_platform_selects_codegen_backend(self, tmp_path, arch_name, mode_name, legacy):
         """platform='a5sim' should compile with the Ascend950 PTO backend."""
         import pypto.language as pl  # noqa: PLC0415
 
+        target = BackendType.Ascend950 if arch_name == "a5" else BackendType.Ascend910
+        mode = ExecutionMode[mode_name]
+        platform = arch_name + ("sim" if mode is ExecutionMode.SIM else "")
+        options: dict[str, Any] = (
+            {"platform": platform} if legacy else {"backend_type": target, "execution_mode": mode}
+        )
         backend.reset_for_testing()
         try:
 
@@ -498,15 +514,16 @@ class TestCompileReturnsCompiledProgram:
                 output_dir=output_dir,
                 dump_passes=False,
                 skip_ptoas=True,
-                platform="a5sim",
+                **options,
             )
 
             pto_files = list(result.output_dir.rglob("*.pto"))
             assert isinstance(result, CompiledProgram)
-            assert result.backend_type == BackendType.Ascend950
-            assert result.platform == "a5sim"
+            assert result.backend_type == target
+            assert result.platform == platform
+            assert result.execution_mode is mode
             assert pto_files
-            assert 'pto.target_arch = "a5"' in pto_files[0].read_text()
+            assert f'pto.target_arch = "{arch_name}"' in pto_files[0].read_text()
         finally:
             backend.reset_for_testing()
 
@@ -815,7 +832,7 @@ class TestCompiledProgramExtraction:
         assert orch_args == "fake_orch_args"
         assert coerced == [a, b, c]
         assert return_style is False
-        oa_helper.assert_called_once_with([a, b, c], worker)
+        oa_helper.assert_called_once_with([a, b, c], worker, ())
 
     def test_build_orch_args_return_style_allocates_output(self, tmp_path):
         """Return-style: only inputs passed; output auto-allocated at output_indices."""
@@ -1022,7 +1039,7 @@ class TestSubChipCallableExtraction:
         assert orch_args == "fake_orch_args"
         assert coerced == [a, b, c]
         assert return_style is False
-        oa_helper.assert_called_once_with([a, b, c], worker)
+        oa_helper.assert_called_once_with([a, b, c], worker, ())
 
     def test_load_after_first_access_is_noop(self, tmp_path):
         sub = self._make_subchip(tmp_path)
@@ -1093,7 +1110,24 @@ class TestCompiledMetaAndFromDir:
         assert {p["dtype"] for p in meta["params"]} == {"fp32"}
         assert meta["num_return_types"] == 1
         assert meta["platform"] == "a2a3sim"
-        assert meta["backend_type"] == "Ascend910B"
+        assert meta["backend_type"] == "Ascend910"
+
+    @pytest.mark.parametrize("backend_name", ["Ascend910", "Ascend910B"])
+    def test_from_dir_accepts_ascend910_backend_names(self, tmp_path, backend_name):
+        """Reload artifacts written before the rename without changing their metadata."""
+        CompiledProgram(_make_program_with_orchestration(), str(tmp_path), platform="a2a3sim")
+        meta_path = tmp_path / _COMPILED_META_FILENAME
+        meta = json.loads(meta_path.read_text())
+        meta["backend_type"] = backend_name
+        meta_path.write_text(json.dumps(meta))
+        persisted = meta_path.read_bytes()
+
+        reloaded = CompiledProgram.from_dir(tmp_path)
+
+        assert reloaded.backend_type is BackendType.Ascend910
+        assert reloaded.backend_type.name == "Ascend910"
+        assert reloaded.platform == "a2a3sim"
+        assert meta_path.read_bytes() == persisted
 
     def test_from_dir_round_trips_param_metadata(self, tmp_path):
         """from_dir reconstructs the same param metadata as the live compile."""
@@ -1108,7 +1142,7 @@ class TestCompiledMetaAndFromDir:
         assert _key(reloaded) == _key(live)
         assert reloaded.program is None  # reconstructed from disk, no live IR
         assert reloaded.platform == "a2a3sim"
-        assert reloaded.backend_type == BackendType.Ascend910B
+        assert reloaded.backend_type == BackendType.Ascend910
         assert reloaded.has_return is live.has_return
 
     def test_from_dir_output_indices_match_out_params(self, tmp_path):
@@ -1162,7 +1196,7 @@ class TestCompiledMetaAndFromDir:
             with patch("pypto.runtime.runner._coerced_to_orch_args") as oa_helper:
                 oa_helper.return_value = "fake_orch_args"
                 orch_args, coerced, return_style = reloaded._build_orch_args(*args, worker=worker)
-                oa_helper.assert_called_once_with(args, worker)
+                oa_helper.assert_called_once_with(args, worker, ())
             with _fake_call_config(call_config):
                 assert reloaded._build_call_config(RunConfig()) is call_config
 
@@ -1195,11 +1229,11 @@ class TestCompiledMetaAndFromDir:
     def test_from_dir_overrides_platform_and_backend(self, tmp_path):
         """Explicit platform / backend_type override the persisted defaults.
 
-        Both overrides differ from what was persisted (``a2a3sim`` / Ascend910B),
+        Both overrides differ from what was persisted (``a2a3sim`` / Ascend910),
         so an ignored override cannot pass by coincidence.
         """
         CompiledProgram(_make_program_with_orchestration(), str(tmp_path), platform="a2a3sim")
-        assert json.loads((tmp_path / _COMPILED_META_FILENAME).read_text())["backend_type"] == "Ascend910B"
+        assert json.loads((tmp_path / _COMPILED_META_FILENAME).read_text())["backend_type"] == "Ascend910"
 
         reloaded = CompiledProgram.from_dir(tmp_path, platform="a5sim", backend_type=BackendType.Ascend950)
         assert reloaded.platform == "a5sim"
@@ -1208,7 +1242,7 @@ class TestCompiledMetaAndFromDir:
         # Without overrides the persisted pair comes back unchanged.
         persisted = CompiledProgram.from_dir(tmp_path)
         assert persisted.platform == "a2a3sim"
-        assert persisted.backend_type == BackendType.Ascend910B
+        assert persisted.backend_type == BackendType.Ascend910
 
     def test_from_dir_keeps_the_fp4_x2_carrier_shape(self, tmp_path):
         """Packed FP4 shapes are persisted already converted, so the reload must not re-halve.
@@ -1574,6 +1608,224 @@ class TestCompiledMetaOutputDirReuse:
         """The atomic write leaves no ``.tmp`` residue next to the sidecar."""
         CompiledProgram(_make_program_with_orchestration(), str(tmp_path))
         assert not list(tmp_path.glob("*.tmp"))
+
+
+@pytest.mark.parametrize("count", [0, 1, 2, 4])
+def test_complete_binding_requires_out_and_inout_without_allocation(count):
+    infos, _, _ = _extract_param_infos(_make_program_with_inout())
+    args = tuple(object() for _ in range(count))
+    with patch("torch.zeros") as allocate:
+        with pytest.raises(TypeError, match="including all Out/InOut"):
+            bind_complete_args(args, infos, caller_name="complete call")
+    allocate.assert_not_called()
+
+
+def test_complete_binding_preserves_aliases_and_runtime_scalar_values():
+    infos, _, _ = _extract_param_infos(_make_program_with_scalar())
+    tensor = torch.ones(128, 128)
+    for value in (3, 9):
+        bound = bind_complete_args((tensor, value, tensor), infos, caller_name="complete call")
+        assert bound[0] is tensor and bound[2] is tensor
+        assert bound[1] == value
+
+
+def test_execution_capabilities_round_trip_without_runtime(tmp_path):
+    program = _make_program_with_orchestration(has_return=True)
+    with _fake_compile_and_assemble(None) as assemble:
+        compiled = CompiledProgram(program, str(tmp_path))
+        restored = CompiledProgram.from_dir(tmp_path)
+        assert compiled.program is program
+        assert restored.execution_capabilities == compiled.execution_capabilities == ExecutionCapabilities()
+        assert restored.has_return == compiled.has_return
+        with pytest.raises(ValueError, match="requires 'kernel'"):
+            restored.execution_capabilities.require(ArtifactExecutionMode.KERNEL)
+    assemble.assert_not_called()
+    meta = json.loads((tmp_path / _COMPILED_META_FILENAME).read_text())
+    assert meta["supported_execution_modes"] == ["program"]
+
+
+@pytest.mark.parametrize(
+    "modes", [None, [], "program", [True], ["unknown"], ["program", "program"], ["kernel"]]
+)
+def test_from_dir_rejects_invalid_or_incompatible_capabilities(tmp_path, modes):
+    CompiledProgram(_make_program_with_orchestration(), str(tmp_path))
+    path = tmp_path / _COMPILED_META_FILENAME
+    meta = json.loads(path.read_text())
+    meta["supported_execution_modes"] = modes
+    path.write_text(json.dumps(meta))
+    with _fake_compile_and_assemble(None) as assemble:
+        with pytest.raises(ValueError, match="recompile"):
+            CompiledProgram.from_dir(tmp_path)
+    assemble.assert_not_called()
+
+
+def test_from_dir_rejects_legacy_metadata_instead_of_guessing_capabilities(tmp_path):
+    CompiledProgram(_make_program_with_orchestration(), str(tmp_path))
+    path = tmp_path / _COMPILED_META_FILENAME
+    meta = json.loads(path.read_text())
+    meta["schema"] = 1
+    del meta["supported_execution_modes"]
+    path.write_text(json.dumps(meta))
+    with pytest.raises(ValueError, match="Incompatible.*schema.*recompile"):
+        CompiledProgram.from_dir(tmp_path)
+
+
+def test_multi_orchestration_preserves_capabilities_in_children_and_reload(tmp_path):
+    for name in ("orch_a", "orch_b"):
+        (tmp_path / "next_levels" / name / "orchestration").mkdir(parents=True)
+    compiled = CompiledProgram(_make_multi_orch_program(), str(tmp_path))
+    for name in compiled.orchestration_names:
+        child = compiled[name]
+        restored = CompiledProgram.from_dir(child.output_dir)
+        assert child.execution_capabilities == compiled.execution_capabilities
+        assert restored.execution_capabilities == child.execution_capabilities
+        assert restored.param_names == child.param_names
+
+
+@pytest.mark.parametrize(
+    "dtype,torch_dtype,c0", [(DataType.INT8, torch.int8, 32), (DataType.FP16, torch.float16, 16)]
+)
+def test_nz_device_tensor_shape_and_sidecar_round_trip(dtype, torch_dtype, c0):
+    """Logical resident shapes remain valid after serializing blocked metadata."""
+    info = _ParamInfo("w", ir.ParamDirection.In, [8, 512 // c0, 16, 16, c0], dtype, "NZ")
+    restored = _param_info_from_dict(json.loads(json.dumps(_param_info_to_dict(info))))
+    assert restored == info
+    arg = DeviceTensor(0x1000, (2, 4, 256, 512), torch_dtype)
+    assert _validate_device_tensor(arg, restored) is None
+    shards = [DeviceTensor(0x1000 + i * 0x100000, (4, 256, 512), torch_dtype) for i in range(2)]
+    stacked = StackedDeviceTensor(shards, (2, 4, 256, 512), [0, 1])
+    assert _validate_stacked_tensor(stacked, restored) is None
+    wrong_shape = DeviceTensor(0x1000, (2, 3, 256, 512), torch_dtype)
+    with pytest.raises(TypeError, match="expects shape"):
+        _validate_device_tensor(wrong_shape, restored)
+    unaligned = DeviceTensor(0x1000, (2, 4, 255, 512), torch_dtype)
+    with pytest.raises(TypeError, match="expects rank"):
+        _validate_device_tensor(unaligned, restored)
+
+
+@pytest.mark.parametrize("stacked", [False, True])
+@pytest.mark.parametrize("reload_metadata", [False, True])
+def test_dynamic_batch_nz_validation_requires_logical_rank_three(stacked, reload_metadata):
+    """Entry code reads B from shapes[0], so blocking must not erase a rank mismatch."""
+    info = _ParamInfo("w", ir.ParamDirection.In, [-1, 16, 16, 16, 32], DataType.INT8, "NZ")
+    if reload_metadata:
+        info = _param_info_from_dict(json.loads(json.dumps(_param_info_to_dict(info))))
+
+    def validate(shape):
+        if stacked:
+            shards = [DeviceTensor(0x1000 + i * 0x100000, shape[1:], torch.int8) for i in range(shape[0])]
+            arg = StackedDeviceTensor(shards, shape, list(range(shape[0])))
+            return _validate_stacked_tensor(arg, info)
+        return _validate_device_tensor(DeviceTensor(0x1000, shape, torch.int8), info)
+
+    for shape in [(1, 256, 512), (8, 256, 512)]:
+        assert validate(shape) is None
+    for shape in [(256, 512), (2, 4, 256, 512)]:
+        with pytest.raises(TypeError, match="logical rank 3"):
+            validate(shape)
+    with pytest.raises(TypeError, match="expects shape"):
+        validate((8, 512, 512))
+
+
+def test_nz_param_layout_is_extracted_from_compiled_ir(tmp_path):
+    """Live and reloaded artifacts retain the NZ layout needed by argument binding."""
+    span = ir.Span.unknown()
+    tensor_type = ir.TensorType(
+        [8, 16, 16, 16, 32], DataType.INT8, None, ir.TensorView(layout=ir.TensorLayout.NZ)
+    )
+    param = ir.Var("w", tensor_type, span)
+    func = ir.Function("main", [param], [], ir.ReturnStmt([], span), span, ir.FunctionType.Orchestration)
+    live = CompiledProgram(ir.Program([func], "Nz", span), str(tmp_path), platform="a2a3sim")
+    restored = CompiledProgram.from_dir(tmp_path)
+    for cp in (live, restored):
+        infos, _, _ = cp._get_metadata()
+        assert infos[0].layout == "NZ"
+        assert _validate_device_tensor(DeviceTensor(0x1000, (2, 4, 256, 512), torch.int8), infos[0]) is None
+
+
+def test_legacy_parameter_metadata_keeps_nd_shape_validation():
+    info = _ParamInfo("w", ir.ParamDirection.In, [256, 512], DataType.INT8)
+    payload = _param_info_to_dict(info)
+    del payload["layout"]
+    restored = _param_info_from_dict(payload)
+    assert restored.layout is None
+    assert _validate_device_tensor(DeviceTensor(0x1000, (256, 512), torch.int8), restored) is None
+    with pytest.raises(TypeError, match="expects rank"):
+        _validate_device_tensor(DeviceTensor(0x1000, (1, 16, 16, 16, 32), torch.int8), restored)
+
+
+@pytest.mark.parametrize("layout", [0, [], {}])
+def test_parameter_metadata_rejects_non_string_layout(layout):
+    payload = _param_info_to_dict(_ParamInfo("w", ir.ParamDirection.In, [256, 512], DataType.INT8))
+    payload["layout"] = layout
+    with pytest.raises(ValueError, match="layout"):
+        _param_info_from_dict(payload)
+
+
+@pytest.mark.filterwarnings("error::DeprecationWarning")
+@pytest.mark.parametrize(
+    ("persisted_backend", "target_backend", "target_name"),
+    [
+        (BackendType.Ascend910, BackendType.Ascend950, "a5"),
+        (BackendType.Ascend950, BackendType.Ascend910, "a2a3"),
+    ],
+)
+@pytest.mark.parametrize("persisted_mode", [None, ExecutionMode.SIM, ExecutionMode.ONBOARD])
+@pytest.mark.parametrize("override_mode", [None, ExecutionMode.SIM, ExecutionMode.ONBOARD])
+def test_reload_backend_override_keeps_target_consistent(
+    tmp_path, persisted_backend, target_backend, target_name, persisted_mode, override_mode
+):
+    CompiledProgram(
+        _make_program_with_orchestration(),
+        str(tmp_path),
+        backend_type=persisted_backend,
+        execution_mode=persisted_mode or ExecutionMode.SIM,
+    )
+    meta_path = tmp_path / _COMPILED_META_FILENAME
+    if persisted_mode is None:
+        payload = json.loads(meta_path.read_text())
+        del payload["platform"]
+        meta_path.write_text(json.dumps(payload))
+    metadata = meta_path.read_bytes()
+
+    restored = CompiledProgram.from_dir(tmp_path, backend_type=target_backend, execution_mode=override_mode)
+    expected_mode = override_mode or persisted_mode or ExecutionMode.SIM
+    assert restored.backend_type == target_backend
+    assert restored.execution_mode is expected_mode
+    assert restored.platform == target_name + ("sim" if expected_mode is ExecutionMode.SIM else "")
+    assert meta_path.read_bytes() == metadata
+
+
+def test_reload_execution_mode_keeps_backend_and_metadata(tmp_path):
+    cp = CompiledProgram(
+        _make_program_with_orchestration(),
+        str(tmp_path),
+        backend_type=BackendType.Ascend950,
+        execution_mode=ExecutionMode.SIM,
+    )
+    metadata = (tmp_path / _COMPILED_META_FILENAME).read_bytes()
+    reloaded = CompiledProgram.from_dir(tmp_path, execution_mode=ExecutionMode.ONBOARD)
+    assert cp.platform == "a5sim"
+    assert reloaded.backend_type == BackendType.Ascend950
+    assert reloaded.execution_mode is ExecutionMode.ONBOARD
+    assert reloaded.platform == "a5"
+    assert (tmp_path / _COMPILED_META_FILENAME).read_bytes() == metadata
+
+
+def test_reload_platform_warns_but_explicit_mode_and_metadata_are_silent(tmp_path):
+    CompiledProgram(_make_program_with_orchestration(), str(tmp_path), backend_type=BackendType.Ascend950)
+    metadata = (tmp_path / _COMPILED_META_FILENAME).read_bytes()
+    with pytest.warns(DeprecationWarning, match=r"CompiledProgram.from_dir\(platform=") as caught:
+        legacy = CompiledProgram.from_dir(tmp_path, platform="a5")
+    assert len(caught) == 1
+    assert caught[0].filename == __file__
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        explicit = CompiledProgram.from_dir(tmp_path, execution_mode=ExecutionMode.ONBOARD)
+        persisted = CompiledProgram.from_dir(tmp_path)
+        assert explicit.platform == legacy.platform == "a5"
+        assert persisted.execution_mode is ExecutionMode.SIM
+    assert (tmp_path / _COMPILED_META_FILENAME).read_bytes() == metadata
 
 
 if __name__ == "__main__":

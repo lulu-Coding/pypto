@@ -9,20 +9,21 @@
 
 """Type stubs for backend module."""
 
-from typing import ClassVar
+from typing import ClassVar, overload
 
 from pypto import ir
 
 class BackendType:
     """Backend type for passes and codegen."""
 
-    Ascend910B: BackendType
+    Ascend910: BackendType
+    Ascend910B: BackendType  # Compatibility alias of Ascend910.
     Ascend950: BackendType
     __members__: ClassVar[dict[str, BackendType]]
     """Every member, keyed by name — the canonical way to enumerate the enum."""
     @property
     def name(self) -> str:
-        """The member name (e.g. ``"Ascend910B"``)."""
+        """The member name (e.g. ``"Ascend910"``)."""
         ...
     @property
     def value(self) -> int:
@@ -52,12 +53,28 @@ class Core:
 class Cluster:
     """Cluster of cores."""
 
+    @overload
+    def __init__(self, core_counts: dict[Core, int], /) -> None:
+        """Create a cluster from a core-counts map."""
+
+    @overload
+    def __init__(self, core: Core, count: int, /) -> None:
+        """Create a cluster with a single core type repeated ``count`` times."""
+
     @property
     def core_counts(self) -> dict[Core, int]: ...
     def total_core_count(self) -> int: ...
 
 class Die:
     """Die containing clusters."""
+
+    @overload
+    def __init__(self, cluster_counts: dict[Cluster, int], /) -> None:
+        """Create a die from a cluster-counts map."""
+
+    @overload
+    def __init__(self, cluster: Cluster, count: int, /) -> None:
+        """Create a die with a single cluster type repeated ``count`` times."""
 
     @property
     def cluster_counts(self) -> dict[Cluster, int]: ...
@@ -66,6 +83,14 @@ class Die:
 
 class SoC:
     """System on Chip."""
+
+    @overload
+    def __init__(self, die_counts: dict[Die, int], /) -> None:
+        """Create a SoC from a die-counts map."""
+
+    @overload
+    def __init__(self, die: Die, count: int, /) -> None:
+        """Create a SoC with a single die type repeated ``count`` times."""
 
     @property
     def die_counts(self) -> dict[Die, int]: ...
@@ -82,32 +107,99 @@ class BackendHandler:
     """
 
     def get_pto_target_arch(self) -> str: ...
-    def get_launch_spec_core_count_method(self) -> str: ...
+    def get_launch_spec_core_count_method(self) -> str:
+        """Return ``set_block_num`` for both supported backends and runtimes."""
+
     def get_default_sim_platform(self) -> str: ...
     def get_extra_ptoas_flags(self) -> list[str]: ...
+    def honors_high_precision_algorithm(self) -> bool: ...
     def requires_gm_pipe_buffer(self) -> bool: ...
+    def supports_local_pipe_depth(self) -> bool: ...
     def requires_split_load_tpop_workaround(self) -> bool: ...
     def requires_level3_tmp_scratch(self) -> bool: ...
     def requires_vto_c_fractal_adapt(self) -> bool: ...
     def requires_runtime_subblock_bridge(self) -> bool: ...
     def requires_no_split_dual_aiv_dispatch(self) -> bool: ...
+    def splits_cube_to_vector_transport_in_hardware(self) -> bool: ...
     def get_gm_access_granularity_bytes(self) -> int: ...
     def get_l2_cache_line_bytes(self) -> int: ...
     def get_recommended_innermost_dim_bytes(self) -> int: ...
-    def get_l0a_capacity_bytes(self) -> int: ...
-    def get_l0b_capacity_bytes(self) -> int: ...
-    def get_l0c_capacity_bytes(self) -> int: ...
-    def get_bias_capacity_bytes(self) -> int: ...
+    def get_capacity_bytes(self, memory_space: ir.MemorySpace) -> int:
+        """Return one SoC memory component's byte capacity, or 0 for an unmodeled space."""
+        ...
     def supports_mat_to_bias_move(self, source_dtype: ir.DataType, bias_dtype: ir.DataType) -> bool: ...
-    def get_mat_capacity_bytes(self) -> int: ...
     def get_l0_fractal_alignment(self) -> int: ...
     def get_l0c_m_alignment(self, accumulator_dtype: ir.DataType) -> int: ...
     def get_min_l0_tile_dim(self) -> int: ...
+
+def get_buffer_elementwise_recipe_names() -> list[str]:
+    """Return sorted logical names from the actual Buffer elementwise recipe table.
+
+    Names identify implemented conversion recipes, not every dtype, layout,
+    workspace, or precision form of the corresponding logical operator.
+    Mutating this snapshot does not change the recipes.
+    """
+    ...
+
+class OpScratchStatus:
+    """Outcome of a registered scratch query; Unknown means missing input information."""
+
+    Required: OpScratchStatus
+    NotRequired: OpScratchStatus
+    Unknown: OpScratchStatus
+    Unsupported: OpScratchStatus
+
+class TileScratchSpec:
+    """Read-only synthesis geometry for a Vec scratch tile, in elements."""
+
+    @property
+    def dtype(self) -> ir.DataType: ...
+    @property
+    def rows(self) -> int: ...
+    @property
+    def cols(self) -> int: ...
+
+class OpScratchPlan:
+    """Read-only query result; only Required carries a scratch spec."""
+
+    @property
+    def status(self) -> OpScratchStatus: ...
+    @property
+    def spec(self) -> TileScratchSpec | None: ...
+    @property
+    def reason(self) -> str: ...
 
 class Backend:
     """Abstract backend base class."""
 
     def get_type_name(self) -> str: ...
+    def plan_op_scratch(
+        self,
+        op_name: str,
+        source_dtype: ir.DataType | None = None,
+        source_cols: int | None = None,
+        *,
+        target_dtype: ir.DataType | None = None,
+        saturating: bool | None = None,
+        source_tile: ir.TileType | None = None,
+    ) -> OpScratchPlan | None:
+        """Plan compiler-created scratch without consulting the global backend.
+
+        An unregistered operator raises ValueError. None means the registered
+        operator has no scratch rule, not that it needs no scratch. Missing
+        physical dimensions can return Unknown. Cast uses source_tile for physical
+        and valid geometry, target_dtype, and effective saturating (True means ON).
+        source_dtype, when supplied, must agree with source_tile. Specs describe synthesis;
+        they are not exact-shape requirements for caller-provided scratch.
+        """
+
+    def get_registered_op_names(self) -> list[str]:
+        """Return registered operator names in sorted order, including target exclusions.
+
+        Registration does not imply support for every operand type or layout.
+        Mutating the returned snapshot does not change the backend registry.
+        """
+
     def get_handler(self) -> BackendHandler: ...
     def export_to_file(self, path: str) -> None: ...
     @staticmethod

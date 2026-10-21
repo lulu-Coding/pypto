@@ -51,6 +51,10 @@ for i, (sum_val,) in pl.range(10, init_values=(sum_init,)):
 
 **语法**：`loop_var, (iter_arg1, ...)` - iter_args 的数量必须与 init_values 匹配。
 
+`pl.unroll()` 也接受这一显式语法，用于保留打印/解析往返中的过渡 SSA IR。
+循环仍为 `ForKind.Unroll`，不会变成顺序循环或被展开。`UnrollLoops` 要求
+非 SSA 输入，因此可执行内核仍应使用普通赋值，并先展开循环再转换 SSA。
+
 ### Yield 与 If 语句 (Statement)
 
 使用 `pl.yield_()` 从嵌套作用域返回值：
@@ -90,6 +94,37 @@ else:
 
 - `pl.parse_program(code)` → 请改用 `pl.parse(code)`
 - `pl.loads_program(path)` → 请改用 `pl.loads(path)`
+
+## 内部 IR 文本形式
+
+文本解析直接从 AST 读取类型注解，不先把注解作为 Python 表达式执行。
+因此，即使 DSL 的运行时 wrapper 没有相应的 Python 运算符，符号 shape 表达式
+仍可解析。打印后的 shape 中，带类型的常量叶子会重建算术、幂、按位及移位节点，
+不进行常量折叠。普通用户常量表达式仍可折叠；重建 IR 的化简由独立 pass 负责。
+
+Shape 维度也通过表达式解析器恢复私有 `pl._dump.call(...)` 快照，保留记录的
+结果类型、操作数绑定及元数据。这些调用必须返回整数或 INDEX 标量。当
+`tensor.dim` 的操作数携带存储信息时，可以使用这种形式，并保留未折叠的读取。
+
+嵌套 `pl.Tuple[...]` 表示递归的元组值类型。内置 `tuple[...]` 返回注解仍表示
+函数结果列表；嵌套结果列表不是元组值类型，仍会被拒绝。
+
+打印器还使用私有 `pl._dump` 表示。它们是序列化语法，不是新的 kernel 编写 API：
+
+| 打印形式 | 重建的 IR |
+| -------- | --------- |
+| `pl._dump.logical_xor(x, y)` | BOOL `Xor`；`x ^ y` 则表示整数 `BitXor` |
+| `pl.const(pl._dump.float64("7ff0000000000000"), pl.FP32)` | 带显式 dtype 的正无穷 |
+| `pl._dump.WindowBuffer`, `pl._dump.Unknown` | 内部无字段类型标记 |
+
+`pl.Ptr` 继续表示 `PtrType`，包括签名中的使用。内部 marker 的 round-trip
+不代表任意内部签名都可降低为可执行 kernel。Unknown 仍是类型推断占位符；
+void 值类型和非 BOOL 的逻辑 XOR 操作数并未因此合法化。
+
+非有限 `ConstFloat` 使用 16 位十六进制字符编码其存储的 IEEE 754 binary64 值，
+与声明的 dtype 无关。NaN 的符号和 payload 均保留。结构比较将位模式相同的 NaN
+视为相等，不同位模式视为不等；这是结构同一性，不是 IEEE 运行时比较。
+有限值、无穷的符号、dtype 检查及既有的正负零相等语义保持不变。
 
 ## SSA 属性
 

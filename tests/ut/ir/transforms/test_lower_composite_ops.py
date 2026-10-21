@@ -25,8 +25,11 @@ import re
 import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
-from pypto import ir, passes
+from pypto import DataType, backend, ir, passes
+from pypto.backend import BackendType
+from pypto.ir.op import tile as _ir_ops_tile
 from pypto.language.parser.diagnostics.exceptions import ParserError
+from pypto.pypto_core import ir as _ir_core
 
 _OP_PLD_TILE_REMOTE_LOAD = ir.get_op("pld.tile.remote_load").name
 _OP_TILE_LOAD = ir.get_op("tile.load").name
@@ -314,9 +317,9 @@ def _collect_op_names(program):
     names = []
 
     class Collector(ir.IRVisitor):
-        def visit_call(self, call):
-            names.append(call.op.name)
-            super().visit_call(call)
+        def visit_call(self, op):
+            names.append(op.op.name)
+            super().visit_call(op)
 
     Collector().visit_program(program)
     return names
@@ -369,18 +372,18 @@ def test_tquant_mx_is_decomposed_to_value_returning_ops(
             self.assign_raw = 0
             self.assign_x2zz = 0
 
-        def visit_eval_stmt(self, stmt):
-            if isinstance(stmt.expr, ir.Call) and stmt.expr.op.name == _OP_TILE_TQUANT_MX_RAW:
+        def visit_eval_stmt(self, op):
+            if isinstance(op.expr, ir.Call) and op.expr.op.name == _OP_TILE_TQUANT_MX_RAW:
                 self.eval_raw += 1
-            super().visit_eval_stmt(stmt)
+            super().visit_eval_stmt(op)
 
-        def visit_assign_stmt(self, stmt):
-            if isinstance(stmt.value, ir.Call):
-                if stmt.value.op.name == _OP_TILE_TQUANT_MX_RAW:
+        def visit_assign_stmt(self, op):
+            if isinstance(op.value, ir.Call):
+                if op.value.op.name == _OP_TILE_TQUANT_MX_RAW:
                     self.assign_raw += 1
-                elif stmt.value.op.name == _OP_TILE_TMOV_X2ZZ:
+                elif op.value.op.name == _OP_TILE_TMOV_X2ZZ:
                     self.assign_x2zz += 1
-            super().visit_assign_stmt(stmt)
+            super().visit_assign_stmt(op)
 
     forms = FormCollector()
     forms.visit_program(After)
@@ -713,12 +716,14 @@ def test_new_host_collectives_in_host_orchestrator_are_left_for_host_collective_
 
 
 class _StmtProbe(ir.IRVisitor):
-    """Collect ForStmt ``stop`` expressions and AssignStmt values."""
+    """Collect loop bounds, assignments, and evaluated expressions in order."""
 
     def __init__(self) -> None:
         super().__init__()
         self.for_stops: list[ir.Expr] = []
         self.assign_values: list[ir.Expr] = []
+        self.assignments: list[ir.AssignStmt] = []
+        self.values: list[ir.Expr] = []
 
     def visit_for_stmt(self, op: ir.ForStmt) -> None:
         self.for_stops.append(op.stop)
@@ -731,6 +736,11 @@ class _StmtProbe(ir.IRVisitor):
 
     def visit_assign_stmt(self, op: ir.AssignStmt) -> None:
         self.assign_values.append(op.value)
+        self.assignments.append(op)
+        self.values.append(op.value)
+
+    def visit_eval_stmt(self, op: ir.EvalStmt) -> None:
+        self.values.append(op.expr)
 
     def _walk_stmt(self, stmt: ir.Stmt) -> None:
         # The nanobind trampoline does not redispatch nested statement
@@ -744,6 +754,8 @@ class _StmtProbe(ir.IRVisitor):
             self.visit_if_stmt(stmt)
         elif isinstance(stmt, ir.AssignStmt):
             self.visit_assign_stmt(stmt)
+        elif isinstance(stmt, ir.EvalStmt):
+            self.visit_eval_stmt(stmt)
 
 
 def _probe_stmts(prog) -> _StmtProbe:
@@ -758,9 +770,9 @@ _AAV_MAX_RECV = 2
 _AAV_TOTAL = _AAV_NRANKS * _AAV_MAX_RECV
 
 
-def _build_all_to_all_v_before():
+def _build_all_to_all_v_before(size: int = _AAV_SIZE):
     """InCore program calling ``pld.tensor.all_to_all_v`` with runtime counts."""
-    SIZE = _AAV_SIZE
+    SIZE = size
     nr = _AAV_NRANKS
     total = _AAV_TOTAL
 
@@ -839,28 +851,42 @@ def test_all_to_all_v_push_loop_is_bounded_by_runtime_send_counts():
 
 
 class _GuardProbe(ir.IRVisitor):
-    """Record Call op names by whether they sit inside an ``IfStmt`` body."""
+    """Record calls and their enclosing conditions and destination loops."""
 
     def __init__(self) -> None:
         super().__init__()
         self.guarded: list[str] = []
         self.unguarded: list[str] = []
-        self._if_depth = 0
+        self.guarded_calls: list[ir.Call] = []
+        self.unguarded_calls: list[ir.Call] = []
+        self.call_guards: dict[int, tuple[ir.Expr, ...]] = {}
+        self.call_loops: dict[int, tuple[ir.ForStmt, ...]] = {}
+        self._guards: list[ir.Expr] = []
+        self._loops: list[ir.ForStmt] = []
 
     def visit_for_stmt(self, op: ir.ForStmt) -> None:
+        self._loops.append(op)
         self._walk_stmt(op.body)
+        self._loops.pop()
 
     def visit_if_stmt(self, op: ir.IfStmt) -> None:
-        self._if_depth += 1
+        self._guards.append(op.condition)
         self._walk_stmt(op.then_body)
         if op.else_body is not None:
             self._walk_stmt(op.else_body)
-        self._if_depth -= 1
+        self._guards.pop()
 
     def visit_assign_stmt(self, op: ir.AssignStmt) -> None:
-        if isinstance(op.value, ir.Call):
-            bucket = self.guarded if self._if_depth > 0 else self.unguarded
-            bucket.append(op.value.op.name)
+        value = op.value
+        if isinstance(value, ir.Call):
+            bucket = self.guarded if self._guards else self.unguarded
+            bucket.append(value.op.name)
+            self.call_guards[id(value)] = tuple(self._guards)
+            self.call_loops[id(value)] = tuple(self._loops)
+            if self._guards:
+                self.guarded_calls.append(value)
+            else:
+                self.unguarded_calls.append(value)
 
     def _walk_stmt(self, stmt: ir.Stmt) -> None:
         # Same trampoline caveat as _StmtProbe: nested statement callbacks are
@@ -939,14 +965,8 @@ def test_all_to_all_v_row_count_is_clamped_below_by_zero():
     )
 
 
-def test_all_to_all_v_count_notify_is_not_inside_the_push_guard():
-    """The push is guarded on ``rows > 0``; the count notify is not.
-
-    A destination receiving zero rows still needs ``recv_counts = 0`` published,
-    or it reads a stale count from a previous invocation. So the guard must wrap
-    the ``pld.tile.put`` only. This asserts the notify survives outside any
-    conditional.
-    """
+def test_all_to_all_v_zero_rows_skip_count_publication_and_payload():
+    """Receiver reset preserves zero when the sender skips an empty transfer."""
     After = passes.lower_composite_ops()(_build_all_to_all_v_before())
     probe = _GuardProbe()
     probe.visit_program(After)
@@ -955,9 +975,146 @@ def test_all_to_all_v_count_notify_is_not_inside_the_push_guard():
     notify_op = ir.get_op("pld.system.notify").name
 
     assert put_op in probe.guarded, "the pld.tile.put must sit inside the rows > 0 guard"
-    assert notify_op in probe.unguarded, (
-        "the recv_counts notify must stay OUTSIDE the rows > 0 guard — a zero-row "
-        "destination would otherwise read a stale recv_counts"
+    count_notifies = [
+        call
+        for call in probe.unguarded_calls
+        if call.op.name == notify_op
+        and isinstance(call.args[0], ir.Var)
+        and call.args[0].name_hint == "recv_counts"
+    ]
+    assert len(count_notifies) == 1, "receiver reset must execute even for an empty transfer"
+    publications = [
+        call
+        for call in probe.guarded_calls
+        if call.op.name == notify_op
+        and isinstance(call.args[0], ir.Var)
+        and call.args[0].name_hint == "recv_counts"
+    ]
+    assert len(publications) == 1, "count publication must be guarded together with the payload"
+    put = next(call for call in probe.guarded_calls if call.op.name == put_op)
+    guards = probe.call_guards[id(publications[0])]
+    assert len(guards) == 1 and isinstance(guards[0], ir.Gt)
+    assert isinstance(guards[0].right, ir.ConstInt) and guards[0].right.value == 0
+    shape = put.args[6]
+    assert isinstance(shape, ir.MakeTuple)
+    ir.assert_structural_equal(guards[0].left, shape.elements[0])
+    assert probe.call_guards[id(put)] == guards, "the same rows > 0 guard must cover both operations"
+    assert all(call.kwargs["op"] == int(pld.NotifyOp.AtomicAdd) for call in (*count_notifies, *publications))
+
+
+def test_all_to_all_v_resets_counts_before_atomic_publication():
+    """Announce every reset before waiting only for the current destination."""
+    After = passes.lower_composite_ops()(_build_all_to_all_v_before())
+    probe = _probe_stmts(After)
+    calls = [value for value in probe.values if isinstance(value, ir.Call)]
+    notify_op = ir.get_op("pld.system.notify").name
+    wait_op = ir.get_op("pld.system.wait").name
+    read_op = ir.get_op("tensor.read").name
+    count_updates = [
+        call
+        for call in calls
+        if call.op.name == notify_op
+        and isinstance(call.args[0], ir.Var)
+        and call.args[0].name_hint == "recv_counts"
+    ]
+    assert len(count_updates) == 2
+    reset, publish = count_updates
+
+    def definition(expr: ir.Expr) -> ir.Expr:
+        while isinstance(expr, ir.Var):
+            value = next((stmt.value for stmt in probe.assignments if stmt.var is expr), None)
+            if value is None:
+                break
+            expr = value
+        return expr
+
+    # Negating INT32_MIN in INT32 would overflow before the atomic delta is
+    # formed. The reset must widen the old value before negation, then narrow.
+    delta = definition(reset.args[3])
+    assert isinstance(delta, ir.Cast)
+    assert isinstance(delta.type, ir.ScalarType) and delta.type.dtype == DataType.INT32
+    negated = definition(delta.operand)
+    assert isinstance(negated, ir.Neg)
+    assert isinstance(negated.type, ir.ScalarType) and negated.type.dtype == DataType.INT64
+    widened = definition(negated.operand)
+    assert isinstance(widened, ir.Cast)
+    assert isinstance(widened.type, ir.ScalarType) and widened.type.dtype == DataType.INT64
+    old_count = definition(widened.operand)
+    assert isinstance(old_count, ir.Call) and old_count.op.name == read_op
+    assert old_count.args[0] is reset.args[0]
+    ir.assert_structural_equal(old_count.args[1], reset.args[2])
+    rank = definition(reset.args[1])
+    assert isinstance(rank, ir.Call) and rank.op.name == ir.get_op("pld.system.rank").name
+
+    invalidations = [call for call in calls if call.op.name == ir.get_op("system.cacheinvalid").name]
+    assert len(invalidations) == 1 and not invalidations[0].args, "invalidate all cached GM reads"
+    waits = [call for call in calls if call.op.name == wait_op]
+    assert _static_wait_expectations(After) == [1, 2]
+    put = next(call for call in calls if call.op.name == ir.get_op("pld.tile.put").name)
+    ready = next(
+        call
+        for call in calls
+        if call.op.name == notify_op
+        and isinstance(call.args[0], ir.Var)
+        and call.args[0].name_hint == "signal"
+    )
+    guards = _GuardProbe()
+    guards.visit_program(After)
+    destination_loop = guards.call_loops[id(publish)][-1]
+    assert guards.call_loops[id(waits[0])][-1] is destination_loop
+    assert guards.call_loops[id(ready)][-1] is not destination_loop, (
+        "all peers must be notified before entering the destination wait/send loop"
+    )
+    ready_offsets = waits[0].args[1]
+    assert isinstance(ready_offsets, ir.MakeTuple)
+    assert ready_offsets.elements[0] is publish.args[1], (
+        "readiness must be checked for the destination being written"
+    )
+    positions = {id(call): i for i, call in enumerate(calls)}
+    assert (
+        positions[id(invalidations[0])]
+        < positions[id(old_count)]
+        < positions[id(reset)]
+        < positions[id(ready)]
+        < positions[id(waits[0])]
+        < positions[id(publish)]
+        < positions[id(put)]
+        < positions[id(waits[1])]
+    )
+    assert all(call.kwargs["op"] == int(pld.NotifyOp.AtomicAdd) for call in count_updates)
+    assert ir.get_op("tensor.write").name not in {call.op.name for call in calls}
+    epilogue = [call for call in calls if call.op.name == notify_op][-1]
+    assert epilogue.kwargs["op"] == int(pld.NotifyOp.AtomicAdd)
+    assert isinstance(epilogue.args[3], ir.ConstInt) and epilogue.args[3].value == -2
+
+
+def test_all_to_all_v_waits_preserve_acquires_and_put_release():
+    """Readiness and completion waits retain the standard acquire behavior."""
+    lowered = passes.lower_composite_ops()(_build_all_to_all_v_before())
+
+    reparsed = pl.parse_program(ir.python_print(lowered))
+    ir.assert_structural_equal(lowered, reparsed)
+
+    fenced = passes.insert_comm_fence()(reparsed)
+    calls = [value for value in _probe_stmts(fenced).values if isinstance(value, ir.Call)]
+    invalidations = [
+        call for call in calls if call.op.name == ir.get_op("system.cacheinvalid").name and not call.args
+    ]
+    assert len(invalidations) == 3, "entry reset, readiness wait, and completion wait must invalidate GM"
+    put_position = next(i for i, call in enumerate(calls) if call.op.name == ir.get_op("pld.tile.put").name)
+    assert calls[put_position + 1].op.name == ir.get_op("system.fence").name, (
+        "outgoing payload must retain its release fence"
+    )
+    ready_wait, final_wait = _collect_barrier_calls(fenced).waits
+    positions = {id(call): i for i, call in enumerate(calls)}
+    assert calls[positions[id(ready_wait)] + 1] is invalidations[1]
+    assert (
+        positions[id(invalidations[0])]
+        < positions[id(ready_wait)]
+        < positions[id(invalidations[1])]
+        < put_position
+        < positions[id(final_wait)]
+        < positions[id(invalidations[2])]
     )
 
 
@@ -1049,7 +1206,7 @@ def test_incore_all_to_all_v_rejects_multi_core_request():
             row = pl.load(result, [0, 0], [1, SIZE])
             return pl.store(row, [0, 0], out)
 
-    with pytest.raises(ValueError, match="requires core_num=1"):
+    with pytest.raises(ValueError, match="requires a compile-time core_num=1"):
         passes.lower_composite_ops()(MultiCoreInCore)
 
 
@@ -2855,6 +3012,31 @@ def _build_two_all_to_all_program():
     return Before
 
 
+def _build_two_all_to_all_v_program():
+    SIZE = _AAV_SIZE
+    nr = _AAV_NRANKS
+    total = _AAV_TOTAL
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def exchange_twice(
+            self,
+            first: pl.Tensor[[total, SIZE], pl.FP32],
+            second: pl.Tensor[[total, SIZE], pl.FP32],
+            first_counts: pl.Tensor[[nr, 1], pl.INT32],
+            second_counts: pl.Tensor[[nr, 1], pl.INT32],
+            data: pl.InOut[pld.DistributedTensor[[total, SIZE], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+            recv_counts: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[total, SIZE], pl.FP32]:
+            data = pld.tensor.all_to_all_v(first, data, signal, first_counts, recv_counts)
+            data = pld.tensor.all_to_all_v(second, data, signal, second_counts, recv_counts)
+            return data
+
+    return Before
+
+
 def _build_two_allgather_program():
     SIZE = _PROTOCOL_SIZE
     nr = _PROTOCOL_NRANKS
@@ -2935,22 +3117,35 @@ def _build_two_ring_allreduce_program():
 
 
 # One builder per collective, with the wait expectations each back-to-back pair
-# must produce. Every call restarts at generation 1 — the epilogue resets the
-# signal to all-zero at the end of each call — so two calls repeat the same
-# sequence rather than accumulating. reduce_scatter barriers twice per call
-# (ready + post-reduce): [1, 2, 1, 2]. The ring allreduce's arbitrary-length
-# schedule (#2161) barriers twice per subchunk (ready + read-complete); at
+# must produce. Every call restarts at generation 1 — the epilogue removes the
+# call's own credits while preserving early next-call credits — so two calls
+# repeat the same sequence rather than accumulating. all_to_all_v (destination readiness +
+# completion) and reduce_scatter (ready + post-reduce) use two credit rounds
+# per call: [1, 2, 1, 2].
+# The ring allreduce's arbitrary-length schedule (#2161) barriers twice per
+# subchunk (ready + read-complete); at
 # NR=2 there is one reduce-scatter round and one allgather round, each with
 # one subchunk, so one call already produces [1, 2, 1, 2] and two calls repeat
 # it.
 _BACK_TO_BACK_CASES = {
     "barrier": (_build_two_barriers_program, [1, 1]),
     "all_to_all": (_build_two_all_to_all_program, [1, 1]),
+    "all_to_all_v": (_build_two_all_to_all_v_program, [1, 2, 1, 2]),
     "allgather": (_build_two_allgather_program, [1, 1]),
     "broadcast": (_build_two_broadcast_program, [1, 1]),
     "reduce_scatter": (_build_two_reduce_scatter_program, [1, 2, 1, 2]),
     "ring_allreduce": (_build_two_ring_allreduce_program, []),
 }
+
+
+def test_all_to_all_v_two_calls_retire_both_barrier_credits():
+    After = passes.lower_composite_ops()(_build_two_all_to_all_v_program())
+    resets = [
+        call.args[3].value
+        for call in _collect_barrier_calls(After).notifies
+        if isinstance(call.args[3], ir.ConstInt) and call.args[3].value < 0
+    ]
+    assert resets == [-2, -2], "each call must remove both reset and completion credits"
 
 
 @pytest.mark.parametrize("collective", sorted(_BACK_TO_BACK_CASES))
@@ -3357,6 +3552,494 @@ def test_ring_allreduce_epilogue_resets_every_row():
         offsets = notify.args[2]
         assert isinstance(offsets, ir.MakeTuple)
         assert len(offsets.elements) == 2
+
+
+class _StageShapeCollector(ir.IRVisitor):
+    """Record the static shape of every ``tile.create`` Call encountered."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.shapes: list[tuple[int, ...]] = []
+
+    def visit_call(self, op: ir.Call) -> None:
+        if op.op.name == _ir_core.get_op("tile.create").name and op.args:
+            shape = op.args[0]
+            if isinstance(shape, ir.MakeTuple):
+                dims = [d.value for d in shape.elements if isinstance(d, ir.ConstInt)]
+                if len(dims) == len(shape.elements):
+                    self.shapes.append(tuple(dims))
+        super().visit_call(op)
+
+
+def _stage_tile_shapes(prog) -> list[tuple[int, ...]]:
+    collector = _StageShapeCollector()
+    collector.visit_program(prog)
+    return collector.shapes
+
+
+def _expected_chunk_cols(size: int, chunk_elements: int = 4096, alignment: int = 8) -> int:
+    """Mirrors ``MakeCollectiveStageShape``'s column pick: a short extent
+    rounds DOWN to the nearest ``alignment``-element width — the stage is a
+    literal pld.tile.put/get bounce buffer and can never exceed the transfer
+    (ValidateStageFitsTransfer), so alignment can only come from shrinking it,
+    never padding past ``size`` — while anything at or past the chunk budget
+    takes the full chunk width. Only meaningful for ``size >= alignment``; a
+    shorter transfer has no valid aligned width that still fits within it.
+    """
+    if size >= chunk_elements:
+        return chunk_elements
+    if size >= alignment:
+        return (size // alignment) * alignment
+    return size
+
+
+@pytest.mark.parametrize("size", [17, 64, 65537])
+def test_broadcast_stage_tile_is_capped_to_one_chunk(size):
+    """The broadcast staging tile is a bounded bounce buffer, not a copy of the
+    transfer: pld.tile.get slides the full extent through it, so a large SIZE
+    must not scale the tile (a [1, 65537] FP32 stage is 256 KiB and overflows UB).
+    A short, non-tile-aligned SIZE (17) must round DOWN to a 32-byte-aligned
+    column width (never up -- the stage can never exceed the transfer) instead
+    of reserving that exact odd byte count.
+    """
+    nr = 2
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def broadcast_step(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[1, size], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[1, size], pl.FP32]:
+            data = pld.tensor.broadcast(data, signal, root=0)
+            return data
+
+    After = passes.lower_composite_ops()(Before)
+    # 16 KiB budget / 4 B per FP32 = 4096 elements.
+    assert (1, _expected_chunk_cols(size)) in _stage_tile_shapes(After)
+
+
+def test_broadcast_accepts_dynamic_target_shape():
+    """The stage no longer derives from the target's static extent, so a dynamic
+    trailing dim lowers instead of tripping "broadcast target shape must be static".
+    """
+    nr = 2
+    n = pl.dynamic("BROADCAST_DYNAMIC_N")
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def broadcast_step(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[1, n], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[1, n], pl.FP32]:
+            data = pld.tensor.broadcast(data, signal, root=0)
+            return data
+
+    # A dynamic dimension that appears only on DistributedTensor is not yet
+    # self-contained in Python printer roundtrips. Keep pass verification, but
+    # skip the unrelated RoundtripInstrument limitation (same workaround as
+    # test_allreduce_dynamic_mesh_lowering_reaches_pto_codegen).
+    from pypto.pypto_core import passes as _core_passes  # noqa: PLC0415
+
+    ctx = _core_passes.PassContext(
+        [_core_passes.VerificationInstrument(_core_passes.VerificationMode.BEFORE_AND_AFTER)]
+    )
+    with ctx:
+        After = passes.lower_composite_ops()(Before)
+
+    assert "pld.tensor.broadcast" not in set(_collect_op_names(After))
+    # A dynamic extent takes the full chunk bound.
+    assert (1, 4096) in _stage_tile_shapes(After)
+
+
+def test_broadcast_stage_row_product_saturates_without_overflow():
+    """Huge static leading dimensions saturate at the row budget safely."""
+    nr = 2
+    huge = 1 << 62
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def broadcast_step(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[huge, 4, 64], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[huge, 4, 64], pl.FP32]:
+            return pld.tensor.broadcast(data, signal, root=0)
+
+    After = passes.lower_composite_ops()(Before)
+    # 4096 FP32 elements / 64 columns = 64 stage rows.
+    assert (64, 64) in _stage_tile_shapes(After)
+
+
+@pytest.mark.parametrize("size", [17, 64, 65537])
+def test_allgather_stage_tile_is_capped_to_one_chunk(size):
+    """Same cap on the allgather push stage; chunk_shape stays the transfer extent.
+    A short, non-tile-aligned SIZE (17) must round DOWN to a 32-byte-aligned
+    column width (never up -- the stage can never exceed the transfer) instead
+    of reserving that exact odd byte count.
+    """
+    nr = 2
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def gather_step(
+            self,
+            inp: pl.Tensor[[1, size], pl.FP32],
+            data: pl.InOut[pld.DistributedTensor[[nr, size], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[nr, size], pl.FP32]:
+            result = pld.tensor.allgather(inp, data, signal)
+            return result
+
+    After = passes.lower_composite_ops()(Before)
+    assert (1, _expected_chunk_cols(size)) in _stage_tile_shapes(After)
+
+
+@pytest.mark.parametrize(
+    "size,expected_cols",
+    [
+        (34, 34),  # even, below one 64-element packed row: documented unrounded gap
+        (66, 64),  # even, just past one packed 32-byte row: floor, never round up
+        (65536, 32768),  # full 16-KiB packed-FP4 chunk, not the GetByte() ceiling
+    ],
+)
+def test_allgather_fp4_stage_uses_physical_storage_width(size, expected_cols):
+    """Packed FP4 geometry uses 4 physical bits per logical element.
+
+    A 16-KiB stage therefore holds 32768 FP4 elements, not 16384 as
+    ``DataType.get_byte()``'s byte-ceiling would imply. Packed last
+    dimensions must be even; 66 is the short aligned-floor case (64), and
+    34 is below one 32-byte packed row so it stays unrounded.
+    """
+    nr = 2
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def gather_step(
+            self,
+            inp: pl.Tensor[[1, size], pl.FP4],
+            data: pl.InOut[pld.DistributedTensor[[nr, size], pl.FP4]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[nr, size], pl.FP4]:
+            return pld.tensor.allgather(inp, data, signal)
+
+    After = passes.lower_composite_ops()(Before)
+    assert (1, expected_cols) in _stage_tile_shapes(After)
+
+
+@pytest.mark.parametrize("size", [17, 64, 65537])
+def test_all_to_all_v_stage_tile_is_capped_to_one_chunk(size):
+    """Same cap on the all_to_all_v per-destination push stage — a 2D budget
+    trade-off, unlike the ``[1, SIZE]`` stage the other siblings use: rows
+    (MAX_RECV) shrink once the chosen column width alone saturates the chunk
+    byte budget (``MakeCollectiveStageShape``'s ``rows_budget = chunk_elements
+    // cols_val``). A short, non-tile-aligned SIZE (17) must also round its
+    column width DOWN to a 32-byte-aligned count, same as the other siblings.
+
+    all_to_all_v's own divisibility constraint stays a compile-time
+    ``[MAX_RECV, SIZE]`` (deliberately not relaxed — see Correction 3), but it
+    shares the same per-destination staging-tile bug as allgather/broadcast/
+    all_to_all: before this fix the stage was sized directly from ``SIZE``, so
+    a ``[MAX_RECV, 65537]`` FP32 stage still reserved 256 KiB and overflowed UB.
+    """
+    # 16 KiB budget / 4 B per FP32 = 4096 elements — mirrors MakeCollectiveStageShape's
+    # row/col trade-off exactly, rather than assuming rows stays fixed at MAX_RECV.
+    chunk_elements = 4096
+    cols = _expected_chunk_cols(size, chunk_elements=chunk_elements)
+    rows = min(_AAV_MAX_RECV, max(1, chunk_elements // cols))
+
+    After = passes.lower_composite_ops()(_build_all_to_all_v_before(size=size))
+    assert (rows, cols) in _stage_tile_shapes(After)
+
+
+_OP_TILE_SELECT = ir.get_op("tile.select").name
+_OP_TILE_SEL = ir.get_op("tile.sel").name
+_OP_TILE_SELS = ir.get_op("tile.sels").name
+_OP_TILE_CMPS = ir.get_op("tile.cmps").name
+_OP_TILE_CMP = ir.get_op("tile.cmp").name
+_OP_TILE_FULL = ir.get_op("tile.full").name
+_OP_TILE_CREATE = ir.get_op("tile.create").name
+
+
+def _build_select_before(*, rows=16, cols=128, dtype=pl.FP32, batch=None, form="mask-tile-scalar"):
+    """A one-``tile.select`` InCore program in each of the operand forms.
+
+    ``batch`` prepends a leading axis, giving rank-3 operands; leaving it None
+    keeps everything 2D. The body cannot branch on ``form`` -- the DSL parser has
+    no way to capture a ``str`` closure variable -- so each form gets its own
+    program and the caller picks one by name.
+    """
+    # LowerCompositeOps rewrites statement-level calls; in the real pipeline
+    # FlattenCallExpr (pass 06) has already bound every nested call by then, so
+    # these programs bind their intermediates the same way.
+    mask_cols = ((cols + 7) // 8 + 31) // 32 * 32
+    shape = [rows, cols] if batch is None else [batch, rows, cols]
+    mask_shape = [rows, mask_cols] if batch is None else [batch, rows, mask_cols]
+    zeros = [0] * len(shape)
+
+    @pl.program
+    class MaskTileScalar:
+        @pl.function(type=pl.FunctionType.InCore)
+        def main_incore_0(
+            self, src: pl.Tensor[shape, dtype], out: pl.Out[pl.Tensor[shape, dtype]]
+        ) -> pl.Tensor[shape, dtype]:
+            tv: pl.Tile[shape, dtype] = pl.load(src, zeros, shape)
+            mask: pl.Tile[mask_shape, pl.UINT8] = pl.tile.cmps(tv, 0, cmp_type=4)
+            selected: pl.Tile[shape, dtype] = pl.tile.select(mask, tv, 1)
+            return pl.store(selected, zeros, out)
+
+        @pl.function
+        def main(self, src: pl.Tensor[shape, dtype]) -> pl.Tensor[shape, dtype]:
+            out = pl.create_tensor(shape, dtype=dtype)
+            return self.main_incore_0(src, out)
+
+    @pl.program
+    class MaskScalarTile:
+        @pl.function(type=pl.FunctionType.InCore)
+        def main_incore_0(
+            self, src: pl.Tensor[shape, dtype], out: pl.Out[pl.Tensor[shape, dtype]]
+        ) -> pl.Tensor[shape, dtype]:
+            tv: pl.Tile[shape, dtype] = pl.load(src, zeros, shape)
+            mask: pl.Tile[mask_shape, pl.UINT8] = pl.tile.cmps(tv, 0, cmp_type=4)
+            selected: pl.Tile[shape, dtype] = pl.tile.select(mask, 1, tv)
+            return pl.store(selected, zeros, out)
+
+        @pl.function
+        def main(self, src: pl.Tensor[shape, dtype]) -> pl.Tensor[shape, dtype]:
+            out = pl.create_tensor(shape, dtype=dtype)
+            return self.main_incore_0(src, out)
+
+    @pl.program
+    class MaskTileTile:
+        @pl.function(type=pl.FunctionType.InCore)
+        def main_incore_0(
+            self, src: pl.Tensor[shape, dtype], out: pl.Out[pl.Tensor[shape, dtype]]
+        ) -> pl.Tensor[shape, dtype]:
+            tv: pl.Tile[shape, dtype] = pl.load(src, zeros, shape)
+            mask: pl.Tile[mask_shape, pl.UINT8] = pl.tile.cmp(tv, tv, cmp_type=4)
+            selected: pl.Tile[shape, dtype] = pl.tile.select(mask, tv, tv)
+            return pl.store(selected, zeros, out)
+
+        @pl.function
+        def main(self, src: pl.Tensor[shape, dtype]) -> pl.Tensor[shape, dtype]:
+            out = pl.create_tensor(shape, dtype=dtype)
+            return self.main_incore_0(src, out)
+
+    return {
+        "mask-tile-scalar": MaskTileScalar,
+        "mask-scalar-tile": MaskScalarTile,
+        "mask-tile-tile": MaskTileTile,
+    }[form]
+
+
+def _select_scratch_shapes(prog):
+    """(rows, cols, dtype) of every ``tile.create`` result in the program."""
+    shapes = []
+
+    class Collector(ir.IRVisitor):
+        def visit_call(self, op: ir.Call) -> None:
+            if op.op.name == _OP_TILE_CREATE and isinstance(op.type, ir.TileType):
+                dims = [d.value for d in op.type.shape if isinstance(d, ir.ConstInt)]
+                shapes.append((tuple(dims), op.type.dtype))
+            super().visit_call(op)
+
+    Collector().visit_program(prog)
+    return shapes
+
+
+@pytest.mark.parametrize(
+    ("form", "expected_select_op", "materializes_scalar"),
+    [
+        ("mask-tile-scalar", _OP_TILE_SELS, False),
+        ("mask-scalar-tile", _OP_TILE_SEL, True),
+        ("mask-tile-tile", _OP_TILE_SEL, False),
+    ],
+)
+def test_tile_select_lowers_to_the_matching_pto_form(form, expected_select_op, materializes_scalar):
+    """Each operand form picks its one-instruction PTO counterpart where one exists.
+
+    ``dst = mask ? src : scalar`` is exactly TSELS. A scalar on the *true* side
+    has no TSELS form, so the scalar is materialized with ``tile.full`` and the
+    selection becomes TSEL.
+    """
+    After = passes.lower_composite_ops()(_build_select_before(form=form))
+    names = _collect_op_names(After)
+
+    assert _OP_TILE_SELECT not in names
+    assert expected_select_op in names
+    assert (_OP_TILE_FULL in names) == materializes_scalar
+    # The scratch operand tile.select does not carry is synthesized here.
+    assert _OP_TILE_CREATE in names
+
+
+@pytest.mark.parametrize("form", ["mask-tile-scalar", "mask-scalar-tile", "mask-tile-tile"])
+def test_tile_select_never_synthesizes_a_compare(form):
+    """The condition is already the mask both TSEL and TSELS take.
+
+    `tile.select` accepts only the packed predicate mask, so the lowering reuses
+    it verbatim and the compare count is unchanged. Asserting on the *delta*
+    rather than the total keeps this sharp: each program already contains exactly
+    one compare, so a total-count assertion would still hold if the lowering
+    re-derived a mask it had been handed.
+    """
+    Before = _build_select_before(form=form)
+
+    def compares(prog):
+        names = _collect_op_names(prog)
+        return names.count(_OP_TILE_CMPS) + names.count(_OP_TILE_CMP)
+
+    After = passes.lower_composite_ops()(Before)
+
+    assert compares(After) == compares(Before)
+
+
+def test_tile_select_keeps_a_narrowed_tail_on_a_materialized_scalar_branch():
+    """The materialized branch must carry the tail of the branch it stands in for.
+
+    ``tile.full`` stamps its result fully valid and ``tile.sel`` reads the result's
+    valid extents from its ``lhs``, so a scalar on the *true* side would otherwise
+    widen a tail-narrowed select back to the full tile.
+    """
+    rows, cols, valid_cols = 16, 128, 100
+    span = ir.Span.unknown()
+    view = ir.TileView(valid_shape=[rows, valid_cols], stride=[], start_offset=None)
+    src = ir.Var("src", ir.TileType([rows, cols], DataType.FP32, tile_view=view), span)
+    mask = _ir_ops_tile.cmps(src, 0.0, cmp_type=4)
+    # Scalar on the true side: no TSELS form, so this takes the tile.full path.
+    selected = _ir_ops_tile.select(mask, 0.0, src)
+    body = ir.SeqStmts(
+        [
+            ir.AssignStmt(ir.Var("m", mask.type, span), mask, span),
+            ir.AssignStmt(ir.Var("o", selected.type, span), selected, span),
+        ],
+        span,
+    )
+    Before = ir.Program([ir.Function("f", [src], [], body, span)], "f", span)
+
+    After = passes.lower_composite_ops()(Before)
+    names = _collect_op_names(After)
+    assert _OP_TILE_SELECT not in names
+    assert _OP_TILE_FULL in names
+
+    full_valids = []
+
+    class Collector(ir.IRVisitor):
+        def visit_call(self, op: ir.Call) -> None:
+            if op.op.name == _OP_TILE_FULL and isinstance(op.type, ir.TileType):
+                valid = op.type.get_effective_tile_view().valid_shape
+                full_valids.append([d.value for d in valid if isinstance(d, ir.ConstInt)])
+            super().visit_call(op)
+
+    Collector().visit_program(After)
+    assert full_valids == [[rows, valid_cols]]
+
+
+@pytest.mark.parametrize("form", ["mask-tile-scalar", "mask-scalar-tile", "mask-tile-tile"], ids=lambda f: f)
+def test_tile_select_survives_the_default_pipeline(form, default_pass_manager, ascend_backend):
+    """Every operand form reaches the end of the pipeline, not just this pass.
+
+    `LowerCompositeOps` runs at slot 13 and `FlattenTileNdTo2D` at 14, so an
+    operand shape this rule emits has to be one the rest of the pipeline accepts.
+    Checking this pass in isolation is not enough -- the rank-3 case below lowers
+    cleanly here and only the full run proves the flattener takes what it emits.
+    """
+    optimized = default_pass_manager.run_passes(_build_select_before(form=form))
+    names = _collect_op_names(optimized)
+
+    assert _OP_TILE_SELECT not in names
+    assert (_OP_TILE_SEL in names) or (_OP_TILE_SELS in names)
+
+
+@pytest.mark.parametrize("form", ["mask-tile-scalar", "mask-scalar-tile", "mask-tile-tile"], ids=lambda f: f)
+def test_tile_select_rank_3_falls_back_to_tsel_and_survives_the_pipeline(
+    form, default_pass_manager, ascend_backend
+):
+    """A rank-3 select routes around TSELS's rank-2 limit and still flattens.
+
+    `DeduceTileSelsType` hard-requires rank 2 (its mask-coverage arithmetic
+    indexes ``valid_shape[0]`` / ``[1]`` directly), and this pass runs *before*
+    `FlattenTileNdTo2D`, so ND is still ND here. The rule therefore declines
+    TSELS for ND and uses ``tile.full`` + ``tile.sel``, neither of which
+    restricts rank, leaving the flattener to collapse the result.
+
+    Asserting through the **full** pipeline is the point: the materialized
+    ``tile.full`` is re-typed with the other branch's view, and only a complete
+    run proves `FlattenTileNdTo2D` accepts that hand-typed call.
+    """
+    optimized = default_pass_manager.run_passes(_build_select_before(batch=2, form=form))
+    names = _collect_op_names(optimized)
+
+    assert _OP_TILE_SELECT not in names
+    # TSELS is rank-2 only, so every ND form lands on TSEL.
+    assert _OP_TILE_SELS not in names
+    assert _OP_TILE_SEL in names
+
+
+@pytest.mark.parametrize(
+    ("ascend_backend", "expected_scratch"),
+    [
+        (BackendType.Ascend910, ((1, 128), pl.FP16)),
+        (BackendType.Ascend950, ((1, 32), pl.UINT8)),
+    ],
+    indirect=["ascend_backend"],
+    ids=["a2a3", "a5"],
+)
+def test_tile_select_takes_the_tsels_scratch_geometry_from_the_backend(ascend_backend, expected_scratch):
+    """A2/A3 sizes the TSELS scratch against one complete physical source row, in
+    the source dtype; A5 uses one fixed 32-byte block."""
+    After = passes.lower_composite_ops()(_build_select_before(cols=128, dtype=pl.FP16))
+
+    assert _OP_TILE_SELS in _collect_op_names(After)
+    assert expected_scratch in _select_scratch_shapes(After)
+
+
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910], indirect=True, ids=["a2a3"])
+def test_tile_select_rejects_8bit_on_a2a3_where_no_instruction_exists(ascend_backend):
+    """A2/A3 has no 8-bit select at all, so say so instead of emitting dead IR.
+
+    `pto.tsels`, `pto.tsel`, and the `pto.texpands` behind `tile.full` all start
+    at 16 bits on this arch, so the TSELS-ineligible fallback cannot carry 8-bit
+    either. Without this the pass emitted a lowering ptoas rejected much later
+    with `expects A2/A3 texpands dst element type to be i16/i32/f16/bf16/f32`.
+    """
+    with pytest.raises(ValueError, match=r"cannot select int8 values on backend 'a2a3'"):
+        passes.lower_composite_ops()(_build_select_before(dtype=pl.INT8, form="mask-scalar-tile"))
+
+
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend950], indirect=True, ids=["a5"])
+def test_tile_select_keeps_8bit_on_tsels_on_a5(ascend_backend):
+    """A5 is the only arch with an 8-bit select, and it goes straight to TSELS.
+
+    The A2/A3 counterpart is not "the same program via the fallback" -- that arch
+    has no 8-bit form for `tsel` or `texpands` either, so there is nothing to
+    fall back to; see the rejection test above.
+    """
+    After = passes.lower_composite_ops()(_build_select_before(dtype=pl.INT8))
+    names = _collect_op_names(After)
+
+    assert _OP_TILE_SELS in names
+    assert _OP_TILE_FULL not in names
+    assert ((1, 32), pl.UINT8) in _select_scratch_shapes(After)
+
+
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910, BackendType.Ascend950], indirect=True)
+def test_tile_select_bf16_uses_registered_tsel_fallback(ascend_backend):
+    """Neither TSELS implementation accepts BF16; a scalar must be materialized."""
+    after = passes.lower_composite_ops()(_build_select_before(dtype=pl.BF16))
+    names = _collect_op_names(after)
+    assert ir.get_op("tile.sels").name not in names
+    assert ir.get_op("tile.sel").name in names
+    assert ir.get_op("tile.full").name in names
+    target = backend.get_backend_instance(backend.get_backend_type())
+    plan = target.plan_op_scratch("tile.sel", DataType.BF16)
+    assert plan is not None and plan.spec is not None
+    assert ((plan.spec.rows, plan.spec.cols), plan.spec.dtype) in _select_scratch_shapes(after)
 
 
 if __name__ == "__main__":

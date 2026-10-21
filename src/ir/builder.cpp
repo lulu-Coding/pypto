@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <any>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -41,7 +42,7 @@ IRBuilder::IRBuilder() = default;
 void IRBuilder::BeginFunction(const std::string& name, const Span& span, FunctionType type,
                               std::optional<Level> level, std::optional<Role> role,
                               std::vector<std::pair<std::string, std::any>> attrs,
-                              bool requires_runtime_binding) {
+                              bool requires_runtime_binding, FunctionIRStage ir_stage) {
   if (InFunction()) {
     throw pypto::RuntimeError("Cannot begin function '" + name + "': already inside function '" +
                               static_cast<FunctionContext*>(CurrentContext())->GetName() + "' at " +
@@ -49,7 +50,7 @@ void IRBuilder::BeginFunction(const std::string& name, const Span& span, Functio
   }
 
   context_stack_.push_back(std::make_unique<FunctionContext>(name, span, type, level, role, std::move(attrs),
-                                                             requires_runtime_binding));
+                                                             requires_runtime_binding, ir_stage));
 }
 
 VarPtr IRBuilder::FuncArg(const std::string& name, const TypePtr& type, const Span& span,
@@ -103,7 +104,7 @@ FunctionPtr IRBuilder::EndFunction(const Span& end_span) {
   auto func = std::make_shared<Function>(
       func_ctx->GetName(), func_ctx->GetParams(), func_ctx->GetParamDirections(), func_ctx->GetReturnTypes(),
       body, combined_span, func_ctx->GetFuncType(), func_ctx->GetLevel(), func_ctx->GetRole(),
-      func_ctx->GetAttrs(), func_ctx->GetRequiresRuntimeBinding());
+      func_ctx->GetAttrs(), func_ctx->GetRequiresRuntimeBinding(), func_ctx->GetIRStage());
 
   // Pop context
   context_stack_.pop_back();
@@ -329,7 +330,9 @@ void IRBuilder::BeginScope(ScopeKind scope_kind, const Span& span, std::optional
                                                           sync_start, manual, std::move(attrs)));
 }
 
-StmtPtr IRBuilder::EndScope(const Span& end_span) {
+StmtPtr IRBuilder::EndScope(const Span& end_span, std::vector<int64_t> devices,
+                            std::vector<WindowBufferPtr> slots,
+                            std::vector<std::pair<std::string, std::any>> extra_attrs) {
   CHECK(!context_stack_.empty() && CurrentContext()->GetType() == BuildContext::Type::SCOPE)
       << "Cannot end scope: not inside a scope context at " << end_span.to_string();
 
@@ -353,6 +356,7 @@ StmtPtr IRBuilder::EndScope(const Span& end_span) {
   auto sync_start = scope_ctx->GetSyncStart();
   auto manual = scope_ctx->GetManual();
   auto attrs = scope_ctx->TakeAttrs();
+  for (auto& attr : extra_attrs) attrs.push_back(std::move(attr));
 
   // Create scope statement before popping context so that if construction throws
   // (e.g. validation CHECK fails) the builder state stays consistent.
@@ -404,12 +408,10 @@ StmtPtr IRBuilder::EndScope(const Span& end_span) {
                                                           std::vector<std::string>{}, std::move(attrs));
       break;
     case ScopeKind::CommDomain:
-      // CommDomainScopeStmt is synthesized by MaterializeCommDomainScopes (no
-      // user DSL surface) and constructed directly by the pass — the IR builder
-      // never receives this ScopeKind from the parser.
-      throw pypto::RuntimeError(
-          "ScopeKind::CommDomain has no DSL surface and cannot be built via IRBuilder::EndScope; "
-          "it is synthesized by the MaterializeCommDomainScopes pass.");
+      scope_stmt = std::make_shared<const CommDomainScopeStmt>(std::move(devices), std::move(slots),
+                                                               std::move(name_hint), body, combined_span,
+                                                               std::vector<std::string>{}, std::move(attrs));
+      break;
   }
   // Safety net: every ScopeKind value above must populate scope_stmt. The switch has
   // no default so adding a new ScopeKind without a case here will trip -Wswitch-enum;

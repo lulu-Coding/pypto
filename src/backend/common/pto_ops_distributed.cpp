@@ -108,7 +108,7 @@ DistTensorBinding ResolveDistTensorBinding(const ExprPtr& arg, codegen::PTOCodeg
 // because of two intertwined PTOAS constraints:
 //
 // * ``pto.addptr`` must feed ``pto.make_tensor_view`` /
-//   ``initialize_l2g2l_pipe(gm_addr)`` / ``load|store_scalar`` *within
+//   ``initialize_l2g2l_pipe(gm_addr)`` / ``load|store`` *within
 //   the same func.func*. A helper that ended with ``addptr → return``
 //   would only feed ``func.return``, which PTOAS rejects.
 // * ``pto.make_tensor_view`` always lowers to ``memref<…, strided<[?,
@@ -128,7 +128,7 @@ DistTensorBinding ResolveDistTensorBinding(const ExprPtr& arg, codegen::PTOCodeg
 // Generated MLIR (2-D example, ``DistributedTensor[[1, 64], FP32]``):
 //
 //   %peer_idx = arith.index_cast %peer : i32 to index
-//   %rk_pair = pto.load_scalar %ctx[%c2_index] : !pto.ptr<i64> -> i64
+//   %rk_pair = pto.load %ctx[%c2_index] : !pto.ptr<i64> -> i64
 //   ...                                (see EmitCommRemoteOffsetInline)
 //   %delems = arith.index_cast %delems_i : i64 to index
 //   %peer_ptr = pto.addptr %local_ptr, %delems
@@ -143,11 +143,21 @@ struct PeerViewInfo {
   std::string ptr_ssa;
 };
 
+/// @param tail_padding_elements Extra elements to add to the innermost dim of
+///        the emitted view. Non-zero only for an internal FP16
+///        `remote_load` carrying `allow_physical_tail_padding`, whose slice is
+///        rounded up to a 32-byte boundary and so may reach past the window's
+///        logical width into the block the comm domain reserves for it. The
+///        view has to declare that reach: `pto.partition_view` is verified
+///        against its source, and a source narrower than its own slice is
+///        rejected by PTOAS >= 0.61. See `kRemoteLoadFp16TailPaddingElements`.
 PeerViewInfo EmitCommRemoteView(const DistTensorBinding& target, const ExprPtr& peer_expr,
-                                codegen::PTOCodegen& codegen) {
+                                codegen::PTOCodegen& codegen, int64_t tail_padding_elements = 0) {
   const auto& shape = target.type->shape_;
   const size_t rank = shape.size();
   CHECK(rank >= 1) << "DistributedTensor must have rank >= 1 for peer view emission";
+  INTERNAL_CHECK(tail_padding_elements >= 0)
+      << "Internal error: negative peer-view tail padding " << tail_padding_elements;
   const std::string dtype_str = codegen.GetTypeString(target.type->dtype_);
   const std::string ptr_type = "!pto.ptr<" + dtype_str + ">";
 
@@ -274,11 +284,28 @@ PeerViewInfo EmitCommRemoteView(const DistTensorBinding& target, const ExprPtr& 
   }
   view_type << "x" << dtype_str << ">";
 
+  // The declared extent of the innermost dim, which may reach past the logical
+  // width into the reserved tail (see `tail_padding_elements`). Kept separate
+  // from `shape_ssa`: the strides above are the real memory layout and must NOT
+  // move when the declared extent grows.
+  std::vector<std::string> view_shape_ssa = shape_ssa;
+  if (tail_padding_elements > 0) {
+    const size_t last = rank - 1;
+    if (auto ci = As<ir::ConstInt>(shape[last])) {
+      view_shape_ssa[last] = codegen.GetOrEmitConstant(ci->value_ + tail_padding_elements, DataType::INDEX);
+    } else {
+      std::string pad = codegen.GetOrEmitConstant(tail_padding_elements, DataType::INDEX);
+      std::string widened = codegen.NewTemp();
+      codegen.Emit(widened + " = arith.addi " + shape_ssa[last] + ", " + pad + " : index");
+      view_shape_ssa[last] = widened;
+    }
+  }
+
   std::ostringstream mv;
   mv << peer_view << " = pto.make_tensor_view " << peer_ptr << ", shape = [";
   for (size_t i = 0; i < rank; ++i) {
     if (i > 0) mv << ", ";
-    mv << shape_ssa[i];
+    mv << view_shape_ssa[i];
   }
   mv << "], strides = [";
   for (size_t i = 0; i < rank; ++i) {
@@ -315,7 +342,15 @@ static std::string MakeRemoteLoadCodegenPTO(const CallPtr& op, codegen::CodegenB
   auto result_tile_type = As<ir::TileType>(op->GetType());
   INTERNAL_CHECK_SPAN(result_tile_type, op->span_) << "pld.tile.remote_load result must be a TileType";
 
-  auto peer_view = EmitCommRemoteView(binding, op->args_[1], codegen);
+  // An internal FP16 remote_load may have had its read rounded up to a 32-byte
+  // boundary by LowerCompositeOps, so the slice below can reach up to
+  // `kRemoteLoadFp16TailPaddingElements` past the window's logical width, into
+  // the block the comm domain reserves. The op's type deducer already widens
+  // the source that way; the emitted view must say the same thing, or it is
+  // narrower than the partition_view taken from it.
+  const int64_t tail_padding =
+      op->GetKwarg<bool>("allow_physical_tail_padding", false) ? ir::kRemoteLoadFp16TailPaddingElements : 0;
+  auto peer_view = EmitCommRemoteView(binding, op->args_[1], codegen, tail_padding);
 
   const std::string dtype_str = codegen.GetTypeString(binding.type->dtype_);
   const auto result_tile_view = ir::tile_view_semantics::GetEffectiveTileView(*result_tile_type);
@@ -432,7 +467,7 @@ static std::string MakeRemoteStoreCodegenPTO(const CallPtr& op, codegen::Codegen
       CHECK_SPAN(handler->SupportsBf16AtomicAdd(), op->span_)
           << "pld.tile.remote_store with atomic=AtomicType.Add into a bf16 window is not supported on the '"
           << handler->GetPtoTargetArch()
-          << "' backend; bf16 atomic-add requires the Ascend910B (A2/A3) profile. Accumulate into an fp32 "
+          << "' backend; bf16 atomic-add requires the Ascend910 (A2/A3) profile. Accumulate into an fp32 "
              "window and cast to bf16 after the reduction instead.";
     }
     tstore_line << " {atomicType = #pto<atomic_type atomic_add>}";
@@ -1057,7 +1092,7 @@ static std::string MakeGetCodegenPTO(const CallPtr& op, codegen::CodegenBase& co
   return "";
 }
 
-// Emit ``%rk_pair = pto.load_scalar %ctx[%slot] : !pto.ptr<i64> -> i64`` for
+// Emit ``%rk_pair = pto.load %ctx[%slot] : !pto.ptr<i64> -> i64`` for
 // the (rankId, rankNum) u64 slot. Shared by ``pld.system.rank`` (low 32 bits)
 // and ``pld.system.nranks`` (high 32 bits) — see comm_layout.h for the static
 // asserts that anchor rankNum at rankId + 4 in the same i64 slot.
@@ -1066,7 +1101,7 @@ static std::string EmitLoadRankPair(codegen::PTOCodegen& cg, const std::string& 
   constexpr int64_t kRankSlotIdx = static_cast<int64_t>(cl::kRankIdOffset / cl::kWindowSlotStride);
   std::string slot_c = cg.GetOrEmitConstant(kRankSlotIdx, DataType::INDEX);
   std::string rk_pair = cg.NewTemp();
-  cg.Emit(rk_pair + " = pto.load_scalar " + ctx_ssa + "[" + slot_c + "] : !pto.ptr<i64> -> i64");
+  cg.Emit(rk_pair + " = pto.load " + ctx_ssa + "[" + slot_c + "] : !pto.ptr<i64> -> i64");
   return rk_pair;
 }
 
@@ -1131,7 +1166,7 @@ void RegisterDistributedOps(Backend& backend, const std::unordered_set<std::stri
 
   // ``pld.system.rank(ctx)``: IR ``ScalarType(INT32)``; MLIR type is ``i32``.
   // ``i32`` (PTOAS rejects ``arith.trunci`` to ``ui32``). Low 32 bits of the
-  // (rankId, rankNum) u64 slot via ``pto.load_scalar`` + ``arith.trunci``.
+  // (rankId, rankNum) u64 slot via ``pto.load`` + ``arith.trunci``.
   reg("pld.system.rank", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) -> std::string {
     auto& cg = AsPto(codegen_base);
     INTERNAL_CHECK_SPAN(op->args_.size() == 1, op->span_)
@@ -1147,7 +1182,7 @@ void RegisterDistributedOps(Backend& backend, const std::unordered_set<std::stri
   // ``pld.system.nranks(ctx)``: same INT32 IR / i32 MLIR convention.
   // High 32 bits of the same slot —
   // ``kRankNumOffset == kRankIdOffset + 4`` lets us shift the already-loaded
-  // i64 right by 32 instead of issuing a second pto.load_scalar.
+  // i64 right by 32 instead of issuing a second pto.load.
   reg("pld.system.nranks", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) -> std::string {
     auto& cg = AsPto(codegen_base);
     INTERNAL_CHECK_SPAN(op->args_.size() == 1, op->span_)

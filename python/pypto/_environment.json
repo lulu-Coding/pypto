@@ -4,6 +4,21 @@
       "function": "_temporary_env",
       "path": "python/pypto/runtime/device_runner.py",
       "reason": "Restores caller-provided runtime overrides; each actual compilation input still needs classification at its consumer."
+    },
+    {
+      "function": "_elf_inputs",
+      "path": "python/pypto/jit/_toolchain.py",
+      "reason": "Copies the compiler subprocess environment; explicit dependency overrides are rejected and effective semantic/tool selections are captured by the adapter."
+    },
+    {
+      "function": "_ptoas_inputs",
+      "path": "python/pypto/jit/_toolchain.py",
+      "reason": "Copies the compiler subprocess environment; explicit dependency overrides are rejected and effective semantic/tool selections are captured by the adapter."
+    },
+    {
+      "function": "_run",
+      "path": "python/pypto/jit/_toolchain.py",
+      "reason": "Copies the compiler subprocess environment so a probe sees the tool selection the build does, with the C locale pinned over it; explicit dependency overrides are rejected and effective semantic/tool selections are captured by the adapter."
     }
   ],
   "schema": 1,
@@ -15,6 +30,34 @@
     "CC": {
       "category": "tool_resolution",
       "reason": "Runtime build-tool selection; direct kernel compilation uses its selected toolchain object."
+    },
+    "CCACHE_CC": {
+      "category": "tool_resolution",
+      "reason": "Deprecated alias of CCACHE_COMPILER; selects the compiler a ccache wrapper runs."
+    },
+    "CCACHE_COMPILER": {
+      "category": "tool_resolution",
+      "reason": "Forces the compiler a ccache wrapper runs, overriding the name it was invoked by."
+    },
+    "CCACHE_CONFIGPATH": {
+      "category": "tool_resolution",
+      "reason": "Selects the ccache configuration file, which may set the compiler to run."
+    },
+    "CCACHE_DISABLE": {
+      "category": "tool_resolution",
+      "reason": "Takes ccache out of the compilation chain."
+    },
+    "CCACHE_NODISABLE": {
+      "category": "tool_resolution",
+      "reason": "Counterpart of CCACHE_DISABLE; keeps ccache in the compilation chain."
+    },
+    "CCACHE_PREFIX": {
+      "category": "tool_resolution",
+      "reason": "Inserts another program before the compiler, e.g. distcc."
+    },
+    "CCACHE_PREFIX_CPP": {
+      "category": "tool_resolution",
+      "reason": "Inserts another program before the preprocessor."
     },
     "COMPILER_PATH": {
       "category": "tool_resolution",
@@ -80,6 +123,10 @@
       "category": "tool_resolution",
       "reason": "Executable search input; fingerprint resolved tools and their resources."
     },
+    "PTOAS_PYTHON": {
+      "category": "tool_resolution",
+      "reason": "Packaged PTOAS launcher interpreter selection; inventory interpreter resources and native dependencies."
+    },
     "PTOAS_ROOT": {
       "category": "tool_resolution",
       "reason": "Use the shared ptoas resolver; inventory the selected launcher and its dependencies."
@@ -96,9 +143,33 @@
       "category": "nonsemantic",
       "reason": "Diagnostic tracing of loop carry dependency analysis only."
     },
+    "PYPTO_CACHE": {
+      "category": "nonsemantic",
+      "reason": "Persistent storage policy; does not change generated code."
+    },
+    "PYPTO_CACHE_DIR": {
+      "category": "nonsemantic",
+      "reason": "Persistent storage location, captured separately from content identity."
+    },
+    "PYPTO_CACHE_EPOCH": {
+      "category": "semantic",
+      "reason": "Explicit installation revision token invalidating cached artifacts after same-version local patches."
+    },
+    "PYPTO_CACHE_IDENTITY": {
+      "category": "tool_resolution",
+      "reason": "Selects build identifiers or the legacy content inventory; policies use distinct persistent identities."
+    },
+    "PYPTO_CACHE_READONLY": {
+      "category": "nonsemantic",
+      "reason": "Persistent storage write policy, captured per request."
+    },
     "PYPTO_CODEGEN_MAX_WORKERS": {
       "category": "nonsemantic",
       "reason": "Bounds parallel codegen workers; does not select generated operations."
+    },
+    "PYPTO_COMPILER_TIMEOUT": {
+      "category": "nonsemantic",
+      "reason": "Bounds compiler and linker execution time; successful binary contents are unchanged."
     },
     "PYPTO_COMPILE_PROFILING": {
       "category": "fresh_request",
@@ -132,6 +203,10 @@
       "category": "nonsemantic",
       "reason": "Synchronizes runtime and compiler logging thresholds only."
     },
+    "PYPTO_SKIP_RUNTIME_PIN_CHECK": {
+      "category": "nonsemantic",
+      "reason": "Suppresses the runtime-pin diagnostic only; the installed runtime revision it reports is separately part of the binary cache identity."
+    },
     "PYPTO_VERIFY_LEVEL": {
       "category": "fresh_request",
       "reason": "C++ captures its default once; use the effective verification policy."
@@ -148,9 +223,25 @@
       "category": "tool_resolution",
       "reason": "Interpreter resource selection; inventory the actual interpreter installation."
     },
+    "PYTHONNOUSERSITE": {
+      "category": "tool_resolution",
+      "reason": "Python console-script import selection; inventory the effective wheel and interpreter inputs."
+    },
+    "PYTHONOPTIMIZE": {
+      "category": "semantic",
+      "reason": "Changes Python compiler execution semantics; captured in the persistent specialization identity."
+    },
     "PYTHONPATH": {
       "category": "tool_resolution",
       "reason": "Import search input; inventory actual imported compiler and runtime modules."
+    },
+    "PYTHONSAFEPATH": {
+      "category": "tool_resolution",
+      "reason": "Python console-script import selection; inventory the effective wheel and interpreter inputs."
+    },
+    "PYTHONUSERBASE": {
+      "category": "tool_resolution",
+      "reason": "Python console-script import selection; inventory the effective wheel and interpreter inputs."
     },
     "SOURCE_DATE_EPOCH": {
       "category": "semantic",

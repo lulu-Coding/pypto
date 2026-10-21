@@ -35,11 +35,11 @@
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/memref.h"
+#include "pypto/ir/op_registry.h"
 #include "pypto/ir/phase.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/tile_view_semantics.h"
-#include "pypto/ir/transforms/utils/auto_name_utils.h"
 #include "pypto/ir/transforms/utils/tensor_view_semantics.h"
 #include "pypto/ir/type.h"
 #include "src/backend/common/pto_ops_internal.h"
@@ -110,20 +110,14 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   INTERNAL_CHECK_SPAN(!shapes_tuple->elements_.empty(), op->span_)
       << "tile.load shapes tuple must have at least one element";
 
-  // TEMPORARY (pypto #2534): PTOAS has no L2-bypass path yet
-  // (https://github.com/hw-native-sys/PTOAS/issues/1356), so a BYPASS request is
-  // carried through the IR but compiles as an ordinary cached access. When that
-  // issue closes, this warn is REPLACED in place by
-  // `GetOrCreateTensorView(tensor, policy)` against an addptr-rooted view — the
-  // declaration already reaches here, so nothing upstream changes.
+  // The declared GM cache-access policy (pypto #2680). PTOAS >= v0.64 carries a
+  // streaming read as a `cache_policy` attribute on `pto.tload` plus an optional
+  // byte `offset` it adds to that one load's source address. On a2a3 the offset
+  // is the driver-owned distance to the page's uncached alias, threaded in as a
+  // synthetic kernel parameter (see PTOCodegen::GetL2CacheOffsetArgSSA); the
+  // attribute alone declares the policy but moves no address. Both are attached
+  // below, alongside the MX layout attribute when it applies.
   const auto policy = static_cast<ir::CachePolicy>(op->GetKwarg<int>("cache", 0));
-  if (policy == ir::CachePolicy::kBypass && codegen.NoteCacheBypassWarned(tensor.get())) {
-    LOG_WARN << "[warning] [CacheBypassUnsupported] tensor '"
-             << ir::auto_name::GetBaseName(tensor->name_hint_)
-             << "' requests CachePolicy.BYPASS, but PTOAS has no L2-bypass path yet "
-             << "(https://github.com/hw-native-sys/PTOAS/issues/1356); compiling as an "
-             << "ordinary cached access" << (op->span_.is_valid() ? " at " + op->span_.to_string() : "");
-  }
 
   std::string dtype_str = codegen.GetTypeString(tensor_type->dtype_);
   std::string tile_buf = codegen.GetCurrentResultTarget();
@@ -169,8 +163,37 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   std::ostringstream tload_line;
   tload_line << "pto.tload ins(" << partition_view << " : " << partition_type << ") outs(";
   tload_line << tile_buf << " : " << tile_buf_type << ")";
+
+  std::vector<std::string> attrs;
   if (is_mx_load) {
-    tload_line << " {layout = #pto.layout<" << pto_layout << ">}";
+    attrs.push_back("layout = #pto.layout<" + pto_layout + ">");
+  }
+  if (policy == ir::CachePolicy::kBypass) {
+    attrs.emplace_back("cache_policy = #pto.load_cache_policy<l2_bypass>");
+  }
+
+  // Default-valued attributes are omitted so an undeclared load keeps its
+  // byte-identical PTO form. PTOAS expects all present attributes in one dict
+  // (same contract as tile.store below).
+  if (!attrs.empty()) {
+    tload_line << " {";
+    for (size_t i = 0; i < attrs.size(); ++i) {
+      if (i != 0) tload_line << ", ";
+      tload_line << attrs[i];
+    }
+    tload_line << "}";
+  }
+
+  // The offset operand follows the attribute dict, and PTOAS applies it only to
+  // a load that also declared l2_bypass. It is empty on an architecture with no
+  // address alias to reach, which leaves the declaration carried by the
+  // attribute alone -- and PTOAS v0.64 lowers a bare attribute to an ordinary
+  // TLOAD, so that declaration costs nothing and does nothing.
+  if (policy == ir::CachePolicy::kBypass) {
+    const std::string l2_cache_offset = codegen.GetL2CacheOffsetArgSSA();
+    if (!l2_cache_offset.empty()) {
+      tload_line << " offset = " << l2_cache_offset << " : i64";
+    }
   }
   codegen.Emit(tload_line.str());
 
@@ -231,19 +254,45 @@ static std::string MakeTileStoreCodegenPTO(const CallPtr& op, codegen::CodegenBa
     // N-rank partition path: use the explicit shapes tuple from FlattenTileNdTo2D.
     const auto& shape_elems = shapes_tuple->elements_;
     const auto& offset_elems = offsets_tuple->elements_;
-    partition_type = MakePartitionTensorViewType(GetDimStrings(shape_elems), dtype_str);
+    auto partition_dims = GetDimStrings(shape_elems);
+    auto offset_codes = GetIndexOffsetCodes(offset_elems, codegen);
+    auto size_codes = GetSizeCodes(shape_elems, codegen);
+    partition_type = MakePartitionTensorViewType(partition_dims, dtype_str);
     partition_view = EmitPartitionViewPTO(output_tensor->name_hint_, tensor_view, tensor_view_type,
-                                          partition_type, GetIndexOffsetCodes(offset_elems, codegen),
-                                          GetSizeCodes(shape_elems, codegen), codegen);
+                                          partition_type, offset_codes, size_codes, codegen);
+  } else if (tensor_type->tensor_view_.has_value() &&
+             ir::IsMxTensorLayout(tensor_type->tensor_view_->layout)) {
+    // MX scale tiles are logically [M,G] / [G,N], while their GM destination
+    // is the rank-5 SFractal view made explicit by BlockMxScaleTensorViews.
+    // A DMA store addresses that physical box directly. Each source scale
+    // tile must cover complete 16x2 boxes, so its logical valid extents map
+    // one-to-one onto a rank-5 partition with the same byte count.
+    auto height = As<ir::ConstInt>(valid_shape[0]);
+    auto width = As<ir::ConstInt>(valid_shape[1]);
+    INTERNAL_CHECK_SPAN(height && width && height->value_ > 0 && width->value_ > 0, op->span_)
+        << "MX tile.store requires static positive scale-tile valid dimensions";
+    const bool is_a = tensor_type->tensor_view_->layout == ir::TensorLayout::MX_A_ZZ;
+    const int64_t row_extent = is_a ? height->value_ : width->value_;
+    const int64_t group_extent = is_a ? width->value_ : height->value_;
+    INTERNAL_CHECK_SPAN(row_extent % 16 == 0 && group_extent % 2 == 0, op->span_)
+        << "MX tile.store requires complete 16x2 scale boxes";
+    const std::vector<std::string> physical_shape = {"1", std::to_string(row_extent / 16),
+                                                     std::to_string(group_extent / 2), "16", "2"};
+    partition_type = MakePartitionTensorViewType(physical_shape, dtype_str);
+    partition_view =
+        EmitPartitionViewPTO(output_tensor->name_hint_, tensor_view, tensor_view_type, partition_type,
+                             GetIndexOffsetCodes(offsets_tuple->elements_, codegen), physical_shape, codegen);
   } else {
     // Standard 1D/2D path
     std::string height_dim = "?", width_dim = "?";
     if (auto h = As<ir::ConstInt>(valid_shape[0])) height_dim = std::to_string(h->value_);
     if (auto w = As<ir::ConstInt>(valid_shape[1])) width_dim = std::to_string(w->value_);
-    partition_type = MakePartitionTensorViewType({height_dim, width_dim}, dtype_str);
-    partition_view = EmitPartitionViewPTO(
-        output_tensor->name_hint_, tensor_view, tensor_view_type, partition_type,
-        GetIndexOffsetCodes(offsets_tuple->elements_, codegen), {height_code, width_code}, codegen);
+    std::vector<std::string> partition_dims = {height_dim, width_dim};
+    auto offset_codes = GetIndexOffsetCodes(offsets_tuple->elements_, codegen);
+    std::vector<std::string> size_codes = {height_code, width_code};
+    partition_type = MakePartitionTensorViewType(partition_dims, dtype_str);
+    partition_view = EmitPartitionViewPTO(output_tensor->name_hint_, tensor_view, tensor_view_type,
+                                          partition_type, offset_codes, size_codes, codegen);
   }
 
   std::ostringstream tstore_line;
@@ -251,9 +300,31 @@ static std::string MakeTileStoreCodegenPTO(const CallPtr& op, codegen::CodegenBa
   if (!tile_buf_type.empty()) {
     tstore_line << " : " << tile_buf_type;
   }
+  // FIXPIPE scalar pre-quantization: the accumulator is multiplied by this FP32
+  // scale on the way out, which is what lets an INT32 accumulator reach an FP16
+  // tensor (DEQF16) or an INT8 one (REQ8) without a vector round-trip. PTOAS
+  // takes the packed word as a second `ins(...)` operand here — unlike
+  // `pto.tinsert`, which spells it as a trailing `pre_quant <ssa> : i64` clause
+  // (both verified against ptoas v0.61).
+  const auto pre_quant = ir::GetOptionalDoubleKwarg(op->kwargs_, "pre_quant");
+  if (pre_quant.has_value()) {
+    const int64_t word = codegen::EncodeFixpipePreQuant(*pre_quant, tensor_type->dtype_);
+    tstore_line << ", " << codegen.GetOrEmitConstant(word, DataType::INT64) << " : i64";
+  }
   tstore_line << ") outs(" << partition_view << " : " << partition_type << ")";
 
   std::vector<std::string> attrs;
+
+  // FIXPIPE activation. It runs on the *accumulator*, ahead of the pre-quant
+  // multiply -- hence `reluPreMode` -- so the pair reproduces
+  // `maximum(tile, 0) * s` and NOT `maximum(tile * s, 0)`. The two agree for
+  // every s > 0, which is why only a negative scale separates them; measured
+  // that way on a2a3 by `acc_to_gm_negative_scale` in
+  // tests/st/runtime/ops/test_fixpipe_epilogue.py. The destination clamp is
+  // last, after the multiply.
+  if (op->GetKwarg<bool>("pre_relu", false)) {
+    attrs.emplace_back("reluPreMode = #pto<relu_pre_mode normal_relu>");
+  }
 
   const int st_phase = op->GetKwarg<int>("st_phase", static_cast<int>(ir::STPhase::kUnspecified));
   INTERNAL_CHECK_SPAN(ir::IsValidSTPhase(st_phase), op->span_)
@@ -661,7 +732,7 @@ static std::string MakeTensorReadCodegenPTO(const CallPtr& op, codegen::CodegenB
   INTERNAL_CHECK_SPAN(scalar_type_ptr, op->span_) << "tensor.read result must be ScalarType";
   std::string scalar_type = codegen.GetTypeString(scalar_type_ptr->dtype_);
 
-  // store_scalar/load_scalar need the base !pto.ptr; resolve via the tensor var
+  // pto.store/pto.load need the base !pto.ptr; resolve via the tensor var
   // even after a slice-assign rebound it to a tensor_view (issue #1493).
   std::string src = codegen.GetTensorBasePtr(AsVarLike(op->args_[0]));
   std::string src_type = codegen.GetExprTypeAnnotation(op->args_[0]);
@@ -674,7 +745,7 @@ static std::string MakeTensorReadCodegenPTO(const CallPtr& op, codegen::CodegenB
   std::string off = GetFlatOffsetSSA(indices_tuple, tensor_type_ptr->shape_, codegen);
 
   std::ostringstream oss;
-  oss << result << " = pto.load_scalar " << src << "[" << off << "]";
+  oss << result << " = pto.load " << src << "[" << off << "]";
   if (!src_type.empty()) {
     oss << " : " << src_type;
   }
@@ -694,7 +765,7 @@ static std::string MakeTensorWriteCodegenPTO(const CallPtr& op, codegen::Codegen
   auto indices_tuple = As<ir::MakeTuple>(op->args_[1]);
   INTERNAL_CHECK_SPAN(indices_tuple, op->span_) << "tensor.write second argument must be MakeTuple (indices)";
 
-  // store_scalar needs the base !pto.ptr; resolve via the tensor var even after
+  // pto.store needs the base !pto.ptr; resolve via the tensor var even after
   // a prior slice-assign rebound it to a tensor_view (issue #1493).
   std::string tensor = codegen.GetTensorBasePtr(AsVarLike(op->args_[0]));
   std::string tensor_type_str = codegen.GetExprTypeAnnotation(op->args_[0]);
@@ -708,7 +779,7 @@ static std::string MakeTensorWriteCodegenPTO(const CallPtr& op, codegen::Codegen
   std::string off = GetFlatOffsetSSA(indices_tuple, tensor_type_ptr->shape_, codegen);
 
   std::ostringstream oss;
-  oss << "pto.store_scalar " << value << ", " << tensor << "[" << off << "]";
+  oss << "pto.store " << value << ", " << tensor << "[" << off << "]";
   if (!tensor_type_str.empty() || !value_type.empty()) {
     oss << " : ";
     if (!tensor_type_str.empty()) oss << tensor_type_str;
@@ -731,21 +802,25 @@ static std::string MakeTensorDimCodegenPTO(const CallPtr& op, codegen::CodegenBa
   auto& codegen = AsPto(codegen_base);
   INTERNAL_CHECK_SPAN(op->args_.size() == 2, op->span_)
       << "tensor.dim requires 2 arguments, but got " << op->args_.size();
-  auto input_tensor = ir::As<ir::TensorType>(op->args_[0]->GetType());
-  CHECK(input_tensor) << "tensor.dim need TensorType for first arg, but got "
-                      << op->args_[0]->GetType()->TypeName();
+  auto input_tensor = ir::AsTensorTypeLike(op->args_[0]->GetType());
+  INTERNAL_CHECK_SPAN(input_tensor, op->span_)
+      << "tensor.dim requires a tensor operand, got " << op->args_[0]->GetType()->TypeName();
   auto axis = codegen.GetConstIntValue(op->args_[1]);
-  CHECK(axis >= 0 && static_cast<size_t>(axis) < input_tensor->shape_.size())
+  if (axis < 0) axis += static_cast<int64_t>(input_tensor->shape_.size());
+  INTERNAL_CHECK_SPAN(axis >= 0 && static_cast<size_t>(axis) < input_tensor->shape_.size(), op->span_)
       << "tensor.dim axis " << axis << " out of range for tensor with rank " << input_tensor->shape_.size();
   auto shape = input_tensor->shape_[axis];
+  // Read the declared extent directly, including composite scalar expressions.
+  // No tensor_view needs to have been emitted for the operand yet.
   std::string shape_name;
-  if (auto dyn_shape = ir::As<ir::Var>(shape)) {
-    shape_name = codegen.GetVarName(dyn_shape);
-  } else if (auto static_shape = ir::As<ir::ConstInt>(shape)) {
-    shape_name = codegen.GetOrEmitConstant(static_shape->value_, DataType::INDEX);
+  if (auto constant = ir::As<ir::ConstInt>(shape)) {
+    // Extents are INDEX values regardless of a constant's declared signedness.
+    // arith.index_cast cannot consume the ui64 emitted for a UINT64 constant.
+    shape_name = codegen.GetOrEmitConstant(constant->value_, DataType::INDEX);
   } else {
-    INTERNAL_CHECK_SPAN(false, op->span_) << "Internal error: tensor.dim shape is neither Var nor ConstInt";
+    shape_name = codegen.EmitCastToIndex(shape, codegen.GetExprAsCode(shape));
   }
+  codegen.SetCurrentExprValue(shape_name);
   auto target_var = codegen.GetCurrentResultVar();
   if (target_var != nullptr && !shape_name.empty()) {
     codegen.RegisterVarToMlir(target_var, shape_name);

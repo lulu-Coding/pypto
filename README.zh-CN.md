@@ -32,9 +32,35 @@ PyPTO（发音：pai p-t-o）是一个面向 AI 加速器的高性能编程框�
 - **nanobind**：2.0.0 或更高版本（构建时自动安装）
 - **scikit-build-core**：0.10.0 或更高版本（构建时自动安装）
 
+以上是从源码安装的要求。下面的开发容器已经带齐这些，宿主机一个都不需要。
+
 ### 安装
 
-#### 从源码安装
+#### 方式一：开发容器（昇腾 A2/A3）
+
+有昇腾卡的机器上最快的路径。CANN、PyPTO、`simpler` 和 ptoas 都已构建进镜像，不需要自己拼工具链。
+
+宿主机需要先备齐三样：昇腾 NPU 驱动（26.0.rc1）、Docker Engine，以及 Ascend Docker
+Runtime —— 下面的 `--runtime=ascend` 正是靠这个插件才生效。这三样的安装与核验步骤见
+[开发容器](docs/zh/user/04-dev-container.md)，选卡、跨容器保留源码和设备侧故障排查也都在同一篇。
+
+备齐之后，拉取镜像并用 0 号卡起一个容器。镜像仓库允许匿名拉取，不需要登录：
+
+```bash
+export PYPTO_IMAGE=swr.cn-east-3.myhuaweicloud.com/cloud-pypto/pypto-dev:a3-dist
+docker pull "$PYPTO_IMAGE"
+
+docker run --rm -it \
+  --runtime=ascend \
+  -e ASCEND_VISIBLE_DEVICES=0 \
+  --shm-size=16g \
+  "$PYPTO_IMAGE"
+```
+
+进入容器后，用 `pypto-doctor` 自检环境，用 `python $PYPTO_SRC/examples/beginner/01_hello_world.py`
+在卡上跑一个内核。
+
+#### 方式二：从源码安装
 
 1. **克隆仓库**：
 
@@ -145,7 +171,7 @@ python -m pytest tests/ut/core/test_error.py -n auto --maxprocesses 8 -v
 
 ## 文档
 
-文档站点发布在 **<https://hw-native-sys.github.io/pypto/>**。
+文档站点发布在 **<https://www.pypto.ai/pypto/>**。
 其源文件是 [`docs/`](docs/) 下的 markdown，在 GitHub 上可直接阅读：
 
 | 章节 | 内容 |
@@ -153,19 +179,9 @@ python -m pytest tests/ut/core/test_error.py -n auto --maxprocesses 8 -v
 | [用户手册](docs/zh/user/index.md) | 入门、语言指南、操作参考、调试 |
 | [参考](docs/zh/reference/index.md) | PTO ISA —— 集群架构、TPUSH/TPOP、缓冲区管理 |
 | [开发者](docs/zh/dev/index.md) | IR、passes、代码生成、后端分派 |
-| [运行时](https://hw-native-sys.github.io/simpler/) | 执行已编译程序的 `simpler` 运行时 |
+| [运行时](https://www.pypto.ai/simpler/) | 执行已编译程序的 `simpler` 运行时 |
 
 英文文档位于 [`docs/en/`](docs/en/)（以英文为准），可从站点的语言菜单切换。
-
-本地构建站点：
-
-```bash
-# 只需文档工具链 —— 构建站点不需要已编译的 pypto
-pip install -r docs/requirements.txt
-
-mkdocs serve            # 在 http://127.0.0.1:8000 实时预览
-mkdocs build --strict   # 与 CI 一致；断链会导致构建失败
-```
 
 ## 许可证
 

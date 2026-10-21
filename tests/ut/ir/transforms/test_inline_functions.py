@@ -17,11 +17,13 @@ Tests use the Before/Expected pattern with ``ir.assert_structural_equal``,
 which compares programs under alpha-equivalence (Var name mismatches are OK
 as long as the LHS↔RHS Var mapping is consistent throughout)."""
 
+import pypto
 import pypto.language as pl
 import pytest
-from pypto import ir, passes
+from pypto import backend, codegen, ir, passes
 from pypto.ir import OptimizationStrategy, PassManager
 from pypto.pypto_core import passes as core_passes
+from pypto.runtime import RunConfig
 
 
 class TestInlineFunctionsBasic:
@@ -97,9 +99,12 @@ class TestInlineFunctionsCallSiteForms:
         """A bare ``self.writeout(...)`` (EvalStmt, no LHS) splices only the
         pre-return body and drops the trailing return value.
 
-        ``SpliceInlineCallAsEval`` (src lines 293-296) calls ``CloneInlineBody``
-        and returns ``body.stmts`` only — the trailing ``return out`` value is
-        discarded since there is no LHS to bind it to. The in-place rebinding
+        ``SpliceInlineCallAsEval`` calls ``CloneInlineBody`` and keeps
+        ``body.stmts``; the trailing ``return out`` value is discarded because
+        there is no LHS to bind it to *and* a bare ``Var`` produces a value and
+        nothing else — dropping it loses no side effect (contrast
+        ``test_eval_stmt_call_site_preserves_nested_write`` below, where the
+        discarded value is a cross-function Call). The in-place rebinding
         ``out = pl.assemble(out, x, ...)`` collapses to ``ext = pl.assemble(ext,
         a, ...)`` under the ``x→a``, ``out→ext`` param substitution. The caller
         deliberately does not read ``ext`` back (that would trip the
@@ -141,6 +146,340 @@ class TestInlineFunctionsCallSiteForms:
 
         After = passes.inline_functions()(Before)
         ir.assert_structural_equal(After, Expected)
+
+    def test_eval_stmt_call_site_preserves_nested_write(self):
+        """Regression test for #2705: an ignored wrapper whose body is
+        ``return self.writeout(x, out)`` must still perform ``writeout``'s write.
+
+        Dropping a return VALUE is not the same as dropping its EVALUATION.
+        ``CloneInlineBody`` strips the trailing ReturnStmt's expression into
+        ``return_values``, so before the fix ``SpliceInlineCallAsEval`` returned
+        an empty ``body.stmts`` for ``forward`` and the nested cross-function
+        Call — together with its write through the ``pl.Out`` arg — vanished
+        without a diagnostic. ``main`` collapsed to a bare ``return x``.
+
+        Nested inline expansion preserves ``writeout``'s spliced body — the
+        assemble below — even when the outer helper's result is discarded."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def writeout(
+                self,
+                x: pl.Tensor[[4], pl.FP32],
+                out: pl.Out[pl.Tensor[[4], pl.FP32]],
+            ) -> pl.Tensor[[4], pl.FP32]:
+                out = pl.tensor.assemble(out, x, [0])
+                return out
+
+            @pl.function(type=pl.FunctionType.Inline)
+            def forward(
+                self,
+                x: pl.Tensor[[4], pl.FP32],
+                out: pl.Out[pl.Tensor[[4], pl.FP32]],
+            ) -> pl.Tensor[[4], pl.FP32]:
+                return self.writeout(x, out)
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[4], pl.FP32],
+                out: pl.Out[pl.Tensor[[4], pl.FP32]],
+            ) -> pl.Tensor[[4], pl.FP32]:
+                self.forward(x, out)  # EvalStmt call site — return value ignored
+                return x
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[4], pl.FP32],
+                out: pl.Out[pl.Tensor[[4], pl.FP32]],
+            ) -> pl.Tensor[[4], pl.FP32]:
+                out = pl.tensor.assemble(out, x, [0])
+                return x
+
+        After = passes.inline_functions()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_eval_stmt_call_site_keeps_non_inline_dispatch(self):
+        """Same shape as above, but the wrapper forwards to a NON-Inline
+        function: the re-emitted EvalStmt stays an ordinary cross-function
+        dispatch, exactly as if the author had written ``self.inner(...)`` at the
+        call site. The inliner does not expand it (``inner`` is not
+        Inline), and nothing may delete it either — ``inner`` writes ``out``."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def inner(
+                self,
+                x: pl.Tensor[[4], pl.FP32],
+                out: pl.Out[pl.Tensor[[4], pl.FP32]],
+            ) -> pl.Tensor[[4], pl.FP32]:
+                out = pl.tensor.assemble(out, x, [0])
+                return out
+
+            @pl.function(type=pl.FunctionType.Inline)
+            def forward(
+                self,
+                x: pl.Tensor[[4], pl.FP32],
+                out: pl.Out[pl.Tensor[[4], pl.FP32]],
+            ) -> pl.Tensor[[4], pl.FP32]:
+                return self.inner(x, out)
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[4], pl.FP32],
+                out: pl.Out[pl.Tensor[[4], pl.FP32]],
+            ) -> pl.Tensor[[4], pl.FP32]:
+                self.forward(x, out)
+                return x
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def inner(
+                self,
+                x: pl.Tensor[[4], pl.FP32],
+                out: pl.Out[pl.Tensor[[4], pl.FP32]],
+            ) -> pl.Tensor[[4], pl.FP32]:
+                out = pl.tensor.assemble(out, x, [0])
+                return out
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[4], pl.FP32],
+                out: pl.Out[pl.Tensor[[4], pl.FP32]],
+            ) -> pl.Tensor[[4], pl.FP32]:
+                self.inner(x, out)
+                return x
+
+        After = passes.inline_functions()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_eval_stmt_call_site_preserves_returned_builtin_store(self):
+        """An ignored wrapper that directly returns an effectful *builtin* keeps
+        its write too — the callee does not have to be a cross-function call.
+
+        ``return pl.tile.store(t, [0, 0], out)`` is a supported return form, and
+        ``tile.store`` declares argument 2 as ``ArgEffect::Write`` /
+        ``ReadWrite`` (``src/ir/op/tile_ops/memory.cpp``). The write lives in the
+        return expression itself, not in a preceding ``AssignStmt``, so the
+        discarded-value classification has to consult the operator registry
+        rather than assume every builtin call is a pure value."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def writeout(
+                self,
+                t: pl.Tile[[64, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                return pl.tile.store(t, [0, 0], out)
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                t: pl.Tile[[64, 64], pl.FP32] = pl.tile.load(a, [0, 0], [64, 64])
+                self.writeout(t, out)  # EvalStmt call site — return value ignored
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                t: pl.Tile[[64, 64], pl.FP32] = pl.tile.load(a, [0, 0], [64, 64])
+                pl.tile.store(t, [0, 0], out)
+                return out
+
+        After = passes.inline_functions()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_eval_stmt_call_site_keeps_returned_sync_op(self):
+        """An operator that writes through no argument is still not deletable.
+
+        ``system.set_ffts`` declares ``no_arg_writes()`` — it moves no data —
+        yet it hands the FFTS unit its workspace pointer, and the same holds for
+        ``pld.system.wait`` (blocks on a signal threshold) and
+        ``pld.system.defer_wait`` (registers a completion condition). "Writes
+        through no argument" is not "safe to delete", so the discarded-value
+        classification cannot key deletion on
+        ``OpRegistryEntry::WritesAnyArg``; the pass keeps every call until a real
+        deletability property exists."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def setup(self, ws: pl.Tensor[[256], pl.INT64]) -> pl.Tensor[[256], pl.INT64]:
+                # The DSL return annotation is parser metadata for the IR, while
+                # the Python surface types `set_ffts` as `-> Call`; the two never
+                # meet at runtime because the body is parsed, not executed.
+                return pl.system.set_ffts(ws)  # type: ignore[reportReturnType]
+
+            @pl.function(type=pl.FunctionType.AIV)
+            def main(
+                self,
+                ws: pl.Tensor[[256], pl.INT64],
+                x: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                self.setup(ws)  # EvalStmt call site — return value ignored
+                return x
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.AIV)
+            def main(
+                self,
+                ws: pl.Tensor[[256], pl.INT64],
+                x: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                pl.system.set_ffts(ws)
+                return x
+
+        After = passes.inline_functions()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_eval_stmt_call_site_keeps_side_effect_free_builtin(self):
+        """Even a builtin that happens to be pure is kept, because nothing in the
+        IR can prove it.
+
+        No operator property answers "is this call safe to delete".
+        ``OpRegistryEntry::WritesAnyArg`` answers a narrower question and is
+        wrong in both directions here: 263 of 315 operators are unclassified
+        (among them ``tile.tpush_to_aiv`` and ``system.aic_initialize_pipe``,
+        which ``dce::IsSideEffectOp`` lists as side-effecting), and a positive
+        ``no_arg_writes()`` verdict covers synchronization ops as well — see
+        ``test_eval_stmt_call_site_keeps_returned_sync_op``. So the pass keeps
+        every call. ``tensor.add`` is genuinely pure and its `EvalStmt` is dead
+        but harmless; that is the deliberate cost of not guessing."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def compute(self, x: pl.Tensor[[1], pl.INT32]) -> pl.Tensor[[1], pl.INT32]:
+                return pl.add(x, x)
+
+            @pl.function
+            def main(self, a: pl.Tensor[[1], pl.INT32]) -> pl.Tensor[[1], pl.INT32]:
+                self.compute(a)  # EvalStmt call site — return value ignored
+                return a
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, a: pl.Tensor[[1], pl.INT32]) -> pl.Tensor[[1], pl.INT32]:
+                pl.add(a, a)
+                return a
+
+        After = passes.inline_functions()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_eval_stmt_call_site_keeps_call_wrapping_a_call(self):
+        """A discarded builtin op Call that *wraps* a cross-function call is kept
+        whole, so the nested call's write rides along inside it.
+
+        ``pl.add`` is an unclassified operator, so the outer Call is preserved by
+        the same rule as any other non-provably-pure call — and preserving it
+        preserves the nested ``Call(inner, x, out)`` verbatim. Nothing is
+        deleted and nothing has to be rejected."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def inner(
+                self,
+                x: pl.Tensor[[4], pl.FP32],
+                out: pl.Out[pl.Tensor[[4], pl.FP32]],
+            ) -> pl.Tensor[[4], pl.FP32]:
+                out = pl.tensor.assemble(out, x, [0])
+                return out
+
+            @pl.function(type=pl.FunctionType.Inline)
+            def forward(
+                self,
+                x: pl.Tensor[[4], pl.FP32],
+                out: pl.Out[pl.Tensor[[4], pl.FP32]],
+            ) -> pl.Tensor[[4], pl.FP32]:
+                return pl.add(self.inner(x, out), x)
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[4], pl.FP32],
+                out: pl.Out[pl.Tensor[[4], pl.FP32]],
+            ) -> pl.Tensor[[4], pl.FP32]:
+                self.forward(x, out)
+                return x
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def inner(
+                self,
+                x: pl.Tensor[[4], pl.FP32],
+                out: pl.Out[pl.Tensor[[4], pl.FP32]],
+            ) -> pl.Tensor[[4], pl.FP32]:
+                out = pl.tensor.assemble(out, x, [0])
+                return out
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[4], pl.FP32],
+                out: pl.Out[pl.Tensor[[4], pl.FP32]],
+            ) -> pl.Tensor[[4], pl.FP32]:
+                pl.add(self.inner(x, out), x)
+                return x
+
+        After = passes.inline_functions()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_eval_stmt_call_site_wrapping_a_call_errors(self):
+        """A discarded return value that is *not itself call-like* but hides a
+        call cannot keep that call's evaluation, so the pass raises instead of
+        deleting it.
+
+        Scalar arithmetic is a dedicated Expr kind (`Add`), not a `Call`, so
+        ``self.bump(n) + 1`` cannot be re-emitted as an `EvalStmt` the way a
+        call-like value can. Dropping it would drop the nested
+        ``Call(bump, n)`` with no verifier to catch it (``bump`` is not Inline,
+        so ``InlineFunctionsEliminated`` sees nothing wrong). Reject it loudly
+        instead; the message names both workarounds."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def bump(self, n: pl.Scalar[pl.INDEX]) -> pl.Scalar[pl.INDEX]:
+                m: pl.Scalar[pl.INDEX] = n + 1
+                return m
+
+            @pl.function(type=pl.FunctionType.Inline)
+            def forward(self, n: pl.Scalar[pl.INDEX]) -> pl.Scalar[pl.INDEX]:
+                return self.bump(n) + 1
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[4], pl.FP32],
+                n: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[4], pl.FP32]:
+                self.forward(n)
+                return x
+
+        with pytest.raises(ValueError, match="wraps a call"):
+            passes.inline_functions()(Before)
 
     def test_self_aliasing_assign_skips_redundant_copy(self):
         """``a = self.passthrough(a)`` where the inline returns its param
@@ -217,7 +556,7 @@ class TestInlineFunctionsMultiCallSite:
 
 
 class TestInlineFunctionsNested:
-    """Inline calls Inline: pass iterates to fixpoint."""
+    """Inline calls Inline: recursive cloning preserves transitive calls."""
 
     def test_inline_calls_inline(self):
         """A → B (both Inline) → caller. Both inlined."""
@@ -264,6 +603,500 @@ class TestInlineFunctionsNested:
                 return r
 
         ir.assert_structural_equal(After, Expected)
+
+
+class TestInlineFunctionsDynamicTypes:
+    """Inlined tensor types must reference the caller's values and dimensions."""
+
+    def test_dynamic_tpop_preserves_declared_result_type(self):
+        """Unknown op inference must retain the remapped explicit tile type."""
+        formal_rows = pl.dynamic("FORMAL_ROWS")
+        rows = pl.dynamic("ROWS")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def receive(self, shape_source: pl.Tile[[formal_rows, 16], pl.FP32]):
+                received: pl.Tile[[formal_rows, 16], pl.FP32] = pl.tile.tpop_from_aiv()
+                return received
+
+            @pl.function
+            def main(self, source: pl.Tile[[rows, 16], pl.FP32]):
+                result = self.receive(source)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, source: pl.Tile[[rows, 16], pl.FP32]):
+                received: pl.Tile[[rows, 16], pl.FP32] = pl.tile.tpop_from_aiv()
+                result = received
+                return result
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        ir.assert_structural_equal(after, pl.parse_program(after.as_python()))
+
+    def test_alias_type_follows_rhs_through_ssa(self):
+        """A stale LHS-only view cannot override the actual alias source."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def helper(self, source: pl.Tensor[[4, 8], pl.FP32]):
+                viewed: pl.Tensor[[4, 8], pl.FP32, pl.TensorView(stride=[16, 1])] = source
+                _rows = pl.tensor.dim(viewed, 0)
+
+            @pl.function
+            def main(self, source: pl.Tensor[[4, 8], pl.FP32]):
+                self.helper(source)
+                caller_alias: pl.Tensor[[4, 8], pl.FP32, pl.TensorView(stride=[16, 1])] = source
+                _caller_rows = pl.tensor.dim(caller_alias, 0)
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, source: pl.Tensor[[4, 8], pl.FP32]):
+                viewed = source
+                _rows = pl.tensor.dim(viewed, 0)
+                caller_alias = source
+                _caller_rows = pl.tensor.dim(caller_alias, 0)
+
+        # This regression deliberately supplies stale alias types to the
+        # normalization pass; verify its repaired output, not that input.
+        instrument = passes.VerificationInstrument(passes.VerificationMode.AFTER)
+        with passes.PassContext([instrument]):
+            after = passes.inline_functions()(Before)
+        props = passes.IRPropertySet()
+        props.insert(passes.IRProperty.AssignTypeSymmetry)
+        for actual, expected in (
+            (after, Expected),
+            (passes.convert_to_ssa()(after), passes.convert_to_ssa()(Expected)),
+        ):
+            ir.assert_structural_equal(actual, expected)
+            assert not passes.PropertyVerifierRegistry.verify(props, actual)
+
+    def test_rhs_view_is_preserved_through_ssa(self):
+        """RHS view metadata survives inlining, including downstream aliases."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def helper(
+                self,
+                source: pl.Tensor[[4, 8], pl.FP32, pl.TensorView(stride=[16, 1], layout=pl.TensorLayout.ND)],
+            ):
+                viewed: pl.Tensor[[4, 8], pl.FP32, pl.TensorView(stride=[32, 1])] = source
+                _rows = pl.tensor.dim(viewed, 0)
+
+            @pl.function
+            def main(
+                self,
+                source: pl.Tensor[[4, 8], pl.FP32, pl.TensorView(stride=[16, 1], layout=pl.TensorLayout.ND)],
+            ):
+                self.helper(source)
+                caller_alias: pl.Tensor[[4, 8], pl.FP32, pl.TensorView(stride=[32, 1])] = source
+                _caller_rows = pl.tensor.dim(caller_alias, 0)
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                source: pl.Tensor[[4, 8], pl.FP32, pl.TensorView(stride=[16, 1], layout=pl.TensorLayout.ND)],
+            ):
+                viewed = source
+                _rows = pl.tensor.dim(viewed, 0)
+                caller_alias = source
+                _caller_rows = pl.tensor.dim(caller_alias, 0)
+
+        # This regression deliberately supplies stale alias types to the
+        # normalization pass; verify its repaired output, not that input.
+        instrument = passes.VerificationInstrument(passes.VerificationMode.AFTER)
+        with passes.PassContext([instrument]):
+            after = passes.inline_functions()(Before)
+        props = passes.IRPropertySet()
+        props.insert(passes.IRProperty.AssignTypeSymmetry)
+        for actual, expected in (
+            (after, Expected),
+            (passes.convert_to_ssa()(after), passes.convert_to_ssa()(Expected)),
+        ):
+            ir.assert_structural_equal(actual, expected)
+            assert not passes.PropertyVerifierRegistry.verify(props, actual)
+
+    def test_tile_alias_memory_space_follows_rhs(self):
+        """Assignment retyping must not reapply stale LHS storage metadata."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def helper(self, source: pl.Tile[[4, 8], pl.FP32]):
+                _alias: pl.Tile[[4, 8], pl.FP32, pl.Mem.Vec] = source
+
+            @pl.function
+            def main(self, source: pl.Tile[[4, 8], pl.FP32]):
+                self.helper(source)
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, source: pl.Tile[[4, 8], pl.FP32]):
+                _alias = source
+
+        # This regression deliberately supplies stale alias types to the
+        # normalization pass; verify its repaired output, not that input.
+        instrument = passes.VerificationInstrument(passes.VerificationMode.AFTER)
+        with passes.PassContext([instrument]):
+            after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        ir.assert_structural_equal(passes.convert_to_ssa()(after), passes.convert_to_ssa()(Expected))
+
+    def test_inline_alias_inherits_actual_memref(self):
+        """Structural type equality alone must not discard the RHS allocation."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def helper(self, source: pl.Tile[[4, 8], pl.FP32, pl.Mem.Vec]):
+                _alias = source
+
+            @pl.function
+            def main(self, data: pl.Tensor[[4, 8], pl.FP32]):
+                source: pl.Tile[[4, 8], pl.FP32, pl.MemRef("scratch"), pl.Mem.Vec] = pl.load(
+                    data, [0, 0], [4, 8], target_memory=pl.Mem.Vec
+                )
+                self.helper(source)
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, data: pl.Tensor[[4, 8], pl.FP32]):
+                source: pl.Tile[[4, 8], pl.FP32, pl.MemRef("scratch"), pl.Mem.Vec] = pl.load(
+                    data, [0, 0], [4, 8], target_memory=pl.Mem.Vec
+                )
+                _alias = source
+
+        after = passes.inline_functions()(Before)
+        for actual, expected in (
+            (after, Expected),
+            (passes.convert_to_ssa()(after), passes.convert_to_ssa()(Expected)),
+        ):
+            ir.assert_structural_equal(actual, expected)
+            main = next(iter(actual.functions.values()))
+            assert isinstance(main.body, ir.SeqStmts)
+            source, alias = main.body.stmts
+            assert isinstance(source, ir.AssignStmt)
+            assert isinstance(alias, ir.AssignStmt)
+            assert isinstance(source.var.type, ir.TileType)
+            assert isinstance(alias.var.type, ir.TileType)
+            assert source.var.type.memref is not None
+            assert alias.var.type.memref is source.var.type.memref
+
+    def test_shared_formal_dimension_keeps_each_actual_tensor_shape(self):
+        formal_rows = pl.dynamic("formal_rows")
+        first_rows = pl.dynamic("first_rows")
+        second_rows = pl.dynamic("second_rows")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def fill(
+                self,
+                first: pl.Tensor[[formal_rows, 16], pl.FP32],
+                second: pl.Tensor[[formal_rows, 16], pl.FP32],
+                row: pl.Tensor[[1, 16], pl.FP32],
+            ):
+                first_update = pl.tensor.assemble(first, row, [0, 0])
+                first = first_update
+                second_update = pl.tensor.assemble(second, row, [0, 0])
+                second = second_update
+
+            @pl.function
+            def main(
+                self,
+                first: pl.Tensor[[first_rows, 16], pl.FP32],
+                second: pl.Tensor[[second_rows, 16], pl.FP32],
+                row: pl.Tensor[[1, 16], pl.FP32],
+            ):
+                self.fill(first, second, row)
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                first: pl.Tensor[[first_rows, 16], pl.FP32],
+                second: pl.Tensor[[second_rows, 16], pl.FP32],
+                row: pl.Tensor[[1, 16], pl.FP32],
+            ):
+                first_update = pl.tensor.assemble(first, row, [0, 0])
+                first = first_update
+                second_update = pl.tensor.assemble(second, row, [0, 0])
+                second = second_update
+
+        ir.assert_structural_equal(passes.inline_functions()(Before), Expected)
+
+    def test_computed_scalar_argument_preserves_caller_tensor_identity(self):
+        shared_rows = pl.dynamic("shared_rows")
+        caller_rows = pl.dynamic("caller_rows")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def fill(
+                self,
+                out: pl.Tensor[[shared_rows, 16], pl.FP32],
+                row: pl.Tensor[[1, 16], pl.FP32],
+                count: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[shared_rows, 16], pl.FP32]:
+                if count > 0:
+                    out = pl.tensor.assemble(out, row, [0, 0])
+                return out
+
+            @pl.function
+            def main(
+                self,
+                ids: pl.Tensor[[shared_rows], pl.INT32],
+                out: pl.Tensor[[caller_rows, 16], pl.FP32],
+                row: pl.Tensor[[1, 16], pl.FP32],
+            ) -> pl.Tensor[[caller_rows, 16], pl.FP32]:
+                out = self.fill(out, row, pl.tensor.dim(ids, 0))
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                ids: pl.Tensor[[shared_rows], pl.INT32],
+                out: pl.Tensor[[caller_rows, 16], pl.FP32],
+                row: pl.Tensor[[1, 16], pl.FP32],
+            ) -> pl.Tensor[[caller_rows, 16], pl.FP32]:
+                if pl.tensor.dim(ids, 0) > 0:
+                    out = pl.tensor.assemble(out, row, [0, 0])
+                return out
+
+        ir.assert_structural_equal(passes.inline_functions()(Before), Expected)
+
+    def test_shape_expression_binding_preserves_caller_symbols(self):
+        shared_rows = pl.dynamic("shared_rows")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def fill(
+                self,
+                out: pl.Tensor[[shared_rows, 16], pl.FP32],
+                row: pl.Tensor[[1, 16], pl.FP32],
+            ):
+                updated = pl.tensor.assemble(out, row, [0, 0])
+                out = updated
+
+            @pl.function
+            def main(
+                self,
+                out: pl.Tensor[[shared_rows + 1, 16], pl.FP32],
+                row: pl.Tensor[[1, 16], pl.FP32],
+            ) -> pl.Tensor[[shared_rows + 1, 16], pl.FP32]:
+                self.fill(out, row)
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                out: pl.Tensor[[shared_rows + 1, 16], pl.FP32],
+                row: pl.Tensor[[1, 16], pl.FP32],
+            ) -> pl.Tensor[[shared_rows + 1, 16], pl.FP32]:
+                updated = pl.tensor.assemble(out, row, [0, 0])
+                out = updated
+                return out
+
+        ir.assert_structural_equal(passes.inline_functions()(Before), Expected)
+
+    @pytest.mark.parametrize("via_alias", [False, True])
+    def test_conditional_assemble_uses_actual_tensor_shape(self, via_alias):
+        formal_rows = pl.dynamic("formal_rows")
+        caller_rows = pl.dynamic("caller_rows")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def fill(
+                self,
+                out: pl.Tensor[[formal_rows, 16], pl.FP32],
+                row: pl.Tensor[[1, 16], pl.FP32],
+                active: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[formal_rows, 16], pl.FP32]:
+                if active > 0:
+                    if via_alias:
+                        updated = pl.tensor.assemble(out, row, [0, 0])
+                        out = updated
+                    else:
+                        out = pl.tensor.assemble(out, row, [0, 0])
+                return out
+
+            @pl.function
+            def main(
+                self,
+                out: pl.Tensor[[caller_rows, 16], pl.FP32],
+                row: pl.Tensor[[1, 16], pl.FP32],
+                active: pl.Scalar[pl.INDEX],
+            ):
+                result = self.fill(out, row, active)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                out: pl.Tensor[[caller_rows, 16], pl.FP32],
+                row: pl.Tensor[[1, 16], pl.FP32],
+                active: pl.Scalar[pl.INDEX],
+            ):
+                if active > 0:
+                    if via_alias:
+                        updated = pl.tensor.assemble(out, row, [0, 0])
+                        out = updated
+                    else:
+                        out = pl.tensor.assemble(out, row, [0, 0])
+                result = out
+                return result
+
+        ir.assert_structural_equal(passes.inline_functions()(Before), Expected)
+
+    def test_local_dimensions_and_valid_shapes_are_fresh_at_each_call_site(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def helper(self, x: pl.Tensor[[16, 16], pl.FP32], n: pl.Scalar[pl.INDEX]):
+                rows = n + 1
+                out = pl.tensor.create([rows, 16], dtype=pl.FP32)
+                view = pl.tensor.slice(x, [8, 16], [0, 0], valid_shape=[rows, 16])
+                tile = pl.tile.load(view, [0, 0], [8, 16])
+                out = pl.tile.store(tile, [0, 0], out)
+                return out
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[16, 16], pl.FP32],
+                first_rows: pl.Scalar[pl.INDEX],
+                second_rows: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                self.helper(x, first_rows)
+                self.helper(x, second_rows)
+                return x
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[16, 16], pl.FP32],
+                first_rows: pl.Scalar[pl.INDEX],
+                second_rows: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                rows_first = first_rows + 1
+                out_first = pl.tensor.create([rows_first, 16], dtype=pl.FP32)
+                view_first = pl.tensor.slice(x, [8, 16], [0, 0], valid_shape=[rows_first, 16])
+                tile_first = pl.tile.load(view_first, [0, 0], [8, 16])
+                out_first = pl.tile.store(tile_first, [0, 0], out_first)
+                rows_second = second_rows + 1
+                out_second = pl.tensor.create([rows_second, 16], dtype=pl.FP32)
+                view_second = pl.tensor.slice(x, [8, 16], [0, 0], valid_shape=[rows_second, 16])
+                tile_second = pl.tile.load(view_second, [0, 0], [8, 16])
+                out_second = pl.tile.store(tile_second, [0, 0], out_second)
+                return x
+
+        ir.assert_structural_equal(passes.inline_functions()(Before), Expected)
+
+    def test_for_loop_carried_dimensions_reference_fresh_iter_args(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def helper(self, n: pl.Scalar[pl.INDEX]):
+                for i, (rows,) in pl.range(2, init_values=(n,)):
+                    _out = pl.tensor.create([rows, 16], dtype=pl.FP32)
+                    _done = pl.yield_(rows + 1)
+
+            @pl.function
+            def main(self, initial_rows: pl.Scalar[pl.INDEX]):
+                self.helper(initial_rows)
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, initial_rows: pl.Scalar[pl.INDEX]):
+                for i, (rows,) in pl.range(2, init_values=(initial_rows,)):
+                    _out = pl.tensor.create([rows, 16], dtype=pl.FP32)
+                    _done = pl.yield_(rows + 1)
+
+        ir.assert_structural_equal(passes.inline_functions()(Before), Expected)
+
+    def test_while_loop_carried_dimensions_reference_fresh_iter_args(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def helper(self, n: pl.Scalar[pl.INDEX]):
+                for (rows,) in pl.while_(init_values=(n,)):
+                    pl.cond(rows < 16)
+                    _out = pl.tensor.create([rows, 16], dtype=pl.FP32)
+                    _done = pl.yield_(rows + 1)
+
+            @pl.function
+            def main(self, initial_rows: pl.Scalar[pl.INDEX]):
+                self.helper(initial_rows)
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, initial_rows: pl.Scalar[pl.INDEX]):
+                for (rows,) in pl.while_(init_values=(initial_rows,)):
+                    pl.cond(rows < 16)
+                    _out = pl.tensor.create([rows, 16], dtype=pl.FP32)
+                    _done = pl.yield_(rows + 1)
+
+        ir.assert_structural_equal(passes.inline_functions()(Before), Expected)
+
+    def test_inline_submit_preserves_task_result_and_dependencies(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(self, x: pl.Tensor[[16], pl.FP32]) -> pl.Tensor[[16], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Inline)
+            def helper(self, x: pl.Tensor[[16], pl.FP32], n: pl.Scalar[pl.INDEX]):
+                with pl.manual_scope():
+                    prior = pl.system.task_dummy(deps=[])
+                    out, tid = pl.spmd_submit(self.kernel, x, core_num=n, deps=[prior])
+                    _fence = pl.system.task_dummy(deps=[tid])
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[16], pl.FP32], blocks: pl.Scalar[pl.INDEX]):
+                result = self.helper(x, blocks)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(self, x: pl.Tensor[[16], pl.FP32]) -> pl.Tensor[[16], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[16], pl.FP32], blocks: pl.Scalar[pl.INDEX]):
+                with pl.manual_scope():
+                    prior = pl.system.task_dummy(deps=[])
+                    out, tid = pl.spmd_submit(self.kernel, x, core_num=blocks, deps=[prior])
+                    _fence = pl.system.task_dummy(deps=[tid])
+                result = out
+                return result
+
+        ir.assert_structural_equal(passes.inline_functions()(Before), Expected)
 
 
 class TestInlineFunctionsCycles:
@@ -396,6 +1229,288 @@ class TestInlineFunctionsBodyShapes:
         ir.assert_structural_equal(After, Expected)
 
 
+class TestInlineFunctionsDumpMarks:
+    """Selective-dump marks (``dump_vars``) on the scopes an Inline body splices in."""
+
+    def test_call_site_tag_follows_local_binding_into_scope(self):
+        """A tagged argument stays selected when the inline parameter is localized."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def helper(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    x = pl.add(x, x)
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, a: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                pl.dump_tag(a)
+                r = self.helper(a)
+                return r
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, a: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                local = a
+                with pl.at(level=pl.Level.CORE_GROUP, dumps=[local]):
+                    local = pl.add(local, local)
+                r = local
+                return r
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        ir.assert_structural_equal(after, pl.parse_program(after.as_python()))
+
+    def test_call_site_tag_follows_local_binding_into_dispatch(self):
+        """A void inline call preserves tags on a nested cross-function dispatch."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def double(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return pl.add(x, x)
+
+            @pl.function(type=pl.FunctionType.Inline)
+            def helper(self, x: pl.Tensor[[64], pl.FP32]):
+                x = self.double(x)
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, a: pl.Tensor[[64], pl.FP32]):
+                pl.dump_tag(a)
+                self.helper(a)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def double(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return pl.add(x, x)
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, a: pl.Tensor[[64], pl.FP32]):
+                local = a
+                pl.dump_tag(local)
+                local = self.double(local)
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        ir.assert_structural_equal(after, pl.parse_program(after.as_python()))
+
+    def test_call_site_tag_follows_local_binding_into_submits(self):
+        """Both submit forms preserve dependencies, existing dumps, and repeated args."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                y: pl.Tensor[[64], pl.FP32],
+                z: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                return pl.add(x, pl.add(y, z))
+
+            @pl.function(type=pl.FunctionType.Inline)
+            def helper(
+                self, x: pl.Tensor[[64], pl.FP32], y: pl.Tensor[[64], pl.FP32]
+            ) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    prior = pl.system.task_dummy(deps=[])
+                    first, first_tid = pl.submit(self.kernel, x, y, x, deps=[prior], dumps=[y, y])
+                    x = first
+                    second, second_tid = pl.spmd_submit(
+                        self.kernel, x, y, x, core_num=2, deps=[first_tid], dumps=[y, y]
+                    )
+                    x = second
+                    _fence = pl.system.task_dummy(deps=[second_tid])
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self, a: pl.Tensor[[64], pl.FP32], b: pl.Tensor[[64], pl.FP32]
+            ) -> pl.Tensor[[64], pl.FP32]:
+                pl.dump_tag(a)
+                result = self.helper(a, b)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                y: pl.Tensor[[64], pl.FP32],
+                z: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                return pl.add(x, pl.add(y, z))
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self, a: pl.Tensor[[64], pl.FP32], b: pl.Tensor[[64], pl.FP32]
+            ) -> pl.Tensor[[64], pl.FP32]:
+                local = a
+                with pl.manual_scope():
+                    prior = pl.system.task_dummy(deps=[])
+                    first, first_tid = pl.submit(self.kernel, local, b, local, deps=[prior], dumps=[b, local])
+                    local = first
+                    second, second_tid = pl.spmd_submit(
+                        self.kernel, local, b, local, core_num=2, deps=[first_tid], dumps=[b, local]
+                    )
+                    local = second
+                    _fence = pl.system.task_dummy(deps=[second_tid])
+                result = local
+                return result
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        ir.assert_structural_equal(after, pl.parse_program(after.as_python()))
+        ir.assert_structural_equal(passes.convert_to_ssa()(after), passes.convert_to_ssa()(Expected))
+
+    def test_call_site_tag_follows_nested_local_bindings(self):
+        """A return-position inline call keeps the tag through a second local handle."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def leaf(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    x = pl.add(x, x)
+                return x
+
+            @pl.function(type=pl.FunctionType.Inline)
+            def helper(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                x = self.leaf(x)
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, a: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                pl.dump_tag(a)
+                return self.helper(a)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, a: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                outer = a
+                inner = outer
+                with pl.at(level=pl.Level.CORE_GROUP, dumps=[inner]):
+                    inner = pl.add(inner, inner)
+                outer = inner
+                return outer
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        ir.assert_structural_equal(after, pl.parse_program(after.as_python()))
+
+    def test_helper_tag_on_cluster_follows_param_substitution(self):
+        """A helper-local ``pl.dump_tag(x)`` lands on its ``pl.cluster`` scope as
+        well as on the inner ``pl.at`` carrier; splicing must rename ``x`` to the
+        caller's arg on both, or the Cluster's mark names a Var the caller never
+        binds and the outliner silently drops it."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def helper(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                pl.dump_tag(x)
+                with pl.cluster():
+                    with pl.at(level=pl.Level.CORE_GROUP):
+                        y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+                return y
+
+            @pl.function
+            def main(self, a: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                r: pl.Tensor[[64], pl.FP32] = self.helper(a)
+                return r
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, a: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.cluster(dumps=[a]):
+                    with pl.at(level=pl.Level.CORE_GROUP, dumps=[a]):
+                        y_inline: pl.Tensor[[64], pl.FP32] = pl.add(a, a)
+                r: pl.Tensor[[64], pl.FP32] = y_inline
+                return r
+
+        After = passes.inline_functions()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_helper_tag_on_graph_follows_param_substitution(self):
+        """Same as the Cluster case for a ``pl.graph`` region, whose mark marks
+        the graph task itself."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def helper(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                pl.dump_tag(x)
+                with pl.graph("g"):
+                    with pl.at(level=pl.Level.CORE_GROUP):
+                        y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+                return y
+
+            @pl.function
+            def main(self, a: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                r: pl.Tensor[[64], pl.FP32] = self.helper(a)
+                return r
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, a: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.graph("g", dumps=[a]):
+                    with pl.at(level=pl.Level.CORE_GROUP, dumps=[a]):
+                        y_inline: pl.Tensor[[64], pl.FP32] = pl.add(a, a)
+                r: pl.Tensor[[64], pl.FP32] = y_inline
+                return r
+
+        After = passes.inline_functions()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_call_site_tag_skips_split_aiv_region(self):
+        """A call-site tag is transferred onto the spliced ``pl.at`` carrier but
+        not onto the ``pl.split_aiv`` region inside it: that region is never
+        outlined into a dispatch, and ``pl.split_aiv`` has no ``dumps=`` to print
+        a mark as."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def helper(
+                self, x: pl.Tensor[[128, 128], pl.FP32], out: pl.Tensor[[128, 128], pl.FP32]
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    for aiv in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                        t: pl.Tile[[64, 128], pl.FP32] = pl.load(x, [aiv * 64, 0], [64, 128])
+                        out = pl.store(t, [aiv * 64, 0], out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self, a: pl.Tensor[[128, 128], pl.FP32], out: pl.Out[pl.Tensor[[128, 128], pl.FP32]]
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                pl.dump_tag(a)
+                out = self.helper(a, out)
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self, a: pl.Tensor[[128, 128], pl.FP32], out: pl.Out[pl.Tensor[[128, 128], pl.FP32]]
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP, dumps=[a]):
+                    for aiv in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                        t: pl.Tile[[64, 128], pl.FP32] = pl.load(a, [aiv * 64, 0], [64, 128])
+                        out = pl.store(t, [aiv * 64, 0], out)
+                return out
+
+        After = passes.inline_functions()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+
 class TestInlineFunctionsDeadCode:
     """Inline functions with no callers."""
 
@@ -403,9 +1518,8 @@ class TestInlineFunctionsDeadCode:
         """An Inline function with no call sites is removed from the program and
         the surviving caller body is left byte-for-byte unchanged.
 
-        ``unused`` has no Call site, so the fixpoint loop never splices it (no
-        ``any_changed``); the cleanup phase (src lines 596-603) drops it purely
-        because ``func_type_ == Inline``. ``main`` carries no inline call, so it
+        ``unused`` has no Call site; cleanup drops it because its
+        ``func_type_ == Inline``. ``main`` carries no inline call, so it
         passes through verbatim — hence Expected is just ``main`` alone."""
 
         @pl.program
@@ -453,6 +1567,263 @@ class TestInlineFunctionsInDefaultPipeline:
         After = pm.run_passes(P)
         names = [f.name for f in After.functions.values()]
         assert "helper" not in names
+
+    def test_live_returned_tuple_reaches_orchestration_codegen(self):
+        """Keeping a used tuple must preserve both its body write and returned operands."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(
+                self, x: pl.Tensor[[16], pl.FP32], out: pl.Out[pl.Tensor[[16], pl.FP32]]
+            ) -> pl.Tensor[[16], pl.FP32]:
+                return pl.store(pl.load(x, [0], [16]), [0], out)
+
+            @pl.function(type=pl.FunctionType.Inline)
+            def helper(self, x: pl.Tensor[[16], pl.FP32], out: pl.Tensor[[16], pl.FP32]):
+                tmp = (x, x)
+                out = self.consume(tmp[0], out)
+                return tmp
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self, x: pl.Tensor[[16], pl.FP32], out: pl.Out[pl.Tensor[[16], pl.FP32]]
+            ) -> pl.Tensor[[16], pl.FP32]:
+                a, b = self.helper(x, out)
+                out = self.consume(a, out)
+                out = self.consume(b, out)
+                return out
+
+        lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Program)
+        orch = next(f for f in lowered.functions.values() if f.func_type == ir.FunctionType.Orchestration)
+        generated = codegen.generate_orchestration(lowered, orch).code
+        assert generated.count(".add_input(ext_x)") == 3, generated
+        assert "FREE_VAR" not in generated
+
+
+class TestInlineFunctionsNestedCallSites:
+    """A call in a nested expression position is hoisted, then spliced.
+
+    `HandleTopLevelInlineCall` only recognises a Call that *is* the whole
+    statement value, but the pass drops every Inline function regardless — so a
+    nested call used to survive as a reference to a deleted function and fail
+    only at `GenerateOrchestration preconditions`. Each case below is the shape
+    the parser produces from ordinary DSL.
+    """
+
+    def test_nested_in_call_argument(self):
+        """`arr[i] = helper(x)` desugars to `array.update_element(arr, i, helper(x))`."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def helper(self, x: pl.Tensor[[1], pl.INT32]) -> pl.Tensor[[1], pl.INT32]:
+                y: pl.Tensor[[1], pl.INT32] = pl.mul(x, x)
+                return y
+
+            @pl.function
+            def main(self, a: pl.Tensor[[1], pl.INT32]) -> pl.Tensor[[1], pl.INT32]:
+                z: pl.Tensor[[1], pl.INT32] = pl.add(self.helper(a), a)
+                return z
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, a: pl.Tensor[[1], pl.INT32]) -> pl.Tensor[[1], pl.INT32]:
+                y_inline: pl.Tensor[[1], pl.INT32] = pl.mul(a, a)
+                t_arg: pl.Tensor[[1], pl.INT32] = y_inline
+                z: pl.Tensor[[1], pl.INT32] = pl.add(t_arg, a)
+                return z
+
+        After = passes.inline_functions()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_nested_in_binary_operand(self):
+        """`k = helper(a) + a` — the call is an operand, not the whole value."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def half(self, n: pl.Scalar[pl.INT32]) -> pl.Scalar[pl.INT32]:
+                m: pl.Scalar[pl.INT32] = n // 2
+                return m
+
+            @pl.function
+            def main(self, n: pl.Scalar[pl.INT32]) -> pl.Scalar[pl.INT32]:
+                k: pl.Scalar[pl.INT32] = self.half(n) + 1
+                return k
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, n: pl.Scalar[pl.INT32]) -> pl.Scalar[pl.INT32]:
+                m_inline: pl.Scalar[pl.INT32] = n // 2
+                t_arg: pl.Scalar[pl.INT32] = m_inline
+                k: pl.Scalar[pl.INT32] = t_arg + 1
+                return k
+
+        After = passes.inline_functions()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_inline_call_as_argument_of_inline_call(self):
+        """`half(half(n))` — the pass's transitive-inline feature, written as one expression."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def half(self, n: pl.Scalar[pl.INT32]) -> pl.Scalar[pl.INT32]:
+                m: pl.Scalar[pl.INT32] = n // 2
+                return m
+
+            @pl.function
+            def main(self, n: pl.Scalar[pl.INT32]) -> pl.Scalar[pl.INT32]:
+                k: pl.Scalar[pl.INT32] = self.half(self.half(n))
+                return k
+
+        After = passes.inline_functions()(Before)
+        printed = ir.python_print(After)
+        assert "half" not in printed, printed
+        assert printed.count("// 2") == 2, printed
+
+    def test_nested_in_loop_bound(self):
+        """A loop bound is evaluated once before the loop, so hoisting it is semantics-preserving."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def half(self, n: pl.Scalar[pl.INT32]) -> pl.Scalar[pl.INT32]:
+                m: pl.Scalar[pl.INT32] = n // 2
+                return m
+
+            @pl.function
+            def main(self, a: pl.Tensor[[1], pl.INT32], n: pl.Scalar[pl.INT32]) -> pl.Scalar[pl.INT32]:
+                for _i in pl.range(self.half(n)):
+                    _t: pl.Tensor[[1], pl.INT32] = pl.mul(a, a)
+                return n
+
+        After = passes.inline_functions()(Before)
+        printed = ir.python_print(After)
+        assert "half" not in printed, printed
+        # The hoisted bound precedes the loop it feeds.
+        assert printed.index("// 2") < printed.index("pl.range"), printed
+
+    def test_top_level_call_site_gains_no_temporary(self):
+        """`z = helper(a)` already splices; hoisting must not add a redundant copy."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def helper(self, x: pl.Tensor[[1], pl.INT32]) -> pl.Tensor[[1], pl.INT32]:
+                y: pl.Tensor[[1], pl.INT32] = pl.mul(x, x)
+                return y
+
+            @pl.function
+            def main(self, a: pl.Tensor[[1], pl.INT32]) -> pl.Tensor[[1], pl.INT32]:
+                z: pl.Tensor[[1], pl.INT32] = self.helper(a)
+                return z
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, a: pl.Tensor[[1], pl.INT32]) -> pl.Tensor[[1], pl.INT32]:
+                y_inline: pl.Tensor[[1], pl.INT32] = pl.mul(a, a)
+                z: pl.Tensor[[1], pl.INT32] = y_inline
+                return z
+
+        After = passes.inline_functions()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_tuple_returning_callee_is_not_hoisted(self):
+        """A tuple-returning callee must stay put — hoisting it leaves an undefined temp.
+
+        `SpliceInlineCallAsTupleSub` deliberately emits no `tmp = ...` binding: it
+        records the cloned return values against the LHS `Var` and rewrites
+        downstream `TupleGetItemExpr(tmp, i)` uses instead. A nested consumer holds
+        `tmp` itself, not a `TupleGetItemExpr`, so a hoist would print
+        `t__inline_arg_v0__FREE_VAR`. Leaving the Call in place keeps the pre-hoist
+        behaviour, and `InlineFunctionsEliminated` reports it.
+
+        Written as source text because the IR shape — a multi-value `ReturnStmt`
+        whose first value is a tuple — has no Python-typeable annotation: the DSL
+        rejects a nested `tuple[...]` return, and a flat one contradicts what the
+        callee returns.
+        """
+        source = """
+@pl.program
+class Before:
+    @pl.function(type=pl.FunctionType.Inline)
+    def pair(self, x: pl.Tensor[[1], pl.INT32]) -> tuple[pl.Tensor[[1], pl.INT32], pl.Tensor[[1], pl.INT32]]:
+        a: pl.Tensor[[1], pl.INT32] = pl.tensor.mul(x, x)
+        b: pl.Tensor[[1], pl.INT32] = pl.tensor.add(x, x)
+        return a, b
+
+    @pl.function
+    def main(self, x: pl.Tensor[[1], pl.INT32]) -> tuple[
+            pl.Tensor[[1], pl.INT32], pl.Tensor[[1], pl.INT32], pl.Tensor[[1], pl.INT32]]:
+        y: pl.Tensor[[1], pl.INT32] = pl.tensor.mul(x, x)
+        return self.pair(x), y
+"""
+        Before = pl.parse_program(source)
+
+        # InlineFunctionsEliminated is in GetVerifiedProperties(), so the
+        # un-spliced Call is reported by the pass's own post-verification — at
+        # the `return self.pair(x), y` line, not 40 passes later in codegen.
+        with pytest.raises(pypto.Error, match=r"Dangling Call to function 'pair'"):
+            passes.inline_functions()(Before)
+
+        # The IR itself is intact: the Call stays where it was, and no temp is
+        # left dangling (`t__inline_arg_vN__FREE_VAR`).
+        with passes.PassContext([], passes.VerificationLevel.NONE):
+            After = passes.inline_functions()(Before)
+        printed = ir.python_print(After)
+        assert "FREE_VAR" not in printed, printed
+        assert "self.pair(x)" in printed, printed
+
+    def test_tuple_unpack_call_site_still_splices(self):
+        """The ordinary `a, b = self.pair(x)` form is unaffected by the hoist skip."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def pair(
+                self, x: pl.Tensor[[1], pl.INT32]
+            ) -> tuple[pl.Tensor[[1], pl.INT32], pl.Tensor[[1], pl.INT32]]:
+                a: pl.Tensor[[1], pl.INT32] = pl.mul(x, x)
+                b: pl.Tensor[[1], pl.INT32] = pl.add(x, x)
+                return a, b
+
+            @pl.function
+            def main(self, x: pl.Tensor[[1], pl.INT32]) -> pl.Tensor[[1], pl.INT32]:
+                p, q = self.pair(x)
+                z: pl.Tensor[[1], pl.INT32] = pl.add(p, q)
+                return z
+
+        After = passes.inline_functions()(Before)
+        printed = ir.python_print(After)
+        assert "pair" not in printed, printed
+        assert "FREE_VAR" not in printed, printed
+
+    def test_verifier_silent_after_nested_call_site(self):
+        """The nested form leaves nothing for InlineFunctionsEliminated to report."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def helper(self, x: pl.Tensor[[1], pl.INT32]) -> pl.Tensor[[1], pl.INT32]:
+                y: pl.Tensor[[1], pl.INT32] = pl.mul(x, x)
+                return y
+
+            @pl.function
+            def main(self, a: pl.Tensor[[1], pl.INT32]) -> pl.Tensor[[1], pl.INT32]:
+                z: pl.Tensor[[1], pl.INT32] = pl.add(self.helper(a), a)
+                return z
+
+        After = passes.inline_functions()(Before)
+        ps = core_passes.IRPropertySet()
+        ps.insert(core_passes.IRProperty.InlineFunctionsEliminated)
+        diagnostics = core_passes.PropertyVerifierRegistry.verify(ps, After)
+        errors = [d for d in diagnostics if d.severity == core_passes.DiagnosticSeverity.Error]
+        assert errors == [], f"Expected no survivors, got {[d.message for d in errors]}"
 
 
 class TestInlineFunctionsEliminatedVerifier:
@@ -614,6 +1985,666 @@ class TestInlineFunctionsParamRebinding:
                 return q, k, v
 
         ir.assert_structural_equal(After, Expected)
+
+    def test_rebound_param_with_slice_arg_binds_temporary(self):
+        """A rebound param whose actual arg is a slice is bound to a temporary.
+
+        Substituting ``ext[r]`` for ``out`` at the rebinding's def-site would put
+        a ``tensor.slice`` Call on the LHS of an AssignStmt, which used to fail
+        with ``InternalError: AssignStmt var is not a Var after mutation``. The
+        splice instead binds the slice to a fresh Var first, which is the IR the
+        parser already produces when the caller names the slice itself.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def write0(self, x: pl.Tensor[[4], pl.FP32], out: pl.Tensor[[4], pl.FP32]):
+                out = pl.tensor.assemble(out, x, [0])
+
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[4], pl.FP32],
+                ext: pl.Out[pl.Tensor[[2, 4], pl.FP32]],
+            ) -> pl.Tensor[[2, 4], pl.FP32]:
+                for r in pl.range(2):
+                    self.write0(a, ext[r])
+                return ext
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[4], pl.FP32],
+                ext: pl.Out[pl.Tensor[[2, 4], pl.FP32]],
+            ) -> pl.Tensor[[2, 4], pl.FP32]:
+                for r in pl.range(2):
+                    out: pl.Tensor[[4], pl.FP32] = ext[r]
+                    out = pl.tensor.assemble(out, a, [0])
+                return ext
+
+        After = passes.inline_functions()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_rebound_param_with_iter_arg_binds_temporary(self):
+        """An IterArg actual arg is not an assignable Var either, so a rebound
+        param bound to one gets the same temporary instead of crashing."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def write0(self, x: pl.Tensor[[4], pl.FP32], out: pl.Tensor[[4], pl.FP32]):
+                out = pl.tensor.assemble(out, x, [0])
+
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[4], pl.FP32],
+                ext: pl.Out[pl.Tensor[[4], pl.FP32]],
+            ) -> pl.Tensor[[4], pl.FP32]:
+                for i, (acc,) in pl.range(2, init_values=(ext,)):
+                    self.write0(a, acc)
+                    acc = pl.yield_(acc)
+                return ext
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[4], pl.FP32],
+                ext: pl.Out[pl.Tensor[[4], pl.FP32]],
+            ) -> pl.Tensor[[4], pl.FP32]:
+                for i, (acc,) in pl.range(2, init_values=(ext,)):
+                    out: pl.Tensor[[4], pl.FP32] = acc
+                    out = pl.tensor.assemble(out, a, [0])
+                    acc = pl.yield_(acc)
+                return ext
+
+        After = passes.inline_functions()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_read_only_param_with_slice_arg_binds_temporary(self):
+        """A computed tensor arg is evaluated once at the call site even when
+        the callee only reads it.
+
+        Substituting ``a[r]`` verbatim would re-evaluate the slice at every use
+        inside the callee body, moving it into whatever ``pl.spmd`` /
+        ``pl.pipeline`` / ``pl.at`` scope holds that use and therefore into the
+        outlined kernel.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def write0(self, x: pl.Tensor[[4], pl.FP32], out: pl.Tensor[[4], pl.FP32]):
+                out = pl.tensor.assemble(out, x, [0])
+
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[2, 4], pl.FP32],
+                ext: pl.Out[pl.Tensor[[4], pl.FP32]],
+            ) -> pl.Tensor[[4], pl.FP32]:
+                for r in pl.range(2):
+                    self.write0(a[r], ext)
+                return ext
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[2, 4], pl.FP32],
+                ext: pl.Out[pl.Tensor[[4], pl.FP32]],
+            ) -> pl.Tensor[[4], pl.FP32]:
+                for r in pl.range(2):
+                    x: pl.Tensor[[4], pl.FP32] = a[r]
+                    ext = pl.tensor.assemble(ext, x, [0])
+                return ext
+
+        After = passes.inline_functions()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_scalar_expression_arg_is_substituted_in_place(self):
+        """A read-only scalar arg is not bound: only computed tensor / tile args
+        are, so scalar expressions keep folding into the callee body."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def dbl(self, n: pl.Scalar[pl.INDEX]) -> pl.Scalar[pl.INDEX]:
+                m: pl.Scalar[pl.INDEX] = n * 2
+                return m
+
+            @pl.function
+            def main(self, k: pl.Scalar[pl.INDEX]) -> pl.Scalar[pl.INDEX]:
+                y: pl.Scalar[pl.INDEX] = self.dbl(k + 1)
+                return y
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, k: pl.Scalar[pl.INDEX]) -> pl.Scalar[pl.INDEX]:
+                m: pl.Scalar[pl.INDEX] = (k + 1) * 2
+                y: pl.Scalar[pl.INDEX] = m
+                return y
+
+        After = passes.inline_functions()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_rebound_scalar_param_does_not_clobber_caller_arg(self):
+        """A rebound pass-by-value scalar param binds a call-site temporary.
+
+        ``n`` is an ``In`` scalar — Python pass-by-value, no in-place contract.
+        Substituting the caller's ``k`` at the *def*-site would splice
+        ``k = k + 1`` into the caller, so the later ``k + m`` would read the
+        bumped value and compute ``2k + 2`` instead of ``2k + 1``."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def bump(self, n: pl.Scalar[pl.INDEX]) -> pl.Scalar[pl.INDEX]:
+                n = n + 1
+                return n
+
+            @pl.function
+            def main(self, k: pl.Scalar[pl.INDEX]) -> pl.Scalar[pl.INDEX]:
+                m: pl.Scalar[pl.INDEX] = self.bump(k)
+                s: pl.Scalar[pl.INDEX] = k + m
+                return s
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, k: pl.Scalar[pl.INDEX]) -> pl.Scalar[pl.INDEX]:
+                n_inline0: pl.Scalar[pl.INDEX] = k  # call-site temporary
+                n_inline0 = n_inline0 + 1  # rebinding stays callee-local
+                m: pl.Scalar[pl.INDEX] = n_inline0
+                s: pl.Scalar[pl.INDEX] = k + m  # reads the ORIGINAL k
+                return s
+
+        After = passes.inline_functions()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_tensor_value_rebinding_keeps_caller_argument(self):
+        """A callee-local add result must not replace the caller's input."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def twice(self, t: pl.Tensor[[4], pl.FP32]) -> pl.Tensor[[4], pl.FP32]:
+                t = pl.add(t, t)
+                return t
+
+            @pl.function
+            def main(self, a: pl.Tensor[[4], pl.FP32]):
+                u = self.twice(a)
+                v = self.twice(a)
+                return pl.add(a, pl.add(u, v))
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, a: pl.Tensor[[4], pl.FP32]):
+                t0 = a
+                t0 = pl.add(t0, t0)
+                u = t0
+                t1 = a
+                t1 = pl.add(t1, t1)
+                v = t1
+                return pl.add(a, pl.add(u, v))
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        ir.assert_structural_equal(passes.convert_to_ssa()(after), passes.convert_to_ssa()(Expected))
+
+    def test_tile_value_rebinding_keeps_caller_argument(self):
+        """Tile parameters have the same local binding semantics as tensors."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def twice(self, t: pl.Tile[[8, 8], pl.FP32]) -> pl.Tile[[8, 8], pl.FP32]:
+                t = pl.tile.add(t, t)
+                return t
+
+            @pl.function
+            def main(self, a: pl.Tile[[8, 8], pl.FP32]):
+                u = self.twice(a)
+                return pl.tile.add(a, u)
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, a: pl.Tile[[8, 8], pl.FP32]):
+                t = a
+                t = pl.tile.add(t, t)
+                u = t
+                return pl.tile.add(a, u)
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+
+    def test_alias_changed_on_later_iteration_cannot_retarget_caller(self):
+        """Alias classification must account for loop backedges, not just DFS order."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def replace(self, t: pl.Tensor[[4], pl.FP32], other: pl.Tensor[[4], pl.FP32]):
+                alias = t
+                for i in pl.range(2):
+                    t = alias
+                    alias = other
+                return t
+
+            @pl.function
+            def main(self, a: pl.Tensor[[4], pl.FP32], b: pl.Tensor[[4], pl.FP32]):
+                u = self.replace(a, b)
+                return a, u
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, a: pl.Tensor[[4], pl.FP32], b: pl.Tensor[[4], pl.FP32]):
+                local = a
+                alias = local
+                for i in pl.range(2):
+                    local = alias
+                    alias = b
+                u = local
+                return a, u
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        ir.assert_structural_equal(passes.convert_to_ssa()(after), passes.convert_to_ssa()(Expected))
+
+    def test_rebinding_from_explicit_iter_arg_keeps_caller_argument(self):
+        """An IterArg's value can come from another buffer and change on each yield."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def replace(self, t: pl.Tensor[[4], pl.FP32], other: pl.Tensor[[4], pl.FP32]):
+                for i, (carry,) in pl.range(2, init_values=(other,)):
+                    t = carry
+                    _result = pl.yield_(pl.add(carry, carry))
+                return t
+
+            @pl.function
+            def main(self, a: pl.Tensor[[4], pl.FP32], b: pl.Tensor[[4], pl.FP32]):
+                u = self.replace(a, b)
+                return a, u
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, a: pl.Tensor[[4], pl.FP32], b: pl.Tensor[[4], pl.FP32]):
+                local = a
+                for i, (carry,) in pl.range(2, init_values=(b,)):
+                    local = carry
+                    _result = pl.yield_(pl.add(carry, carry))
+                u = local
+                return a, u
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        ir.assert_structural_equal(passes.convert_to_ssa()(after), passes.convert_to_ssa()(Expected))
+
+    def test_inout_tensor_value_rebinding_stays_local(self):
+        """Direction describes storage effects, not a reference to the caller's name."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def twice(self, t: pl.InOut[pl.Tensor[[4], pl.FP32]]):
+                t = pl.add(t, t)
+                return t
+
+            @pl.function
+            def main(self, a: pl.Tensor[[4], pl.FP32]):
+                u = self.twice(a)
+                return pl.add(a, u)
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, a: pl.Tensor[[4], pl.FP32]):
+                local = a
+                local = pl.add(local, local)
+                u = local
+                return pl.add(a, u)
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+
+    def test_rebinding_to_another_write_target_keeps_caller_argument(self):
+        """A writeback to a different buffer is still a local name rebinding."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def replace(self, t: pl.Tensor[[4], pl.FP32], other: pl.Tensor[[4], pl.FP32]):
+                t = pl.tensor.assemble(other, t, [0])
+                return t
+
+            @pl.function
+            def main(self, a: pl.Tensor[[4], pl.FP32], b: pl.Tensor[[4], pl.FP32]):
+                u = self.replace(a, b)
+                return a, u
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, a: pl.Tensor[[4], pl.FP32], b: pl.Tensor[[4], pl.FP32]):
+                t = a
+                t = pl.tensor.assemble(b, t, [0])
+                u = t
+                return a, u
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+
+    @pytest.mark.parametrize("count", [0, 1, 3])
+    def test_jit_tensor_loop_rebinding_compiles_with_local_carry(self, count, tmp_path):
+        """Specialization, inlining, SSA and codegen preserve the caller's input."""
+
+        @pl.jit.inline
+        def twice(t: pl.Tensor[[8, 8], pl.FP32]) -> pl.Tensor[[8, 8], pl.FP32]:
+            for i in pl.range(count):
+                t = pl.add(t, t)
+            return t
+
+        @pl.jit
+        def main(a: pl.Tensor[[8, 8], pl.FP32], out: pl.Out[pl.Tensor[[8, 8], pl.FP32]]):
+            with pl.at(pl.Level.CORE_GROUP):
+                u = twice(a)
+                out[:] = pl.add(a, u)
+            return out
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.Orchestration, level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+            def main(
+                self, a: pl.Tensor[[8, 8], pl.FP32], out: pl.Out[pl.Tensor[[8, 8], pl.FP32]]
+            ) -> pl.Tensor[[8, 8], pl.FP32]:
+                with pl.at(pl.Level.CORE_GROUP):
+                    local = a
+                    for i in pl.range(count):
+                        local = pl.add(local, local)
+                    u = local
+                    out[:] = pl.add(a, u)
+                return out
+
+        before = main.specialize()
+        after = passes.inline_functions()(before)
+        ir.assert_structural_equal(after, Expected)
+        ir.assert_structural_equal(passes.convert_to_ssa()(after), passes.convert_to_ssa()(Expected))
+        actual = ir.compile(
+            before,
+            output_dir=str(tmp_path / "actual"),
+            backend_type=backend.BackendType.Ascend950,
+            skip_ptoas=True,
+        )
+        expected = ir.compile(
+            Expected,
+            output_dir=str(tmp_path / "expected"),
+            backend_type=backend.BackendType.Ascend950,
+            skip_ptoas=True,
+        )
+        actual_dump = sorted((actual.output_dir / "passes_dump").glob("*.py"))[-1]
+        expected_dump = sorted((expected.output_dir / "passes_dump").glob("*.py"))[-1]
+        ir.assert_structural_equal(pl.parse(actual_dump.read_text()), pl.parse(expected_dump.read_text()))
+
+    @pytest.mark.parametrize("take_branch", [False, True])
+    def test_mixed_writeback_and_value_rebinding_compiles(self, take_branch, tmp_path):
+        """Writes before detaching affect the argument; later writes affect the local value."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def update(
+                self,
+                t: pl.Tensor[[8, 8], pl.FP32],
+                x: pl.Tensor[[8, 8], pl.FP32],
+                flag: pl.Scalar[pl.BOOL],
+            ):
+                t = pl.tensor.assemble(t, pl.add(x, x), [0, 0])
+                if flag:
+                    t = pl.add(t, t)
+                t = pl.tensor.assemble(t, pl.add(x, pl.add(x, x)), [0, 0])
+                return t
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.InOut[pl.Tensor[[8, 8], pl.FP32]],
+                x: pl.Tensor[[8, 8], pl.FP32],
+                out: pl.Out[pl.Tensor[[8, 8], pl.FP32]],
+            ):
+                with pl.at(pl.Level.CORE_GROUP):
+                    u = self.update(a, x, take_branch)
+                    out[:] = pl.add(a, u)
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.InOut[pl.Tensor[[8, 8], pl.FP32]],
+                x: pl.Tensor[[8, 8], pl.FP32],
+                out: pl.Out[pl.Tensor[[8, 8], pl.FP32]],
+            ):
+                with pl.at(pl.Level.CORE_GROUP):
+                    local = a
+                    local = pl.tensor.assemble(local, pl.add(x, x), [0, 0])
+                    if take_branch:
+                        local = pl.add(local, local)
+                    local = pl.tensor.assemble(local, pl.add(x, pl.add(x, x)), [0, 0])
+                    u = local
+                    out[:] = pl.add(a, u)
+                return out
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        ir.assert_structural_equal(passes.convert_to_ssa()(after), passes.convert_to_ssa()(Expected))
+        actual = ir.compile(
+            Before,
+            output_dir=str(tmp_path / "actual"),
+            backend_type=backend.BackendType.Ascend950,
+            skip_ptoas=True,
+        )
+        expected = ir.compile(
+            Expected,
+            output_dir=str(tmp_path / "expected"),
+            backend_type=backend.BackendType.Ascend950,
+            skip_ptoas=True,
+        )
+        actual_dump = sorted((actual.output_dir / "passes_dump").glob("*.py"))[-1]
+        expected_dump = sorted((expected.output_dir / "passes_dump").glob("*.py"))[-1]
+        ir.assert_structural_equal(pl.parse(actual_dump.read_text()), pl.parse(expected_dump.read_text()))
+
+    def test_rebound_tensor_param_still_aliases_caller_arg(self):
+        """A parameter used only for self-writeback keeps direct substitution.
+
+        Unlike value rebinding, ``assemble(c, ...)`` preserves the destination
+        storage. A bare tensor annotation must still support that writeback
+        without introducing a redundant call-site handle."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def fill(self, x: pl.Tensor[[4], pl.FP32], c: pl.Tensor[[4], pl.FP32]) -> pl.Tensor[[4], pl.FP32]:
+                c = pl.tensor.assemble(c, x, [0])
+                return c
+
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[4], pl.FP32],
+                ext: pl.Out[pl.Tensor[[4], pl.FP32]],
+            ) -> pl.Tensor[[4], pl.FP32]:
+                v: pl.Tensor[[4], pl.FP32] = self.fill(a, ext)
+                return v
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[4], pl.FP32],
+                ext: pl.Out[pl.Tensor[[4], pl.FP32]],
+            ) -> pl.Tensor[[4], pl.FP32]:
+                ext = pl.tensor.assemble(ext, a, [0])  # no temporary: writes through
+                v: pl.Tensor[[4], pl.FP32] = ext
+                return v
+
+        After = passes.inline_functions()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_rebound_array_param_gains_no_bare_alias(self):
+        """A rebound ``pl.Array`` param keeps aliasing the caller's Var.
+
+        An Array is a handle like a tensor: ``a[i] = v`` parses as
+        ``a = pl.array.update_element(a, i, v)``, so the rebinding *is* the
+        update and the caller must see it. Binding a call-site temporary would
+        emit a bare ``vals_inline0 = vals`` alias, which orchestration codegen
+        cannot declare — an array Var comes from ``array.create`` or an alias
+        onto a backing array, never from its type, so it aborts with
+        ``GetCppType called for ArrayType``."""
+
+        @pl.jit.inline
+        def fill(vals: pl.Array[2, pl.INDEX], base: pl.Scalar[pl.INDEX]):
+            for i in pl.range(2):
+                vals[i] = base + i
+
+        @pl.jit
+        def drv(
+            x: pl.Tensor[[64], pl.FP32],
+            k: pl.Scalar[pl.INDEX],
+            o: pl.Out[pl.Tensor[[64], pl.FP32]],
+        ):
+            vals = pl.array.create(2, pl.INDEX)
+            fill(vals, k)
+            o[0:64] = pl.add(x[0:64], x[0:64])
+            return o
+
+        # An Inline function with an Array param trips the ArrayNotEscaped
+        # verifier on the *input* program. The real pipeline never sees it —
+        # InlineFunctions runs first and splices the callee away before any
+        # verification — so run the pass the same way here.
+        with core_passes.PassContext([], core_passes.VerificationLevel.NONE):
+            spliced = passes.inline_functions()(drv.specialize())
+        orch = next(f for f in spliced.functions.values() if f.func_type == ir.FunctionType.Orchestration)
+
+        class BareArrayAliasCollector(ir.IRVisitor):
+            def __init__(self):
+                super().__init__()
+                self.aliases: list[str] = []
+
+            def visit_assign_stmt(self, op):
+                if isinstance(op.value, ir.Var) and isinstance(op.value.type, ir.ArrayType):
+                    self.aliases.append(f"{op.var.name_hint} = {op.value.name_hint}")
+                super().visit_assign_stmt(op)
+
+        collector = BareArrayAliasCollector()
+        collector.visit_function(orch)
+        assert collector.aliases == [], (
+            f"InlineFunctions emitted a bare array alias codegen cannot declare: {collector.aliases}"
+        )
+
+    def test_jit_inline_loop_carried_scalar_rebind_keeps_caller_arg(self):
+        """End-to-end: a ``@pl.jit.inline`` scalar rebind inside a loop.
+
+        The JIT specializer alpha-renames a rebinding only at the scope depth
+        where the name was first bound, so a rebind inside ``pl.range`` reaches
+        InlineFunctions as a genuine def-site of the param. The loop carry must
+        run over a call-site temporary, leaving the caller's ``k`` readable
+        afterwards (``s == k + (k + 6)``, not ``(k + 6) * 2``)."""
+
+        @pl.jit.inline
+        def acc(n: pl.Scalar[pl.INDEX]) -> pl.Scalar[pl.INDEX]:
+            for i in pl.range(4):
+                n = n + i
+            return n
+
+        @pl.jit
+        def drv(
+            a: pl.Tensor[[256], pl.FP32],
+            k: pl.Scalar[pl.INDEX],
+            out: pl.Out[pl.Tensor[[64], pl.FP32]],
+        ):
+            m = acc(k)
+            s = k + m
+            out[0:64] = pl.add(a[s : s + 64], a[s : s + 64])
+            return out
+
+        spliced = passes.inline_functions()(drv.specialize())
+        orch = next(f for f in spliced.functions.values() if f.func_type == ir.FunctionType.Orchestration)
+        caller_k = orch.params[1]
+
+        # The loop must rebind a temporary, never the caller's `k` param.
+        class LoopCarryCollector(ir.IRVisitor):
+            def __init__(self):
+                super().__init__()
+                self.rebound: list[ir.Var] = []
+
+            def visit_assign_stmt(self, op):
+                self.rebound.append(op.var)
+                super().visit_assign_stmt(op)
+
+        collector = LoopCarryCollector()
+        collector.visit_function(orch)
+        rebound_ids = {v.unique_id for v in collector.rebound}
+        assert caller_k.unique_id not in rebound_ids, (
+            "InlineFunctions spliced the callee's rebinding onto the caller's `k`"
+        )
+
+    def test_jit_subscript_write_through_sliced_arg_lowers(self):
+        """End-to-end repro: a ``@pl.jit.inline`` helper writing ``c[...] = v``
+        into a tensor param, called with ``c[r]``, lowers through the default
+        pipeline and still writes into the caller's ``c``."""
+
+        @pl.jit.inline
+        def add_into(x: pl.Tensor[[64, 128], pl.FP32], c: pl.Tensor[[64, 128], pl.FP32]):
+            for i in pl.spmd(2):
+                c0 = i * 64
+                c[0:64, c0 : c0 + 64] = pl.add(x[0:64, c0 : c0 + 64], x[0:64, c0 : c0 + 64])
+
+        @pl.jit
+        def drv(a: pl.Tensor[[2, 64, 128], pl.FP32], c: pl.Out[pl.Tensor[[2, 64, 128], pl.FP32]]):
+            for r in pl.range(2):
+                add_into(a[r], c[r])
+            return c
+
+        # tests/ut/ir/transforms/conftest.py pins the Ascend950 backend.
+        lowered = drv.lower(config=RunConfig(platform="a5"))
+        assert ir.FunctionType.Inline not in {f.func_type for f in lowered.functions.values()}
+
+        class DispatchCollector(ir.IRVisitor):
+            def __init__(self):
+                super().__init__()
+                self.calls: list[ir.Call] = []
+
+            def visit_call(self, op):
+                if isinstance(op.op, ir.GlobalVar):
+                    self.calls.append(op)
+                super().visit_call(op)
+
+        orch = next(f for f in lowered.functions.values() if f.func_type == ir.FunctionType.Orchestration)
+        collector = DispatchCollector()
+        collector.visit_function(orch)
+        assert len(collector.calls) == 1
+        # The kernel's written operand is the bound slice: a view into c's buffer.
+        written_type = collector.calls[0].args[-1].type
+        c_type = orch.params[1].type
+        assert isinstance(written_type, ir.TensorType) and isinstance(c_type, ir.TensorType)
+        assert written_type.memref is not None and c_type.memref is not None
+        assert written_type.memref.base_.unique_id == c_type.memref.base_.unique_id
 
 
 class TestInlineReturnAndMultiReturn:
@@ -800,6 +2831,48 @@ class TestInlineReturnAndMultiReturn:
 
         ir.assert_structural_equal(After, Expected)
 
+    @pytest.mark.parametrize("rebind_source", [False, True])
+    def test_returned_tuple_temporary_keeps_body_uses(self, rebind_source):
+        """A live tuple definition and its captured elements must survive inlining."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def helper(
+                self,
+                x: pl.Tensor[[4], pl.FP32],
+                out: pl.Out[pl.Tensor[[4], pl.FP32]],
+            ) -> tuple[pl.Tensor[[4], pl.FP32], pl.Tensor[[4], pl.FP32]]:
+                tmp = (x, x)
+                out = pl.tensor.assemble(out, tmp[0], [0])
+                if rebind_source:
+                    x = pl.add(x, x)
+                return tmp
+
+            @pl.function
+            def main(self, x: pl.Tensor[[4], pl.FP32], out: pl.Out[pl.Tensor[[4], pl.FP32]]):
+                a, b = self.helper(x, out)
+                return a, b, out
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, x: pl.Tensor[[4], pl.FP32], out: pl.Out[pl.Tensor[[4], pl.FP32]]):
+                local = x
+                tmp = (local, local)
+                out = pl.tensor.assemble(out, tmp[0], [0])
+                if rebind_source:
+                    local = pl.add(local, local)
+                a = tmp[0]
+                b = tmp[1]
+                return a, b, out
+
+        after = passes.inline_functions()(Before)
+        assert "FREE_VAR" not in after.as_python()
+        ir.assert_structural_equal(after, Expected)
+        ir.assert_structural_equal(after, pl.parse_program(after.as_python()))
+        ir.assert_structural_equal(passes.convert_to_ssa()(after), passes.convert_to_ssa()(Expected))
+
     def test_inline_with_bare_tensor_params_multi_return(self):
         """Bare `pl.Tensor` inline params (no `pl.Out` wrapper) splice the
         same way as `pl.Out`-annotated params: rebindings retarget the
@@ -906,6 +2979,559 @@ class TestInlineFunctionsSubmitCallSite:
             "Expected the verifier to flag the surviving pl.submit(self.helper, ...) "
             "after `helper` was dropped, but it reported no errors."
         )
+
+
+class TestInlineFunctionsDynamicShapes:
+    def test_specialized_result_reaches_next_inline_call(self):
+        """The next inline call must receive its argument's refined view metadata."""
+        rows = pl.dynamic("FORMAL_ROWS")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def refine(self, x: pl.Tensor[[rows, 4], pl.FP32]) -> pl.Tensor[[rows, 4], pl.FP32]:
+                refined = pl.tensor.set_validshape(x, 3, 4)
+                return refined
+
+            @pl.function(type=pl.FunctionType.Inline)
+            def double(self, x: pl.Tensor[[rows, 4], pl.FP32]):
+                result = pl.add(x, x)
+                return result
+
+            @pl.function
+            def main(self, x: pl.Tensor[[8, 4], pl.FP32]):
+                first = self.refine(x)
+                second = self.double(first)
+                return pl.add(second, second)
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, x: pl.Tensor[[8, 4], pl.FP32]):
+                refined = pl.tensor.set_validshape(x, 3, 4)
+                first = refined
+                result = pl.add(first, first)
+                second = result
+                return pl.add(second, second)
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        ir.assert_structural_equal(passes.convert_to_ssa()(after), passes.convert_to_ssa()(Expected))
+
+    def test_nested_inline_tuple_results_keep_independent_shapes(self):
+        """Nested tuple substitutions and their caller uses share the updated types."""
+        rows = pl.dynamic("FORMAL_ROWS")
+        padded_rows = pl.dynamic("PADDED_ROWS")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def pair(self, x: pl.Tensor[[rows, 4], pl.FP32], padded: pl.Tensor[[padded_rows, 4], pl.FP32]):
+                first = pl.add(x, x)
+                second = pl.add(padded, padded)
+                return first, second
+
+            @pl.function(type=pl.FunctionType.Inline)
+            def forward(self, x: pl.Tensor[[rows, 4], pl.FP32], padded: pl.Tensor[[padded_rows, 4], pl.FP32]):
+                return self.pair(x, padded)
+
+            @pl.function
+            def main(self, x: pl.Tensor[[8, 4], pl.FP32], padded: pl.Tensor[[16, 4], pl.FP32]):
+                a, b = self.forward(x, padded)
+                return pl.add(a, x), pl.add(b, padded)
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, x: pl.Tensor[[8, 4], pl.FP32], padded: pl.Tensor[[16, 4], pl.FP32]):
+                first = pl.add(x, x)
+                second = pl.add(padded, padded)
+                a = first
+                b = second
+                return pl.add(a, x), pl.add(b, padded)
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        ir.assert_structural_equal(passes.convert_to_ssa()(after), passes.convert_to_ssa()(Expected))
+
+    def test_nested_alias_return_refines_callers_valid_shape(self):
+        """Factoring a metadata update into an inline helper keeps its caller binding."""
+        rows = pl.dynamic("NESTED_ALIAS_ROWS")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def refine(self, t: pl.Tensor[[rows, 4], pl.FP32]) -> pl.Tensor[[rows, 4], pl.FP32]:
+                refined = pl.tensor.set_validshape(t, 3, 4)
+                return refined
+
+            @pl.function(type=pl.FunctionType.Inline)
+            def outer(self, t: pl.Tensor[[rows, 4], pl.FP32]):
+                t = self.refine(t)
+
+            @pl.function
+            def main(self, t: pl.Tensor[[8, 4], pl.FP32]):
+                self.outer(t)
+                return t
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, t: pl.Tensor[[8, 4], pl.FP32]):
+                refined = pl.tensor.set_validshape(t, 3, 4)
+                t = refined
+                return t
+
+        after = passes.inline_functions()(Before)
+        ssa = passes.convert_to_ssa()(after)
+        main = ssa.get_function("main")
+        assert main is not None and isinstance(main.body, ir.SeqStmts)
+        result = main.body.stmts[-1]
+        assert isinstance(result, ir.ReturnStmt)
+        result_type = result.value[0].type
+        assert isinstance(result_type, ir.TensorType)
+        view = result_type.tensor_view
+        valid_shape = view.valid_shape if view is not None and view.valid_shape else result_type.shape
+        assert len(valid_shape) == 2
+        for dim, expected in zip(valid_shape, [3, 4]):
+            assert isinstance(dim, ir.ConstInt)
+            assert dim.value == expected
+        ir.assert_structural_equal(after, Expected)
+        ir.assert_structural_equal(ssa, passes.convert_to_ssa()(Expected))
+
+    def test_nested_fresh_return_keeps_callers_binding(self):
+        """Expanding a generic nested helper must not turn fresh results into writebacks."""
+        rows = pl.dynamic("NESTED_FRESH_ROWS")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def double(self, t: pl.Tensor[[rows, 4], pl.FP32]) -> pl.Tensor[[rows, 4], pl.FP32]:
+                doubled = pl.add(t, t)
+                return doubled
+
+            @pl.function(type=pl.FunctionType.Inline)
+            def outer(self, t: pl.Tensor[[rows, 4], pl.FP32]):
+                t = self.double(t)
+
+            @pl.function
+            def main(self, t: pl.Tensor[[8, 4], pl.FP32]):
+                self.outer(t)
+                return t
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, t: pl.Tensor[[8, 4], pl.FP32]):
+                local = t
+                doubled = pl.add(local, local)
+                local = doubled
+                return t
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        ir.assert_structural_equal(passes.convert_to_ssa()(after), passes.convert_to_ssa()(Expected))
+
+    def test_nested_identity_return_materializes_original_scalar_def(self):
+        """An analysis-only no-op elimination must not expose a non-Var assignment target."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def identity(self, n: pl.Scalar[pl.INDEX]) -> pl.Scalar[pl.INDEX]:
+                return n
+
+            @pl.function(type=pl.FunctionType.Inline)
+            def outer(self, n: pl.Scalar[pl.INDEX]) -> pl.Scalar[pl.INDEX]:
+                n = self.identity(n)
+                return n
+
+            @pl.function
+            def main(self, k: pl.Scalar[pl.INDEX]):
+                constant = self.outer(3)
+                computed = self.outer(k + 1)
+                return constant + computed
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, k: pl.Scalar[pl.INDEX]):
+                local_constant = 3
+                constant = local_constant
+                local_computed = k + 1
+                computed = local_computed
+                return constant + computed
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        ir.assert_structural_equal(passes.convert_to_ssa()(after), passes.convert_to_ssa()(Expected))
+
+    def test_inline_view_refinement_preserves_caller_rebinding(self):
+        """A void helper must update the binding read after the inline call."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def refine(self, out: pl.Tensor[[8, 4], pl.FP32]):
+                out = pl.tensor.set_validshape(out, 3, 4)
+
+            @pl.function
+            def main(self, out: pl.Tensor[[8, 4], pl.FP32]):
+                self.refine(out)
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, out: pl.Tensor[[8, 4], pl.FP32]):
+                out = pl.tensor.set_validshape(out, 3, 4)
+                return out
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        ir.assert_structural_equal(passes.convert_to_ssa()(after), passes.convert_to_ssa()(Expected))
+
+    def test_inline_tile_refinement_preserves_caller_rebinding(self):
+        """Tile metadata updates use the same direct writeback contract as tensors."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def refine(self, out: pl.Tile[[8, 4], pl.FP32, pl.TileView(valid_shape=[3, 4])]):
+                out = pl.tile.set_validshape(out, 3, 4)
+
+            @pl.function
+            def main(self, out: pl.Tile[[8, 4], pl.FP32, pl.TileView(valid_shape=[3, 4])]):
+                self.refine(out)
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, out: pl.Tile[[8, 4], pl.FP32, pl.TileView(valid_shape=[3, 4])]):
+                out = pl.tile.set_validshape(out, 3, 4)
+                return out
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        ir.assert_structural_equal(passes.convert_to_ssa()(after), passes.convert_to_ssa()(Expected))
+
+    def test_conflicting_result_type_uses_operand_even_with_caller_dimension(self):
+        """An unrelated caller signature dimension cannot mask a stale result extent."""
+        rows = pl.dynamic("SHARED_ROWS")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def fill(self, out: pl.Tensor[[rows, 4], pl.FP32], padded: pl.Tensor[[rows, 4], pl.FP32]):
+                updated = pl.add(out, out)
+                out = updated
+
+            @pl.function
+            def main(
+                self,
+                marker: pl.Tensor[[rows, 4], pl.FP32],
+                out: pl.Tensor[[8, 4], pl.FP32],
+                padded: pl.Tensor[[16, 4], pl.FP32],
+            ):
+                self.fill(out, padded)
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                marker: pl.Tensor[[rows, 4], pl.FP32],
+                out: pl.Tensor[[8, 4], pl.FP32],
+                padded: pl.Tensor[[16, 4], pl.FP32],
+            ):
+                local = out
+                updated = pl.add(local, local)
+                local = updated
+                return out
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        passes.convert_to_ssa()(after)
+        ir.assert_structural_equal(after, pl.parse_program(after.as_python()))
+
+    def test_conflicting_tensor_carries_follow_for_and_while_initializers(self):
+        """Both loop kinds specialize tensor carries and the results consumed after them."""
+        rows = pl.dynamic("FORMAL_ROWS")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def fill(self, out: pl.Tensor[[rows, 4], pl.FP32], padded: pl.Tensor[[rows, 4], pl.FP32]):
+                for i, (carry,) in pl.range(2, init_values=(out,)):
+                    result = pl.yield_(pl.add(carry, carry))
+                out = pl.add(result, result)
+                for carry, count in pl.while_(init_values=(out, 0)):
+                    pl.cond(count < 2)
+                    result, _count = pl.yield_(pl.add(carry, carry), count + 1)
+                out = pl.add(result, result)
+
+            @pl.function
+            def main(self, out: pl.Tensor[[8, 4], pl.FP32], padded: pl.Tensor[[16, 4], pl.FP32]):
+                self.fill(out, padded)
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, out: pl.Tensor[[8, 4], pl.FP32], padded: pl.Tensor[[16, 4], pl.FP32]):
+                local = out
+                for i, (carry,) in pl.range(2, init_values=(local,)):
+                    result = pl.yield_(pl.add(carry, carry))
+                local = pl.add(result, result)
+                for carry, count in pl.while_(init_values=(local, 0)):
+                    pl.cond(count < 2)
+                    result, _count = pl.yield_(pl.add(carry, carry), count + 1)
+                local = pl.add(result, result)
+                return out
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        passes.convert_to_ssa()(after)
+        ir.assert_structural_equal(after, pl.parse_program(after.as_python()))
+
+    def test_caller_signature_dimension_not_present_in_actual_arguments(self):
+        """A signature dimension stays in scope when only static buffers reach the helper."""
+        rows = pl.dynamic("SHARED_ROWS")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def fill(self, out: pl.Tensor[[rows, 4], pl.FP32], padded: pl.Tensor[[rows, 4], pl.FP32]):
+                _scratch = pl.create_tensor([rows, 4], pl.FP32)
+
+            @pl.function
+            def main(
+                self,
+                marker: pl.Tensor[[rows, 4], pl.FP32],
+                out: pl.Tensor[[8, 4], pl.FP32],
+                padded: pl.Tensor[[16, 4], pl.FP32],
+            ):
+                self.fill(out, padded)
+                return marker
+
+        after = passes.inline_functions()(Before)
+        passes.convert_to_ssa()(after)
+
+    @pytest.mark.parametrize("loop_carried", [False, True])
+    @pytest.mark.parametrize("separate_symbols", [False, True])
+    def test_logical_and_padded_local_types(self, loop_carried, separate_symbols):
+        """Local/loop types follow their operands even when annotations share a symbol."""
+        rows = pl.dynamic("CALLEE_ROWS")
+        padded_rows = pl.dynamic("PADDED_ROWS") if separate_symbols else rows
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def fill(self, out: pl.Tensor[[rows, 4], pl.FP32], padded: pl.Tensor[[padded_rows, 4], pl.FP32]):
+                if loop_carried:
+                    for i in pl.range(2):
+                        out = pl.add(out, out)
+                else:
+                    _updated = pl.add(padded, padded)
+
+            @pl.function
+            def main(self, out: pl.Tensor[[8, 4], pl.FP32], padded: pl.Tensor[[16, 4], pl.FP32]):
+                self.fill(out, padded)
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, out: pl.Tensor[[8, 4], pl.FP32], padded: pl.Tensor[[16, 4], pl.FP32]):
+                local = out
+                if loop_carried:
+                    for i in pl.range(2):
+                        local = pl.add(local, local)
+                else:
+                    _updated = pl.add(padded, padded)
+                return out
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        passes.convert_to_ssa()(after)
+        ir.assert_structural_equal(after, pl.parse_program(after.as_python()))
+
+    def test_void_inline_call_preserves_logical_and_padded_arguments(self):
+        """Inline helpers may use one placeholder for logical and padded buffers."""
+        rows = pl.dynamic("CALLEE_ROWS")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def fill(self, logical: pl.Tensor[[rows, 4], pl.FP32], padded: pl.Tensor[[rows, 4], pl.FP32]):
+                n = pl.tensor.dim(logical, 0)
+                _value = pl.tensor.read(padded, [n, 0])
+
+            @pl.function
+            def main(self, logical: pl.Tensor[[8, 4], pl.FP32], padded: pl.Tensor[[16, 4], pl.FP32]):
+                self.fill(logical, padded)
+                return padded
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, logical: pl.Tensor[[8, 4], pl.FP32], padded: pl.Tensor[[16, 4], pl.FP32]):
+                n = pl.tensor.dim(logical, 0)
+                _value = pl.tensor.read(padded, [n, 0])
+                return padded
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        passes.convert_to_ssa()(after)
+
+    def test_shared_shape_symbols_preserve_caller_arguments(self):
+        """Specialize callee locals without rewriting an argument's shared shape symbol."""
+        rows = pl.dynamic("CALLEE_ROWS")
+        shared = pl.dynamic("SHARED_ROWS")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def double(self, x: pl.Tensor[[rows, 4], pl.FP32], marker: pl.Tensor[[shared, 4], pl.FP32]):
+                y = pl.add(x, x)
+                return y
+
+            @pl.function
+            def main(self, a: pl.Tensor[[shared + 4, 4], pl.FP32], b: pl.Tensor[[16, 4], pl.FP32]):
+                result = self.double(a, b)
+                return result
+
+        after = passes.inline_functions()(Before)
+        main = after.get_function("main")
+        assert main is not None
+        assert isinstance(main.body, ir.SeqStmts)
+        assign = main.body.stmts[0]
+        assert isinstance(assign, ir.AssignStmt)
+        assert isinstance(assign.var.type, ir.TensorType)
+        assert isinstance(main.params[0].type, ir.TensorType)
+        ir.assert_structural_equal(assign.var.type, main.params[0].type)
+        assert isinstance(assign.value, ir.Call)
+        assert assign.value.args[0] is main.params[0]
+        passes.convert_to_ssa()(after)
+        ir.assert_structural_equal(after, pl.parse_program(after.as_python()))
+
+    def test_local_extent_through_loop_carried_tensor(self):
+        """Callee-only dimensions must be bound to the caller's runtime extent (#2936)."""
+        rows = pl.dynamic("CALLEE_ROWS")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def fill(self, out: pl.Tensor[[rows, 4], pl.FP32], src: pl.Tensor[[4, 4], pl.FP32]):
+                for i in pl.range(2):
+                    updated = pl.tensor.assemble(out, src, [0, 0])
+                    out = updated
+                return out
+
+            @pl.function
+            def main(self, n: pl.Scalar[pl.INDEX], src: pl.Tensor[[4, 4], pl.FP32]):
+                extent = n + 4
+                out = pl.create_tensor([extent, 4], pl.FP32)
+                result = self.fill(out, src)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, n: pl.Scalar[pl.INDEX], src: pl.Tensor[[4, 4], pl.FP32]):
+                extent = n + 4
+                out = pl.create_tensor([extent, 4], pl.FP32)
+                for i in pl.range(2):
+                    updated = pl.tensor.assemble(out, src, [0, 0])
+                    out = updated
+                result = out
+                return result
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        passes.convert_to_ssa()(after)
+
+    def test_void_helper_specializes_submit_result_and_preserves_output_storage(self):
+        """A Submit result can use a local handle while preserving the output storage."""
+        rows = pl.dynamic("CALLEE_ROWS")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def store(
+                self, src: pl.Tensor[[4, 4], pl.FP32], out: pl.Out[pl.Tensor[[rows, 4], pl.FP32]]
+            ) -> pl.Tensor[[rows, 4], pl.FP32]:
+                out = pl.tensor.assemble(out, src, [0, 0])
+                return out
+
+            @pl.function(type=pl.FunctionType.Inline)
+            def fill(self, out: pl.Tensor[[rows, 4], pl.FP32], src: pl.Tensor[[4, 4], pl.FP32]):
+                with pl.manual_scope():
+                    updated, tid = pl.submit(self.store, src, out)
+                    out = updated
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, n: pl.Scalar[pl.INDEX], src: pl.Tensor[[4, 4], pl.FP32]):
+                extent = n + 4
+                out = pl.create_tensor([extent, 4], pl.FP32)
+                self.fill(out, src)
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def store(
+                self, src: pl.Tensor[[4, 4], pl.FP32], out: pl.Out[pl.Tensor[[rows, 4], pl.FP32]]
+            ) -> pl.Tensor[[rows, 4], pl.FP32]:
+                out = pl.tensor.assemble(out, src, [0, 0])
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, n: pl.Scalar[pl.INDEX], src: pl.Tensor[[4, 4], pl.FP32]):
+                extent = n + 4
+                out = pl.create_tensor([extent, 4], pl.FP32)
+                local = out
+                with pl.manual_scope():
+                    updated, tid = pl.submit(self.store, src, local)
+                    local = updated
+                return out
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        passes.convert_to_ssa()(after)
+
+    def test_each_call_binds_its_own_static_extent(self):
+        """A shared inline helper must specialize local types independently at each call."""
+        rows = pl.dynamic("CALLEE_ROWS")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def double(self, x: pl.Tensor[[rows, 4], pl.FP32]):
+                y = pl.add(x, x)
+                return y
+
+            @pl.function
+            def main(self, a: pl.Tensor[[8, 4], pl.FP32], b: pl.Tensor[[16, 4], pl.FP32]):
+                first = self.double(a)
+                second = self.double(b)
+                return first, second
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, a: pl.Tensor[[8, 4], pl.FP32], b: pl.Tensor[[16, 4], pl.FP32]):
+                y0 = pl.add(a, a)
+                first = y0
+                y1 = pl.add(b, b)
+                second = y1
+                return first, second
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        passes.convert_to_ssa()(after)
 
 
 class TestInlineFunctionsReservedDelimiter:

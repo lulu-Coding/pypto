@@ -91,7 +91,7 @@ class _LeftoverPinCase(_Case):
         return "leftover_pin_case"
 
     def get_backend_type(self) -> BackendType:
-        return BackendType.Ascend910B
+        return BackendType.Ascend910
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +103,7 @@ def test_a_case_carries_no_backend_of_its_own():
     # Not "the default is 910B" — there is no such accessor to default.
     assert not hasattr(harness.PTOTestCase, "get_backend_type")
     with pytest.raises(TypeError):
-        _Case(backend_type=BackendType.Ascend910B)  # pyright: ignore[reportCallIssue]
+        _Case(backend_type=BackendType.Ascend910)  # pyright: ignore[reportCallIssue]
 
 
 def test_the_backend_is_derived_from_the_bound_platform():
@@ -139,7 +139,7 @@ def test_cache_key_separates_the_platform_variants():
     key_a2a3 = test_runner._cache_key(a2a3, session_memory_planner=MemoryPlanner.PYPTO)
     key_a5 = test_runner._cache_key(a5, session_memory_planner=MemoryPlanner.PYPTO)
     assert key_a2a3 != key_a5
-    assert key_a2a3.endswith("@a2a3@pypto") and key_a5.endswith("@a5sim@pypto")
+    assert key_a2a3.endswith("@a2a3@pypto@buffer_ir") and key_a5.endswith("@a5sim@pypto@buffer_ir")
 
 
 def test_cache_key_refuses_an_artifact_with_no_platform():
@@ -159,8 +159,12 @@ def _fn_taking(*argnames: str):
     def _test(*_args, **_kwargs):
         pass
 
-    _test.__signature__ = inspect.Signature(
-        [inspect.Parameter(name, inspect.Parameter.POSITIONAL_OR_KEYWORD) for name in argnames]
+    setattr(
+        _test,
+        "__signature__",
+        inspect.Signature(
+            [inspect.Parameter(name, inspect.Parameter.POSITIONAL_OR_KEYWORD) for name in argnames]
+        ),
     )
     return _test
 

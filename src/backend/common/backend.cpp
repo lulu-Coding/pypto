@@ -30,6 +30,7 @@
 #include "pypto/backend/910B/backend_910b.h"
 #include "pypto/backend/950/backend_950.h"
 #include "pypto/backend/common/backend_registry.h"
+#include "pypto/backend/common/op_rules.h"
 #include "pypto/ir/memory_allocator_policy.h"
 
 // clang-format off
@@ -49,20 +50,20 @@ namespace backend {
 
 const Backend* GetBackendInstance(BackendType type) {
   switch (type) {
-    case BackendType::Ascend910B:
+    case BackendType::Ascend910:
       return &Backend910B::Instance();
     case BackendType::Ascend950:
       return &Backend950::Instance();
     default:
-      CHECK(false) << "GetBackendInstance: unexpected BackendType (must be Ascend910B or Ascend950)";
+      CHECK(false) << "GetBackendInstance: unexpected BackendType (must be Ascend910 or Ascend950)";
       return nullptr;  // unreachable
   }
 }
 
 std::string BackendTypeToString(BackendType type) {
   switch (type) {
-    case BackendType::Ascend910B:
-      return "Ascend910B";
+    case BackendType::Ascend910:
+      return "Ascend910";
     case BackendType::Ascend950:
       return "Ascend950";
   }
@@ -421,11 +422,22 @@ BackendOpRegistryEntry Backend::RegisterOp(const std::string& op_name) {
 
 void Backend::FinalizeOpRegistration(const std::string& op_name, BackendCodegenFunc func,
                                      std::optional<BackendPipeInferFunc> infer_pipe_func,
-                                     std::optional<BackendTileLayoutSpec> tile_layout_spec) {
+                                     std::optional<BackendTileLayoutSpec> tile_layout_spec,
+                                     std::optional<BackendOpValidateFunc> validate_func,
+                                     std::optional<BackendScratchPlanFunc> scratch_plan_func) {
   CHECK(backend_op_registry_.find(op_name) == backend_op_registry_.end())
       << "Operator '" << op_name << "' is already registered in this backend";
   backend_op_registry_[op_name] =
-      BackendOpInfo{std::move(func), std::move(infer_pipe_func), std::move(tile_layout_spec)};
+      BackendOpInfo{std::move(func), std::move(infer_pipe_func), std::move(tile_layout_spec),
+                    std::move(validate_func), std::move(scratch_plan_func)};
+}
+
+std::optional<OpScratchPlan> Backend::PlanOpScratch(const std::string& op_name,
+                                                    const OpScratchRequest& request) const {
+  const auto* info = GetOpInfo(op_name);
+  CHECK(info != nullptr) << "Operator '" << op_name << "' is not registered in this backend";
+  if (!info->scratch_plan_func) return std::nullopt;
+  return (*info->scratch_plan_func)(request);
 }
 
 const Backend::BackendOpInfo* Backend::GetOpInfo(const std::string& op_name) const {
@@ -434,6 +446,16 @@ const Backend::BackendOpInfo* Backend::GetOpInfo(const std::string& op_name) con
     return &it->second;
   }
   return nullptr;
+}
+
+std::vector<std::string> Backend::GetRegisteredOpNames() const {
+  std::vector<std::string> names;
+  names.reserve(backend_op_registry_.size());
+  for (const auto& entry : backend_op_registry_) {
+    names.push_back(entry.first);
+  }
+  std::sort(names.begin(), names.end());
+  return names;
 }
 
 const BackendTileLayoutSpec* Backend::GetTileLayoutSpec(const std::string& op_name) const {
@@ -623,6 +645,18 @@ BackendOpRegistryEntry& BackendOpRegistryEntry::f_infer_pipe(BackendPipeInferFun
   return *this;
 }
 
+BackendOpRegistryEntry& BackendOpRegistryEntry::f_validate(BackendOpValidateFunc func) {
+  CHECK(!validate_func_ && func) << "Expected one nonempty validator for op '" << op_name_ << "'";
+  validate_func_ = std::move(func);
+  return *this;
+}
+
+BackendOpRegistryEntry& BackendOpRegistryEntry::f_plan_scratch(BackendScratchPlanFunc func) {
+  CHECK(!scratch_plan_func_ && func) << "Expected one nonempty scratch planner for op '" << op_name_ << "'";
+  scratch_plan_func_ = std::move(func);
+  return *this;
+}
+
 BackendOpRegistryEntry& BackendOpRegistryEntry::set_input_layout(size_t input_index, ir::TileLayout layout) {
   if (!tile_layout_spec_.has_value()) {
     tile_layout_spec_.emplace();
@@ -645,7 +679,8 @@ BackendOpRegistryEntry& BackendOpRegistryEntry::set_output_layout(ir::TileLayout
 BackendOpRegistryEntry::~BackendOpRegistryEntry() {
   if (backend_ && codegen_func_.has_value()) {
     backend_->FinalizeOpRegistration(op_name_, std::move(*codegen_func_), std::move(infer_pipe_func_),
-                                     std::move(tile_layout_spec_));
+                                     std::move(tile_layout_spec_), std::move(validate_func_),
+                                     std::move(scratch_plan_func_));
   }
 }
 

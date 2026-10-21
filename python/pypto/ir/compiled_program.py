@@ -38,10 +38,18 @@ import json
 import os
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, TypeAlias, TypeGuard
 
 import torch
 
+from pypto._artifact_contract import ArtifactExecutionMode, ExecutionCapabilities
+from pypto._target import (
+    ExecutionMode,
+    _parse_platform,
+    _platform_string,
+    _resolve_target,
+    _warn_deprecated_platform,
+)
 from pypto.backend import BackendType
 from pypto.pypto_core import DataType
 from pypto.pypto_core import backend as _backend_core
@@ -59,10 +67,17 @@ from pypto.runtime.device_tensor import DeviceTensor, StackedDeviceTensor
 # Re-exported: these moved to a leaf module so a consumer of the metadata can
 # depend on it without depending on this module. See ``param_info``.
 from .param_info import (  # noqa: F401  -- re-export
-    _DATATYPE_TO_TORCH,
-    ParamInfo,
+    _DATATYPE_TO_CTYPE,
     _ParamInfo,
     _to_torch_dtype,
+    bind_complete_args,
+    block_nz_shape,
+)
+from .param_info import (
+    _DATATYPE_TO_TORCH as _DATATYPE_TO_TORCH,  # noqa: PLC0414
+)
+from .param_info import (
+    ParamInfo as ParamInfo,  # noqa: PLC0414
 )
 
 # Type alias for arguments accepted by CompiledProgram.__call__().
@@ -71,7 +86,13 @@ from .param_info import (  # noqa: F401  -- re-export
 # distributed programs, a :class:`StackedDeviceTensor` (per-card resident shards).
 # Scalar params accept Python primitives or ctypes scalars (which are
 # coerced to the correct ctypes type internally).
-CallArg = torch.Tensor | DeviceTensor | StackedDeviceTensor | int | float | bool | ctypes._SimpleCData
+CallArg: TypeAlias = (
+    "torch.Tensor | DeviceTensor | StackedDeviceTensor | int | float | bool | ctypes._SimpleCData[Any]"
+)
+
+if TYPE_CHECKING:
+    from pypto.runtime._artifact_runtime import ArtifactRuntime
+
 
 # Filename of the small JSON sidecar persisted alongside the build artifacts so
 # a single-orchestration program can be reconstructed (``from_dir``) without the
@@ -82,7 +103,7 @@ CallArg = torch.Tensor | DeviceTensor | StackedDeviceTensor | int | float | bool
 # independently, so a change to *that* shared format must bump this schema AND
 # ``distributed_compiled_program._META_SCHEMA``.
 _COMPILED_META_FILENAME = "compiled_meta.json"
-_COMPILED_META_SCHEMA = 1
+_COMPILED_META_SCHEMA = 2
 
 # The L3 counterpart, kept here so both names sit next to the marker table below;
 # ``distributed_compiled_program`` re-exports it and owns its schema constant.
@@ -109,33 +130,13 @@ _BUILD_KIND_MARKERS = (
     "orchestration/host_orch.py",
 )
 
-# IR DataType -> ctypes scalar constructor mapping.
-# Used to wrap Python int/float/bool values into the correct ctypes scalar
-# when calling a compiled program with scalar parameters.
-_DATATYPE_TO_CTYPE: dict[str, type[ctypes._SimpleCData]] = {
-    "fp16": ctypes.c_float,  # no native half; promote to float
-    "fp32": ctypes.c_float,
-    "fp64": ctypes.c_double,
-    "bfloat16": ctypes.c_float,  # no native bfloat16; promote to float
-    "int8": ctypes.c_int8,
-    "int16": ctypes.c_int16,
-    "int32": ctypes.c_int32,
-    "int64": ctypes.c_int64,
-    "uint8": ctypes.c_uint8,
-    "uint16": ctypes.c_uint16,
-    "uint32": ctypes.c_uint32,
-    "uint64": ctypes.c_uint64,
-    "bool": ctypes.c_bool,
-    "index": ctypes.c_int64,
-}
-
 
 def _to_runtime_shape(shape: list[int], dtype: DataType) -> list[int]:
-    """Convert logical IR shape to the runtime carrier shape.
+    """Convert compiled IR shape to the runtime carrier shape.
 
-    Only packed FP4 differs: Torch/runtime use one x2 element per byte while
-    PyPTO IR counts logical nibbles. The conversion remains at the call ABI
-    boundary, so no persistent storage_shape is needed in IR types.
+    ``DataType.FP4E2M1X2`` last dims already match ``torch.float4_e2m1fn_x2``
+    (no halving). Logical ``DataType.FP4`` still counts nibbles, so the call
+    ABI halves a static last dim at this boundary only.
     """
     runtime_shape = list(shape)
     if dtype == DataType.FP4 and runtime_shape[-1] != -1:
@@ -145,8 +146,8 @@ def _to_runtime_shape(shape: list[int], dtype: DataType) -> list[int]:
 
 
 def _validate_fp4_carrier_shape(shape: Sequence[int], info: "_ParamInfo") -> None:
-    """Validate the runtime x2 carrier shape for one FP4 parameter."""
-    if info.dtype != DataType.FP4:
+    """Validate the runtime x2 carrier shape for one FP4 / FP4E2M1X2 parameter."""
+    if info.dtype not in (DataType.FP4, DataType.FP4E2M1X2):
         return
     if not shape:
         raise TypeError(f"Packed FP4 parameter {info.name!r} must have rank >= 1")
@@ -164,9 +165,11 @@ def _validate_fp4_carrier_shape(shape: Sequence[int], info: "_ParamInfo") -> Non
 # Built from the named constants exposed on ``DataType`` so it tracks the C++
 # enum without a hand-maintained literal table.
 _STR_TO_DATATYPE: dict[str, DataType] = {}
+_dt: DataType | None = None
+_dt_name: str = ""
 for _dt_name in (
     "BOOL", "INT4", "INT8", "INT16", "INT32", "INT64", "UINT4", "UINT8", "UINT16",
-    "UINT32", "UINT64", "FP4", "FP8E4M3FN", "FP8E5M2", "FP8E8M0", "FP16", "FP32", "BF16",
+    "UINT32", "UINT64", "FP4", "FP4E2M1X2", "FP8E4M3FN", "FP8E5M2", "FP8E8M0", "FP16", "FP32", "BF16",
     "HF4", "HF8", "INDEX", "TASK_ID",
 ):  # fmt: skip
     _dt = getattr(DataType, _dt_name, None)
@@ -190,10 +193,25 @@ def _param_info_to_dict(info: _ParamInfo) -> dict[str, Any]:
         "direction": info.direction.name,
         "shape": info.shape,
         "dtype": str(info.dtype),
+        "layout": info.layout,
     }
 
 
-def _param_info_from_dict(d: dict[str, Any]) -> _ParamInfo:
+def _is_obj_list(v: object) -> TypeGuard[list[object]]:
+    return isinstance(v, list)
+
+
+def _is_str_dict(v: object) -> TypeGuard[dict[str, object]]:
+    """A JSON object: ``json.loads`` only produces string keys."""
+    return isinstance(v, dict)
+
+
+def _is_int_list(v: object) -> TypeGuard[list[int]]:
+    """True for a JSON array of non-bool ints (``bool`` is an ``int`` subclass)."""
+    return _is_obj_list(v) and all(isinstance(x, int) and not isinstance(x, bool) for x in v)
+
+
+def _param_info_from_dict(d: dict[str, object]) -> _ParamInfo:
     """Reconstruct a :class:`_ParamInfo` from :func:`_param_info_to_dict` output.
 
     Every field is validated here rather than trusted: the sidecars this parses
@@ -220,23 +238,30 @@ def _param_info_from_dict(d: dict[str, Any]) -> _ParamInfo:
         )
 
     # ``bool`` is an ``int`` subclass; a JSON ``true`` is never a dimension.
-    shape = d["shape"]
-    if shape is not None:
-        is_dim_list = isinstance(shape, list) and all(
-            isinstance(dim, int) and not isinstance(dim, bool) for dim in shape
-        )
-        if not is_dim_list:
-            raise ValueError(f"'shape' must be null or a list of ints, got {shape!r}")
+    raw_shape: object = d["shape"]
+    shape: list[int] | None = None
+    if raw_shape is not None:
+        if _is_int_list(raw_shape):
+            shape = raw_shape
+        else:
+            raise ValueError(f"'shape' must be null or a list of ints, got {raw_shape!r}")
 
     raw_dtype = d["dtype"]
     if not isinstance(raw_dtype, str):
         raise ValueError(f"'dtype' must be a string, got {raw_dtype!r}")
+
+    # A sidecar written before parameters carried a layout says nothing about
+    # one, which is exactly what ND means.
+    raw_layout = d.get("layout")
+    if raw_layout is not None and not isinstance(raw_layout, str):
+        raise ValueError(f"'layout' must be null or a string, got {raw_layout!r}")
 
     return _ParamInfo(
         name=name,
         direction=direction,
         shape=shape,
         dtype=_datatype_from_string(raw_dtype),
+        layout=raw_layout,
     )
 
 
@@ -346,26 +371,33 @@ def _load_meta(meta_path: Path, *, filename: str, schema: int) -> dict[str, Any]
     except UnicodeDecodeError as exc:  # binary or mis-encoded file
         raise _bad(f"is not valid UTF-8 text ({exc})") from exc
     try:
-        meta = json.loads(raw_text)
+        raw_meta: object = json.loads(raw_text)
     except ValueError as exc:  # JSONDecodeError is a ValueError subclass
         raise _bad(f"not valid JSON ({exc})") from exc
-    if not isinstance(meta, dict):
-        raise _bad(f"expected a JSON object, got {type(meta).__name__}")
+    if not _is_str_dict(raw_meta):
+        raise _bad(f"expected a JSON object, got {type(raw_meta).__name__}")
+    meta = raw_meta
 
     found_schema = meta.get("schema")
-    if found_schema != schema:
+    if type(found_schema) is not int or found_schema != schema:
         raise ValueError(
             f"Incompatible {filename} schema {found_schema!r} (expected "
             f"{schema}) in {meta_path}. The metadata was written by a "
             f"different pypto version — recompile via ir.compile() to refresh."
         )
 
-    raw_params = meta.get("params")
-    if not isinstance(raw_params, list):
+    try:
+        capabilities = ExecutionCapabilities.from_record(meta.get("supported_execution_modes"))
+        capabilities.require(ArtifactExecutionMode.PROGRAM)
+    except ValueError as exc:
+        raise _bad(str(exc)) from exc
+
+    raw_params: object = meta.get("params")
+    if not _is_obj_list(raw_params):
         raise _bad(f"'params' must be a list, got {type(raw_params).__name__}")
     param_infos: list[_ParamInfo] = []
     for i, entry in enumerate(raw_params):
-        if not isinstance(entry, dict):
+        if not _is_str_dict(entry):
             raise _bad(f"params[{i}] must be an object, got {type(entry).__name__}")
         try:
             param_infos.append(_param_info_from_dict(entry))
@@ -378,7 +410,7 @@ def _load_meta(meta_path: Path, *, filename: str, schema: int) -> dict[str, Any]
 
     # Strict enum-member lookup, not getattr(): ``getattr(BackendType, "mro")``
     # resolves to a bound method and would sail through as a bogus backend.
-    raw_backend = meta.get("backend_type", "Ascend910B")
+    raw_backend = meta.get("backend_type", "Ascend910")
     backend_type = BackendType.__members__.get(raw_backend) if isinstance(raw_backend, str) else None
     if backend_type is None:
         raise _bad(f"'backend_type' must be one of {sorted(BackendType.__members__)}, got {raw_backend!r}")
@@ -388,6 +420,7 @@ def _load_meta(meta_path: Path, *, filename: str, schema: int) -> dict[str, Any]
         raise _bad(f"'platform' must be a string or absent, got {type(platform).__name__}")
 
     return {
+        "execution_capabilities": capabilities,
         "param_infos": param_infos,
         "num_return_types": num_return_types,
         "platform": platform,
@@ -409,10 +442,14 @@ def _extract_func_param_infos(func: Function) -> tuple[list[_ParamInfo], list[in
         param_type = param.type
         shape: list[int] | None = None
 
+        layout: str | None = None
+
         if isinstance(param_type, ShapedType):
             dtype = param_type.dtype
             logical_shape = [dim.value if isinstance(dim, ConstInt) else -1 for dim in param_type.shape]
             shape = _to_runtime_shape(logical_shape, dtype)
+            view = getattr(param_type, "tensor_view", None)
+            layout = view.layout.name if view is not None else "ND"
         elif isinstance(param_type, ScalarType):
             dtype = param_type.dtype
         else:
@@ -421,7 +458,9 @@ def _extract_func_param_infos(func: Function) -> tuple[list[_ParamInfo], list[in
                 f"Expected ShapedType or ScalarType."
             )
 
-        param_infos.append(_ParamInfo(name=param.name_hint, direction=direction, shape=shape, dtype=dtype))
+        param_infos.append(
+            _ParamInfo(name=param.name_hint, direction=direction, shape=shape, dtype=dtype, layout=layout)
+        )
 
         # Only pure Out params can be auto-allocated in return-style calls.
         # InOut params require an initial value from the caller, so they must
@@ -463,6 +502,36 @@ def _extract_param_infos(program: Program) -> tuple[list[_ParamInfo], list[int],
     return _extract_func_param_infos(orch_func)
 
 
+def _arg_shape_as_declared(arg_shape: Sequence[int], info: _ParamInfo) -> list[int]:
+    """*arg_shape* in the parameter's own terms, ready to compare with ``info.shape``.
+
+    An NZ parameter is compiled to the blocked rank-5 shape the backend
+    addresses, while its caller allocates and passes the logical one — the same
+    bytes under two spellings. Comparing them means blocking the caller's shape
+    with the rule the compiler used. Every other parameter is already in its
+    caller's terms, and a shape that does not block at all (an odd row count,
+    say) is left alone so it is reported as the mismatch it is.
+    """
+    if info.layout != "NZ":
+        return list(arg_shape)
+    # A dynamic blocked batch can only come from logical [B, R, C]: the NZ
+    # pass rejects dynamic leading extents at rank > 3. Entry code reads B
+    # directly from the incoming shapes[0], so accepting another logical rank
+    # here would disagree with that lookup even if blocking hides the mismatch.
+    if info.shape and info.shape[0] < 0 and len(arg_shape) != 3:
+        raise TypeError(
+            f"Parameter {info.name!r} with a dynamic NZ batch expects logical rank 3 "
+            f"(shape [B, R, C]); got shape {tuple(arg_shape)}"
+        )
+    expected_dtype = _to_torch_dtype(info.dtype)
+    if expected_dtype is None:
+        return list(arg_shape)
+    try:
+        return block_nz_shape(arg_shape, expected_dtype)
+    except ValueError:
+        return list(arg_shape)
+
+
 def _validate_device_tensor(arg: DeviceTensor, info: _ParamInfo) -> None:
     """Check a ``DeviceTensor`` arg against IR parameter metadata.
 
@@ -476,12 +545,13 @@ def _validate_device_tensor(arg: DeviceTensor, info: _ParamInfo) -> None:
     runtime can't map to torch are also skipped.
     """
     if info.shape is not None:
-        if len(info.shape) != len(arg.shape):
+        blocked_arg_shape = _arg_shape_as_declared(arg.shape, info)
+        if len(info.shape) != len(blocked_arg_shape):
             raise TypeError(
                 f"Parameter {info.name!r} expects rank {len(info.shape)} "
                 f"(shape {tuple(info.shape)}); got DeviceTensor shape {arg.shape}"
             )
-        for expected_dim, actual_dim in zip(info.shape, arg.shape, strict=True):
+        for expected_dim, actual_dim in zip(info.shape, blocked_arg_shape, strict=True):
             if expected_dim >= 0 and expected_dim != actual_dim:
                 raise TypeError(
                     f"Parameter {info.name!r} expects shape {tuple(info.shape)}; "
@@ -508,12 +578,13 @@ def _validate_stacked_tensor(arg: StackedDeviceTensor, info: _ParamInfo) -> None
         TypeError: when ``full_shape`` rank/dims or dtype disagree with ``info``.
     """
     if info.shape is not None:
-        if len(info.shape) != len(arg.full_shape):
+        blocked_full_shape = _arg_shape_as_declared(arg.full_shape, info)
+        if len(info.shape) != len(blocked_full_shape):
             raise TypeError(
                 f"Parameter {info.name!r} expects rank {len(info.shape)} "
                 f"(shape {tuple(info.shape)}); got StackedDeviceTensor full_shape {arg.full_shape}"
             )
-        for expected_dim, actual_dim in zip(info.shape, arg.full_shape, strict=True):
+        for expected_dim, actual_dim in zip(info.shape, blocked_full_shape, strict=True):
             if expected_dim >= 0 and expected_dim != actual_dim:
                 raise TypeError(
                     f"Parameter {info.name!r} expects shape {tuple(info.shape)}; "
@@ -565,7 +636,7 @@ def _coerce_args(  # noqa: PLR0912 — branches for in-place vs return + scalar/
     return_types: list[Any],
     *,
     caller_name: str,
-) -> tuple[list[torch.Tensor | DeviceTensor | ctypes._SimpleCData], bool]:
+) -> "tuple[list[torch.Tensor | DeviceTensor | ctypes._SimpleCData[Any]], bool]":
     """Validate user-provided args against IR metadata and coerce them.
 
     Returns ``(coerced, return_style)`` where ``coerced`` is a full positional
@@ -582,7 +653,7 @@ def _coerce_args(  # noqa: PLR0912 — branches for in-place vs return + scalar/
     return_style = has_return and len(args) == n_inputs
 
     if len(args) == n_params:
-        all_args: list[CallArg] = list(args)
+        all_args = bind_complete_args(args, param_infos, caller_name=caller_name)
     elif return_style:
         all_args = _build_full_args(args, param_infos, output_indices)
     else:
@@ -594,7 +665,7 @@ def _coerce_args(  # noqa: PLR0912 — branches for in-place vs return + scalar/
             f"Parameters: {[p.name for p in param_infos]}"
         )
 
-    coerced: list[torch.Tensor | DeviceTensor | ctypes._SimpleCData] = []
+    coerced: list[torch.Tensor | DeviceTensor | ctypes._SimpleCData[Any]] = []
     for info, arg in zip(param_infos, all_args, strict=True):
         if info.shape is None:
             if isinstance(arg, torch.Tensor):
@@ -637,6 +708,7 @@ def _invoke_compiled(
     args: tuple["CallArg", ...],
     config: Any,
     caller_name: str,
+    artifact_runtime: Any = None,
 ) -> "torch.Tensor | tuple[torch.Tensor, ...] | None":
     """Shared dispatch: coerce args, call the runtime, pack outputs.
 
@@ -655,7 +727,11 @@ def _invoke_compiled(
         args, param_infos, output_indices, return_types, caller_name=caller_name
     )
 
-    from pypto.runtime.runner import RunConfig, _execute_compiled  # noqa: PLC0415
+    # Lazy import from outside the overlay scope; its precision lives there.
+    from pypto.runtime.runner import (  # noqa: PLC0415
+        RunConfig,
+        _execute_compiled,
+    )
 
     execution_platform = platform if config is None else config.platform
     if config is None:
@@ -669,6 +745,7 @@ def _invoke_compiled(
         dfx=config.dfx_options(),
         aicpu_thread_num=config.aicpu_thread_num,
         config=config,
+        **({"artifact_runtime": artifact_runtime} if artifact_runtime is not None else {}),
     )
 
     if not return_style:
@@ -686,6 +763,23 @@ def _default_platform(backend_type: BackendType) -> str:
     handler.
     """
     return _backend_core.get_backend_instance(backend_type).get_handler().get_default_sim_platform()
+
+
+def _reload_platform(
+    persisted_backend: BackendType,
+    persisted_platform: str | None,
+    *,
+    backend_type: BackendType | None,
+    execution_mode: ExecutionMode | None,
+    platform: str | None,
+) -> str | None:
+    """Apply target overrides, retaining the persisted value of an omitted axis."""
+    if backend_type is None and execution_mode is None:
+        return platform or persisted_platform
+    if execution_mode is None and platform is None:
+        execution_mode = _parse_platform(persisted_platform or _default_platform(persisted_backend))[1]
+    target_backend = persisted_backend if backend_type is None else backend_type
+    return _platform_string(*_resolve_target(target_backend, execution_mode, platform))
 
 
 def _write_debug_runner(
@@ -736,6 +830,12 @@ class _RuntimeFacade:
     _chip_callable: Any
     _runtime_name: str | None
     _runtime_config: dict[str, Any] | None
+    _execution_capabilities: ExecutionCapabilities
+
+    @property
+    def execution_capabilities(self) -> ExecutionCapabilities:
+        """Artifact consumers declared at compilation, without loading a runtime."""
+        return self._execution_capabilities
 
     def _check_runtime_access(self) -> None:
         """Hook run before the first compile-and-load. Default: allow.
@@ -748,9 +848,17 @@ class _RuntimeFacade:
         if self._chip_callable is not None:
             return
         self._check_runtime_access()
-        from pypto.runtime.device_runner import _compile_and_assemble  # noqa: PLC0415
+        artifact_runtime = getattr(self, "_artifact_runtime", None)
+        if artifact_runtime is None:
+            from pypto.runtime.device_runner import (  # noqa: PLC0415 -- lazy import from outside the overlay scope; its precision lives there
+                _compile_and_assemble,
+            )
 
-        cc, rn, rc = _compile_and_assemble(self._output_dir, self._platform)
+            cc, rn, rc = _compile_and_assemble(  # see the lazy import above
+                self._output_dir, self._platform
+            )
+        else:
+            cc, rn, rc = artifact_runtime.load()["."]
         # Publish the "loaded" sentinel (_chip_callable) last so a reader can
         # never observe it set while _runtime_name / _runtime_config are None.
         self._runtime_name = rn
@@ -777,6 +885,18 @@ class _RuntimeFacade:
         self._ensure_runtime_loaded()
         assert self._runtime_name is not None
         return self._runtime_name
+
+    def _host_tensor_indices(self) -> tuple[int, ...] | list[int]:
+        """Read argument transfers without compiling binaries or opening a worker."""
+        if self._runtime_config is not None:
+            return self._runtime_config.get("host_tensor_indices", ())
+        from pypto.runtime._artifact_sources import read_kernel_config  # noqa: PLC0415
+
+        config_path = self._output_dir / "kernel_config.py"
+        if not config_path.exists():
+            return ()
+        config = read_kernel_config(config_path)
+        return getattr(config, "RUNTIME_CONFIG", {}).get("host_tensor_indices", ())
 
     @property
     def runtime_config(self) -> dict[str, Any]:
@@ -815,28 +935,37 @@ class CompiledProgram(_RuntimeFacade):
     """
 
     __test__ = False  # Not a pytest test class
+    _artifact_runtime: "ArtifactRuntime | None" = None
 
     def __init__(
         self,
         program: Program | None,
         output_dir: str,
         *,
-        backend_type: BackendType = BackendType.Ascend910B,
+        backend_type: BackendType = BackendType.Ascend910,
         platform: str | None = None,
+        execution_mode: ExecutionMode | None = None,
         _param_infos: list[_ParamInfo] | None = None,
         _output_indices: list[int] | None = None,
         _return_types: list[Any] | None = None,
         _sub_chip_names: Sequence[str] | None = None,
+        _execution_capabilities: ExecutionCapabilities = ExecutionCapabilities(),
     ) -> None:
         # ``program`` is ``None`` on the :meth:`from_dir` reload path: param
         # metadata is supplied pre-derived via the ``_param_infos`` /
         # ``_output_indices`` / ``_return_types`` kwargs (read back from
         # ``compiled_meta.json``), and the runtime artefacts are assembled from
         # the on-disk ``kernel_config.py`` -- so no live IR is needed.
+        _execution_capabilities.require(ArtifactExecutionMode.PROGRAM)
+        self._execution_capabilities = _execution_capabilities
         self._program = program
         self._output_dir = Path(output_dir).resolve()
         self._backend_type = backend_type
-        self._platform = platform or _default_platform(backend_type)
+        self._platform = (
+            platform or _default_platform(backend_type)
+            if execution_mode is None
+            else _platform_string(*_resolve_target(backend_type, execution_mode, platform))
+        )
         # Lazy metadata -- extracted on first call, or supplied by from_dir()
         self._param_infos = _param_infos
         self._output_indices = _output_indices
@@ -934,6 +1063,7 @@ class CompiledProgram(_RuntimeFacade):
         """
         meta = {
             "schema": _COMPILED_META_SCHEMA,
+            "supported_execution_modes": self.execution_capabilities.record(),
             "params": [_param_info_to_dict(p) for p in param_infos],
             "num_return_types": len(return_types),
             "platform": self._platform,
@@ -999,6 +1129,7 @@ class CompiledProgram(_RuntimeFacade):
         *,
         platform: str | None = None,
         backend_type: BackendType | None = None,
+        execution_mode: ExecutionMode | None = None,
     ) -> "CompiledProgram":
         """Reconstruct a single-chip program from an existing ``build_output/`` dir.
 
@@ -1010,20 +1141,24 @@ class CompiledProgram(_RuntimeFacade):
         orchestration cpp / ``.pto``, then re-measure)::
 
             from pypto.ir import CompiledProgram
-            from pypto.runtime import benchmark
+            from pypto.runtime import ExecutionMode, benchmark
 
-            compiled = CompiledProgram.from_dir(work_dir, platform="a2a3")
+            compiled = CompiledProgram.from_dir(work_dir, execution_mode=ExecutionMode.ONBOARD)
             stats = benchmark(compiled, args, rounds=100)
 
         Args:
             output_dir: A build directory produced by a prior ``ir.compile`` of a
                 single-orchestration (L2) program. Must contain
                 ``compiled_meta.json``.
-            platform: Override the persisted platform (e.g. swap ``a2a3sim`` ->
+            platform: Deprecated; use backend_type and execution_mode.
+                Override the persisted platform (e.g. swap ``a2a3sim`` ->
                 ``a2a3`` to replay on hardware). ``None`` keeps the persisted
                 value.
+            execution_mode: Override the execution mode, retaining the persisted
+                backend unless backend_type is also supplied.
             backend_type: Override the persisted codegen backend. ``None`` keeps
-                the persisted value.
+                the persisted value. An override retains the saved execution mode
+                unless execution_mode or a legacy platform is also supplied.
 
         Returns:
             A :class:`CompiledProgram` whose ``__call__`` and runtime-artefact
@@ -1043,6 +1178,8 @@ class CompiledProgram(_RuntimeFacade):
             ValueError: ``compiled_meta.json`` is unreadable, malformed, or
                 records a ``schema`` version incompatible with this pypto build.
         """
+        if platform is not None:
+            _warn_deprecated_platform("CompiledProgram.from_dir")
         meta_path = Path(output_dir).resolve() / _COMPILED_META_FILENAME
         if not meta_path.exists():
             raise FileNotFoundError(
@@ -1053,6 +1190,13 @@ class CompiledProgram(_RuntimeFacade):
                 f"— reload one of those). Recompile via ir.compile() to refresh."
             )
         meta = _load_meta(meta_path, filename=_COMPILED_META_FILENAME, schema=_COMPILED_META_SCHEMA)
+        platform = _reload_platform(
+            meta["backend_type"],
+            meta["platform"],
+            backend_type=backend_type,
+            execution_mode=execution_mode,
+            platform=platform,
+        )
         param_infos = meta["param_infos"]
         output_indices = [i for i, p in enumerate(param_infos) if p.direction == ParamDirection.Out]
         # ``return_types`` contents are never inspected at runtime — only the
@@ -1071,6 +1215,7 @@ class CompiledProgram(_RuntimeFacade):
             _output_indices=output_indices,
             _return_types=return_types,
             _sub_chip_names=[],
+            _execution_capabilities=meta["execution_capabilities"],
         )
 
     # --- Properties -----------------------------------------------------------
@@ -1093,6 +1238,11 @@ class CompiledProgram(_RuntimeFacade):
     def backend_type(self) -> BackendType:
         """Backend type used during compilation."""
         return self._backend_type
+
+    @property
+    def execution_mode(self) -> ExecutionMode:
+        """Simulator or onboard execution for this artifact."""
+        return _parse_platform(self._platform)[1]
 
     @property
     def platform(self) -> str:
@@ -1169,7 +1319,7 @@ class CompiledProgram(_RuntimeFacade):
         self,
         *args: "CallArg",
         worker: Any | None = None,
-    ) -> tuple[Any, list[torch.Tensor | DeviceTensor | ctypes._SimpleCData], bool]:
+    ) -> "tuple[Any, list[torch.Tensor | DeviceTensor | ctypes._SimpleCData[Any]], bool]":
         """Coerce user args and pack into simpler address-free ``TaskArgs``.
 
         Returns ``(orch_args, coerced, return_style)``:
@@ -1201,9 +1351,11 @@ class CompiledProgram(_RuntimeFacade):
             raise TypeError(
                 "_build_orch_args requires the simpler Worker that will own and dispatch these TaskArgs"
             )
-        from pypto.runtime.runner import _coerced_to_orch_args  # noqa: PLC0415
+        from pypto.runtime.runner import (  # noqa: PLC0415 -- lazy import from outside the overlay scope; its precision lives there
+            _coerced_to_orch_args,
+        )
 
-        orch_args = _coerced_to_orch_args(coerced, worker)
+        orch_args = _coerced_to_orch_args(coerced, worker, self._host_tensor_indices())
         return orch_args, coerced, return_style
 
     def _build_call_config(
@@ -1256,7 +1408,8 @@ class CompiledProgram(_RuntimeFacade):
         if isinstance(other, CompiledProgram):
             return self._output_dir == other._output_dir
         if isinstance(other, (str, os.PathLike)):
-            return str(self._output_dir) == str(other)
+            # PathLike[Unknown] from the isinstance narrow; str() accepts any fspath result.
+            return str(self._output_dir) == str(other)  # type: ignore[reportUnknownArgumentType]
         return NotImplemented
 
     def __hash__(self) -> int:
@@ -1322,7 +1475,9 @@ class CompiledProgram(_RuntimeFacade):
             raise KeyError(
                 f"next_levels/{name}/ exists but function {name!r} is missing from the program IR."
             )
-        return _SubChipCallable(name, func, self._sub_chip_dirs[name], self._platform)
+        return _SubChipCallable(
+            name, func, self._sub_chip_dirs[name], self._platform, self.execution_capabilities
+        )
 
     def __getattr__(self, name: str) -> "_SubChipCallable":
         # __getattr__ only fires when normal attribute lookup fails. Read
@@ -1385,6 +1540,7 @@ class CompiledProgram(_RuntimeFacade):
             args=args,
             config=config,
             caller_name="CompiledProgram",
+            artifact_runtime=getattr(self, "_artifact_runtime", None),
         )
 
 
@@ -1398,7 +1554,16 @@ class _SubChipCallable(_RuntimeFacade):
 
     __test__ = False
 
-    def __init__(self, name: str, func: Function, sub_dir: Path, platform: str) -> None:
+    def __init__(
+        self,
+        name: str,
+        func: Function,
+        sub_dir: Path,
+        platform: str,
+        execution_capabilities: ExecutionCapabilities = ExecutionCapabilities(),
+    ) -> None:
+        execution_capabilities.require(ArtifactExecutionMode.PROGRAM)
+        self._execution_capabilities = execution_capabilities
         self._name = name
         self._func = func
         self._output_dir = sub_dir
@@ -1418,6 +1583,16 @@ class _SubChipCallable(_RuntimeFacade):
         return self._output_dir
 
     @property
+    def backend_type(self) -> BackendType:
+        """Backend selected by the parent artifact's target."""
+        return _parse_platform(self._platform)[0]
+
+    @property
+    def execution_mode(self) -> ExecutionMode:
+        """Simulator or onboard execution for this artifact."""
+        return _parse_platform(self._platform)[1]
+
+    @property
     def platform(self) -> str:
         return self._platform
 
@@ -1433,7 +1608,7 @@ class _SubChipCallable(_RuntimeFacade):
         self,
         *args: "CallArg",
         worker: Any | None = None,
-    ) -> tuple[Any, list[torch.Tensor | DeviceTensor | ctypes._SimpleCData], bool]:
+    ) -> "tuple[Any, list[torch.Tensor | DeviceTensor | ctypes._SimpleCData[Any]], bool]":
         coerced, return_style = _coerce_args(
             args,
             self._param_infos,
@@ -1445,9 +1620,11 @@ class _SubChipCallable(_RuntimeFacade):
             raise TypeError(
                 "_build_orch_args requires the simpler Worker that will own and dispatch these TaskArgs"
             )
-        from pypto.runtime.runner import _coerced_to_orch_args  # noqa: PLC0415
+        from pypto.runtime.runner import (  # noqa: PLC0415 -- lazy import from outside the overlay scope; its precision lives there
+            _coerced_to_orch_args,
+        )
 
-        orch_args = _coerced_to_orch_args(coerced, worker)
+        orch_args = _coerced_to_orch_args(coerced, worker, self._host_tensor_indices())
         return orch_args, coerced, return_style
 
     def _build_call_config(
@@ -1492,3 +1669,8 @@ class _SubChipCallable(_RuntimeFacade):
 # parameter metadata without instantiating a full CompiledProgram.
 
 extract_param_infos = _extract_param_infos
+
+# ``_validate_stacked_tensor`` is shared (lazy-imported) with the runtime's
+# prepared-dispatch boundary and the ir suite; the listing keeps pyright's
+# unused-function check satisfied without widening the public surface.
+__all__ = ["_validate_stacked_tensor"]

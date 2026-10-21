@@ -22,7 +22,6 @@ from pypto.pypto_core import ir as _ir_core
 from pypto.pypto_core.ir import (
     AccPhase,
     Call,
-    ConstFloat,
     ConstInt,
     Expr,
     MemorySpace,
@@ -43,9 +42,31 @@ from ..utils import (
     _to_int32_scalar,
     _to_make_tuple,
     resolve_cast_mode,
+    resolve_fixpipe_epilogue,
     resolve_saturation_deviation,
 )
 from ._pad_value import normalize_pad_value
+
+
+def _fixpipe_epilogue_kwargs(
+    op_name: str, pre_quant: float | Expr | None, pre_relu: bool | Expr
+) -> dict[str, Any]:
+    """Build the FIXPIPE ``pre_quant`` / ``pre_relu`` op kwargs, or none at all.
+
+    Resolution lives in :func:`resolve_fixpipe_epilogue` so the DSL entry points
+    can apply the same rules before dispatching. This adds only the op-kwarg
+    shape: an epilogue-free call must produce no kwargs, so ordinary tile IR
+    prints and compares exactly as it did before the feature existed, and a
+    ``float`` is always stored (the op declares ``set_attr<double>``, which an
+    ``int`` would fail to cast).
+    """
+    scale, relu = resolve_fixpipe_epilogue(op_name, pre_quant, pre_relu)
+    kwargs: dict[str, Any] = {}
+    if scale is not None:
+        kwargs["pre_quant"] = scale
+    if relu:
+        kwargs["pre_relu"] = True
+    return kwargs
 
 
 def _validate_offsets_shapes(offsets_tuple: _ir_core.MakeTuple, shapes_tuple: _ir_core.MakeTuple) -> None:
@@ -210,9 +231,10 @@ def load(
             element must be an integer scalar — one extent per dimension, never a
             nested tuple.
         target_memory: Target memory space (MemorySpace.Vec or MemorySpace.Mat).
-            ``None`` (the default) leaves the space unset so InferTileMemorySpace
-            places the tile from consumer demand; the kwarg is then omitted from
-            the op entirely. MX-layout tensors require an explicit MemorySpace.Mat.
+            ``None`` (the default) leaves an ordinary load unset so
+            InferTileMemorySpace places the tile from consumer demand. An
+            MX-layout load instead defaults to MemorySpace.Mat, the only memory
+            that the raw MX load instruction can target.
         clamp: Sanction a read that runs off the end of the source. By default a
             load asserts that ``offsets + valid_shape`` stays inside the source
             and is rejected when that provably fails; with ``clamp=True`` the
@@ -237,10 +259,12 @@ def load(
     source_layout = getattr(tensor_view, "layout", None)
     is_mx = source_layout in (TensorLayout.MX_A_ZZ, TensorLayout.MX_B_NN)
 
-    if is_mx and target_memory != MemorySpace.Mat:
+    if is_mx and target_memory is None:
+        target_memory = MemorySpace.Mat
+    elif is_mx and target_memory != MemorySpace.Mat:
         raise ValueError(
-            "tile.load of an MX-layout tensor requires explicit target_memory=MemorySpace.Mat "
-            f"(MX scale loads are L1/Mat only); got {target_memory}"
+            "tile.load of an MX-layout tensor only supports target_memory=MemorySpace.Mat "
+            f"(omitting target_memory selects Mat automatically); got {target_memory}"
         )
 
     # Validate target_memory: only Vec and Mat are allowed for load. ``None``
@@ -293,6 +317,8 @@ def store(
     *,
     atomic: int = 0,
     st_phase: STPhase = STPhase.Unspecified,
+    pre_quant: float | Expr | None = None,
+    pre_relu: bool | Expr = False,
 ) -> Call:
     """Copy data from unified buffer (tile) to tensor.
 
@@ -311,6 +337,14 @@ def store(
             preserves ordinary stores; ``STPhase.Final`` checks and clears the
             flag published by a final phased accumulator producer. The kwarg is
             omitted entirely for the default so existing stores remain unchanged.
+        pre_quant: FIXPIPE pre-quantization scale for an ``Acc`` source. The
+            accumulator is multiplied by it in FP32 on the way out, before the
+            destination clamp, which is what lets an INT32 accumulator reach an
+            FP16 or INT8 tensor without a vector round-trip. ``None`` (default)
+            emits no scale at all — distinct from ``1.0``, which still selects
+            the quantizing instruction form.
+        pre_relu: Apply ReLU inside the same writeback, *after* ``pre_quant`` and
+            the clamp — it reproduces ``maximum(tile * pre_quant, 0)``.
 
     Returns:
         Call expression that returns the output tensor
@@ -325,6 +359,7 @@ def store(
     kwargs: dict[str, Any] = {"atomic": atomic} if atomic else {}
     if st_phase != STPhase.Unspecified:
         kwargs["st_phase"] = int(st_phase)
+    kwargs.update(_fixpipe_epilogue_kwargs("tile.store", pre_quant, pre_relu))
     return _ir_core.create_op_call("tile.store", args, kwargs, actual_span)
 
 
@@ -333,6 +368,9 @@ def assemble(
     source: Expr,
     offset: Sequence[int | Expr] | _ir_core.MakeTuple,
     span: Span | None = None,
+    *,
+    pre_quant: float | Expr | None = None,
+    pre_relu: bool | Expr = False,
 ) -> Call:
     """Write source tile data into target tile at specified offset.
 
@@ -341,6 +379,14 @@ def assemble(
         source: Source tile to write (TileType)
         offset: Offset dimensions for where to write, or a MakeTuple
         span: Optional source span for debugging (auto-captured if not provided)
+        pre_quant: FIXPIPE pre-quantization scale for an ``Acc``-to-``Mat``
+            writeback. The accumulator is multiplied by it in FP32 on the way
+            out, before the destination clamp, which is what lets an INT32
+            accumulator land in an FP16 Mat tile the next matmul can read.
+            ``None`` (default) emits no scale at all — distinct from ``1.0``,
+            which still selects the quantizing instruction form.
+        pre_relu: Apply ReLU inside the same writeback, *after* ``pre_quant`` and
+            the clamp — it reproduces ``maximum(tile * pre_quant, 0)``.
 
     Returns:
         Call expression that returns a TileType with the same shape/dtype as target
@@ -348,7 +394,8 @@ def assemble(
     actual_span = _get_span_or_capture(span)
     offset_tuple = _to_make_tuple(offset, actual_span)
 
-    return _ir_core.create_op_call("tile.assemble", [target, source, offset_tuple], {}, actual_span)
+    kwargs = _fixpipe_epilogue_kwargs("tile.assemble", pre_quant, pre_relu)
+    return _ir_core.create_op_call("tile.assemble", [target, source, offset_tuple], kwargs, actual_span)
 
 
 def gather_row(  # noqa: PLR0913
@@ -398,8 +445,8 @@ def scatter_update(
     input: Expr,
     *args: Expr | int,
     dim: int | Expr | None = None,
-    index: Expr | None = None,
-    src: Expr | None = None,
+    index: Expr | int | None = None,
+    src: Expr | int | None = None,
     span: Span | None = None,
 ) -> Call:
     """Update tile rows at positions specified by 2D index tile with values from src.
@@ -484,7 +531,7 @@ _MGATHER_COALESCE = {"row": 0, "elem": 1}
 _MGATHER_GATHER_OOB = {"undefined": 0, "clamp": 1, "wrap": 2, "zero": 3}
 
 
-def _resolve_mgather_coalesce(coalesce: str | int) -> int:
+def _resolve_mgather_coalesce(coalesce: object) -> int:
     if isinstance(coalesce, str):
         try:
             return _MGATHER_COALESCE[coalesce]
@@ -495,7 +542,7 @@ def _resolve_mgather_coalesce(coalesce: str | int) -> int:
     raise ValueError(f"mgather coalesce must be 'row', 'elem', 0, or 1, got {coalesce!r}")
 
 
-def _resolve_mgather_gather_oob(gather_oob: str | int) -> int:
+def _resolve_mgather_gather_oob(gather_oob: object) -> int:
     if isinstance(gather_oob, str):
         try:
             return _MGATHER_GATHER_OOB[gather_oob]
@@ -680,7 +727,7 @@ def get_block_num(span: Span | None = None) -> Call:
 def full(
     shape: Sequence[int | Expr] | _ir_core.MakeTuple,
     dtype: DataType,
-    value: int | float,
+    value: int | float | Expr,
     span: Span | None = None,
 ) -> Call:
     """Create a tile from a shape and fill with value in UB.
@@ -688,7 +735,7 @@ def full(
     Args:
         shape: Shape of the tile, or a MakeTuple
         dtype: Data type of the tile
-        value: filling scalar
+        value: Numeric fill value or parsed scalar constant (runtime values are not supported)
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -696,10 +743,7 @@ def full(
     """
     actual_span = _get_span_or_capture(span)
     shape_tuple = _to_make_tuple(shape, actual_span)
-    if isinstance(value, int):
-        value_expr = ConstInt(value, dtype, actual_span)
-    else:
-        value_expr = ConstFloat(value, dtype, actual_span)
+    value_expr = _normalize_const_to_dtype(value, dtype, actual_span)
     kwargs: dict[str, Any] = {"dtype": dtype}
     return _ir_core.create_op_call("tile.full", [shape_tuple, value_expr], kwargs, actual_span)
 
@@ -1529,6 +1573,82 @@ def sels(
         retype_constants=True,
     )
     return _ir_core.create_op_call("tile.sels", [mask, src, tmp, scalar_expr], {}, actual_span)
+
+
+def select(
+    cond: Expr,
+    on_true: int | float | Expr,
+    on_false: int | float | Expr,
+    span: Span | None = None,
+) -> Call:
+    """Per-element value selection between two operands.
+
+    For each element (i, j): ``dst[i,j] = on_true[i,j] if cond[i,j] else on_false[i,j]``.
+
+    Unlike :func:`sel` / :func:`sels` this is a composite op: it carries no
+    ``tmp`` operand, and ``LowerCompositeOps`` expands it into the
+    ``tile.create`` / ``tile.sel`` / ``tile.sels`` chain with the architecture's
+    scratch geometry filled in.
+
+    Both branches are evaluated -- this selects values, it does not branch.
+
+    Two tile branches must share a physical shape, valid extents, and dtype: the lowered TSEL reads both
+    sources element-wise, does not broadcast, and has one element type for both
+    sources and the result. Widen with :func:`expands` /
+    :func:`row_expand` / :func:`col_expand`, or :func:`cast`, first.
+
+    Args:
+        cond: The packed predicate mask returned by :func:`cmp` / :func:`cmps`
+            for this result's geometry. A 0/1 value tile is not accepted -- a
+            mask's valid extent counts carrier bytes where a value's counts
+            elements, so the two cannot be told apart reliably; convert one with
+            ``cmps(value, 0, cmp_type=1)``
+        on_true: Value selected where cond is true; a tile or a constant scalar
+        on_false: Value selected where cond is false; same forms as on_true
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for per-element selection
+
+    Raises:
+        ValueError: If both on_true and on_false are scalars -- there is no
+            shape to select into -- if two tile branches disagree on shape,
+            valid extents, or dtype, or if a scalar branch is not a compile-time
+            constant (it is materialized with ``tile.full``, which needs one)
+    """
+    actual_span = _get_span_or_capture(span)
+
+    def as_tile(value: int | float | Expr) -> Expr | None:
+        """The operand as a tile Expr, or None when it is a scalar branch."""
+        if isinstance(value, _ir_core.Expr) and isinstance(value.type, _ir_core.TileType):
+            return value
+        return None
+
+    true_tile = as_tile(on_true)
+    false_tile = as_tile(on_false)
+    shaped = true_tile if true_tile is not None else false_tile
+    if shaped is None:
+        raise ValueError(
+            "tile.select requires at least one of on_true/on_false to be a Tile, but both are "
+            f"scalars ({on_true!r}, {on_false!r}); there is no shape to select into"
+        )
+    # Re-stamp a scalar branch to the selected tile's element type, matching how
+    # tile.sels normalizes its own scalar operand.
+    true_arg: Expr = (
+        true_tile
+        if true_tile is not None
+        else _normalize_signless_same_width_scalar_operand(
+            shaped, on_true, actual_span, retype_constants=True
+        )
+    )
+    false_arg: Expr = (
+        false_tile
+        if false_tile is not None
+        else _normalize_signless_same_width_scalar_operand(
+            shaped, on_false, actual_span, retype_constants=True
+        )
+    )
+    return _ir_core.create_op_call("tile.select", [cond, true_arg, false_arg], {}, actual_span)
 
 
 def muls(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
@@ -3032,6 +3152,10 @@ def reinterpret_view(
 ) -> Call:
     """Reinterpret a tile over the same bytes with a different dtype.
 
+    FP4E2M1X2 <-> UINT8/INT8 is a same-shape byte alias for dense
+    address-backed 2D row-major Vec tiles with static UB offsets. Reshape
+    the byte view separately. A5 codegen requires PYPTO / DSA_RP planning.
+
     Args:
         data: Input tile expression
         dtype: Target element dtype
@@ -3049,7 +3173,7 @@ def reinterpret_view(
     return _ir_core.create_op_call("tile.reinterpret_view", args, {"dtype": dtype}, actual_span)
 
 
-def _normalize_axis_const(axis: int | ConstInt, span: Span, name: str) -> ConstInt:
+def _normalize_axis_const(axis: object, span: Span, name: str) -> ConstInt:
     """Normalize an axis argument (int or ConstInt) into a ConstInt(INDEX) expression."""
     if isinstance(axis, ConstInt):
         return axis
@@ -3406,7 +3530,7 @@ def gather_mask(
 _GATHER_COMPARE_CMP_MODES = ("eq", "ne", "lt", "le", "gt", "ge")
 
 
-def resolve_gather_compare_cmp_mode(cmp_mode: str | int) -> int:
+def resolve_gather_compare_cmp_mode(cmp_mode: object) -> int:
     """Normalize a gather_compare cmp_mode to its integer enum value.
 
     Accepts either a string in ``{"eq", "ne", "lt", "le", "gt", "ge"}`` or

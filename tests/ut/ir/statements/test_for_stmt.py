@@ -380,8 +380,8 @@ class TestForStmtEquality:
 
         ir.assert_structural_equal(for_stmt1, for_stmt2)
 
-    def test_for_stmt_different_loop_var_equal(self):
-        """Test ForStmt nodes with different loop vars are not equal."""
+    def test_for_stmt_shared_body_with_different_binder_not_equal(self):
+        """A shared body must still respect the loop-variable bijection."""
         span = ir.Span.unknown()
         dtype = DataType.INT64
         i = ir.Var("i", ir.ScalarType(dtype), span)
@@ -394,7 +394,9 @@ class TestForStmtEquality:
         for_stmt1 = ir.ForStmt(i, start, stop, step, [], assign, [], span)
         for_stmt2 = ir.ForStmt(j, start, stop, step, [], assign, [], span)
 
-        ir.assert_structural_equal(for_stmt1, for_stmt2)
+        assert not ir.structural_equal(for_stmt1, for_stmt2)
+        with pytest.raises(ValueError, match="binding:"):
+            ir.assert_structural_equal(for_stmt1, for_stmt2)
 
     def test_for_stmt_different_range_not_equal(self):
         """Test ForStmt nodes with different range values are not equal."""
@@ -752,7 +754,7 @@ class TestForKindEquality:
         assign2 = ir.AssignStmt(i2, start2, span)
         for_stmt2 = ir.ForStmt(i2, start2, stop2, step2, [], assign2, [], span, ir.ForKind.Parallel)
 
-        with pytest.raises(ValueError, match=r"ForKind mismatch"):
+        with pytest.raises(ValueError, match=r"root\.kind"):
             ir.assert_structural_equal(for_stmt1, for_stmt2)
 
 

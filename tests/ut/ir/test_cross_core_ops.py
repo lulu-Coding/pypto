@@ -169,6 +169,43 @@ def test_cross_core_sync_static_and_dynamic_event_ids():
     assert dynamic_wait.kwargs["core_type"] == "aic"
 
 
+def test_pipeline_flags_static_and_dynamic_ir():
+    span = ir.Span.unknown()
+    set_call = system_ops.set_flag(ir.PipeType.MTE2, ir.PipeType.V, 7, span=span)
+    event = ir.Var("event", ir.ScalarType(DataType.INDEX), span)
+    wait_call = system_ops.wait_flag(
+        ir.PipeType.MTE2, ir.PipeType.V, event, core_type=system_ops.KernelType.AIV, span=span
+    )
+    assert isinstance(set_call.type, ir.UnknownType)
+    assert set_call.args == []
+    assert set_call.kwargs["event_id"] == 7
+    assert wait_call.args == [event]
+    assert "event_id" not in wait_call.kwargs
+    assert wait_call.kwargs["core_type"] == "aiv"
+
+
+@pytest.mark.parametrize("event_id", [-1, 8, True])
+def test_pipeline_flag_rejects_invalid_static_event(event_id):
+    with pytest.raises((TypeError, ValueError)):
+        system_ops.set_flag(ir.PipeType.MTE2, ir.PipeType.V, event_id)
+
+
+def test_pipeline_flag_rejects_invalid_ir():
+    span = ir.Span.unknown()
+    with pytest.raises((TypeError, ValueError), match="different"):
+        system_ops.set_flag(ir.PipeType.V, ir.PipeType.V)
+    with pytest.raises((TypeError, ValueError), match="concrete"):
+        ir.create_op_call(
+            "system.wait_flag",
+            [],
+            {"src_pipe": ir.PipeType.ALL, "dst_pipe": ir.PipeType.V, "event_id": 0},
+            span,
+        )
+    bad_event = ir.Var("event", ir.ScalarType(DataType.INT32), span)
+    with pytest.raises((TypeError, ValueError), match="INDEX"):
+        system_ops.wait_flag(ir.PipeType.MTE2, ir.PipeType.V, bad_event)
+
+
 @pytest.mark.parametrize("core_type", ["aic", "aiv", "aic_only", "mix", 0])
 def test_cross_core_sync_rejects_non_enum_core_type(core_type):
     """``core_type`` is enum-only: the lowered attr spelling is not an input."""
@@ -297,6 +334,56 @@ def test_shard_allows_static_narrow_columns():
     shard = ir.create_op_call("tile.aiv_shard", [tile_var], {"split": 1}, span)
     assert isinstance(shard.type, ir.TileType)
     assert shard.type.shape == [8, 128]
+
+
+@pytest.mark.parametrize("split", [0, 1, 2])
+@pytest.mark.parametrize(
+    ("layout", "shape", "target"),
+    [
+        (ir.TileLayout.row_major, [32, 4], ir.MemorySpace.LeftScale),
+        (ir.TileLayout.col_major, [4, 32], ir.MemorySpace.RightScale),
+    ],
+)
+def test_gather_preserves_mx_scale_layout(split, layout, shape, target):
+    """A gathered public MX scale remains usable by its cube scale operand."""
+    span = ir.Span.unknown()
+    source = ir.Var(
+        "scale",
+        ir.TileType(
+            shape,
+            DataType.FP8E8M0,
+            tile_view=ir.TileView(blayout=layout, slayout=layout, fractal=32),
+            memory_space=ir.MemorySpace.Vec,
+        ),
+        span,
+    )
+    gathered = ir.create_op_call("tile.aic_gather", [source], {"split": split}, span)
+    # Exercise the actual consumer before checking metadata: this used to raise
+    # "requires the source Mat tile to use the matching row/row/32 layout".
+    moved = ir.create_op_call("tile.move", [gathered], {"target_memory": target}, span)
+    expected_shape = shape.copy()
+    if split:
+        expected_shape[split - 1] *= 2
+    assert isinstance(moved.type, ir.TileType)
+    assert isinstance(gathered.type, ir.TileType)
+    assert moved.type.shape == expected_shape
+    view = gathered.type.get_effective_tile_view()
+    assert (view.blayout, view.slayout, view.fractal) == (layout, layout, 32)
+
+
+@pytest.mark.parametrize("split", [0, 1, 2])
+@pytest.mark.parametrize("layout", [ir.TensorLayout.MX_A_ZZ, ir.TensorLayout.MX_B_NN])
+def test_tensor_gather_preserves_mx_scale_layout(split, layout):
+    span = ir.Span.unknown()
+    source = ir.Var(
+        "scale",
+        ir.TensorType([32, 32], DataType.FP8E8M0, tensor_view=ir.TensorView([], layout)),
+        span,
+    )
+    gathered = ir.create_op_call("tensor.aic_gather", [source], {"split": split}, span)
+    assert isinstance(gathered.type, ir.TensorType)
+    assert gathered.type.tensor_view is not None
+    assert gathered.type.tensor_view.layout == layout
 
 
 def test_gather_defers_the_band_rule_to_lowering():

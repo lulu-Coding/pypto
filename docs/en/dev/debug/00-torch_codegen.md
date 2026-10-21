@@ -24,8 +24,11 @@ torch_codegen(node: _ir.Program | _ir.Function, check_shapes: bool = False) -> s
 
 - Keep IR-to-Python expression/statement mapping readable.
 - Cover common tensor/tile operations.
+- Execute the default dense Vec Buffer transfers and registered vector/scalar arithmetic (including full), including destination writes and storage aliases, for `kernel.lower()` and `CompiledProgram.validate_ir()`. Structured control flow preserves simultaneous scalar yields and planned Tile carry copies; ordinary cube operations model fractal layouts and shared physical storage, including transpose and wider accumulator views. Buffer pass dumps retain readable Python text and a lossless `.msgpack` companion; `validate_ir()` replays the companion because Buffer text is not executable DSL.
 - Simulate concurrent cross-core `tpush/tpop` behavior.
 - Provide actionable diagnostics for suspicious inputs (timeouts, invalid split dimensions, etc.).
+
+Addressed Vec and cube allocations share one byte pool per memory space and function invocation. Overlapping addresses therefore alias even across distinct allocation handles; addressless allocations remain independent. Window views retain their parent pitch and have independent valid metadata.
 
 ### Non-goals
 
@@ -129,7 +132,7 @@ accumulating matmul, so each honours the predicate through the one handler:
 The odd codes are validated against the tile's RUNTIME valid extent, not its
 physical box: an even box with an odd valid extent (16 with `valid_shape` 15)
 is exactly the case they exist for. `lane_stride` rides along only when
-[LowerAutoVectorSplit](../passes/23-lower_auto_vector_split.md) rebalanced a
+[LowerAutoVectorSplit](../passes/24-lower_auto_vector_split.md) rebalanced a
 ragged boundary; the runtime then cuts the lanes there instead of at the box
 half. Odd codes are rejected on `push_to_aic` / `pop_from_aiv`, mirroring PTO
 codegen — pto-isa has no odd Vector-to-Cube transport.

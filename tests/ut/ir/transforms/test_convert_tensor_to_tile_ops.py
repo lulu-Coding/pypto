@@ -4348,6 +4348,52 @@ class TestGmLocalTensorConversion:
         assert len(_find_calls_to(kernel, "tile.reshape")) == 2
         assert _find_first_call_to(kernel, "tensor.write") is None
 
+    @pytest.mark.parametrize("target", ["dst", "viewed"])
+    def test_constant_fill_with_dynamic_scalar_overrides_keeps_scalar_stores(self, target):
+        """Folding a cast must not turn two scalar-write loops into mixed stores."""
+        before = pl.parse_program(f"""
+@pl.program
+class Before:
+    @pl.function(type=pl.FunctionType.InCore)
+    def main_incore_0(
+        self, dst: pl.Tensor[[32], pl.INT32], count: pl.Scalar[pl.INDEX]
+    ) -> pl.Tensor[[32], pl.INT32]:
+        viewed = pl.tensor.view(dst, [32])
+        for i in pl.range(32):
+            pl.tensor.write(dst, [i], pl.cast(0, pl.INT32))
+        for j in pl.range(count):
+            pl.tensor.write({target}, [j], pl.cast(j + 1, pl.INT32))
+        return dst
+""")
+        simplified = passes.simplify()(passes.convert_to_ssa()(before))
+        after = passes.convert_tensor_to_tile_ops()(simplified)
+        kernel = _require_function(after, "main_incore_0")
+        assert len(_find_calls_to(kernel, "tensor.write")) == 2
+        assert _find_first_call_to(kernel, "tile.store") is None
+        assert kernel.param_directions[0] == ir.ParamDirection.InOut
+
+    def test_constant_fill_and_scalar_update_to_distinct_tensors_keeps_bulk_fill(self):
+        """Scalar updates to a different GM root do not prevent fill promotion."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                dst: pl.Tensor[[32], pl.INT32],
+                other: pl.Tensor[[32], pl.INT32],
+                value: pl.Scalar[pl.INT32],
+            ) -> pl.Tensor[[32], pl.INT32]:
+                for i in pl.range(32):
+                    pl.tensor.write(dst, [i], pl.const(0, pl.INT32))
+                pl.tensor.write(other, [0], value)
+                return dst
+
+        after = passes.convert_tensor_to_tile_ops()(Before)
+        kernel = _require_function(after, "main_incore_0")
+        assert len(_find_calls_to(kernel, "tile.store")) == 1
+        assert len(_find_calls_to(kernel, "tensor.write")) == 1
+
     def test_unaligned_constant_scalar_fill_loop_still_rejected(self):
         """A constant fill smaller than one MTE3 row stays on the scalar path."""
 
@@ -4887,6 +4933,7 @@ class TestBridgedLoadSpaceDerivation:
     def test_cube_operand_stages_through_mat_not_its_constraint(self):
         """tile.matmul demands Left/Right; the bridged loads still land in Mat."""
         matmul_spec = ir.get_op_memory_spec("tile.matmul")
+        assert matmul_spec is not None
         assert matmul_spec["input_constraints"][0] == [MemorySpace.Left]
         assert matmul_spec["input_constraints"][1] == [MemorySpace.Right]
 
@@ -4921,9 +4968,12 @@ class TestBridgedLoadSpaceDerivation:
         """A Vec-constrained consumer bridges straight into Vec -- no staging hop."""
         # The three operands tensor.scatter bridges are consumed by tile.scatter
         # (src, indexes) and by the preserve blend's tile.sel (the else-operand).
-        assert ir.get_op_memory_spec("tile.scatter")["input_constraints"][1] == [MemorySpace.Vec]
-        assert ir.get_op_memory_spec("tile.scatter")["input_constraints"][2] == [MemorySpace.Vec]
-        assert ir.get_op_memory_spec("tile.sel")["input_constraints"][2] == [MemorySpace.Vec]
+        scatter_spec = ir.get_op_memory_spec("tile.scatter")
+        sel_spec = ir.get_op_memory_spec("tile.sel")
+        assert scatter_spec is not None and sel_spec is not None
+        assert scatter_spec["input_constraints"][1] == [MemorySpace.Vec]
+        assert scatter_spec["input_constraints"][2] == [MemorySpace.Vec]
+        assert sel_spec["input_constraints"][2] == [MemorySpace.Vec]
 
         @pl.program
         class Before:
@@ -4960,7 +5010,9 @@ class TestBridgedLoadSpaceDerivation:
         second entry here would ask for a `tile.load` into L0C, which no target
         implements.
         """
-        constraints = ir.get_op_memory_spec("pld.tile.remote_store")["input_constraints"]
+        remote_store_spec = ir.get_op_memory_spec("pld.tile.remote_store")
+        assert remote_store_spec is not None
+        constraints = remote_store_spec["input_constraints"]
         assert constraints[0] == [MemorySpace.Vec, MemorySpace.Acc]
 
     @pytest.mark.parametrize(
@@ -4983,8 +5035,11 @@ class TestBridgedLoadSpaceDerivation:
         to one of the pair fails here with the two spaces named rather than only
         as an import-time throw.
         """
-        flat = ir.get_op_memory_spec(flat_op)["input_constraints"]
-        batch = ir.get_op_memory_spec(batch_op)["input_constraints"]
+        flat_spec = ir.get_op_memory_spec(flat_op)
+        batch_spec = ir.get_op_memory_spec(batch_op)
+        assert flat_spec is not None and batch_spec is not None
+        flat = flat_spec["input_constraints"]
+        batch = batch_spec["input_constraints"]
         assert flat == batch, (
             f"{flat_op} and {batch_op} are the two targets of one rank dispatch but "
             f"demand different memory: {flat} vs {batch}"
@@ -5381,11 +5436,212 @@ class TestConvertSortOps:
         ir.assert_structural_equal(After, Expected)
 
 
+class TestConvertFlatGatherOp:
+    @pytest.mark.parametrize("source_type", [ir.TensorType, ir.DistributedTensorType])
+    @pytest.mark.parametrize("index_type", [ir.TensorType, ir.DistributedTensorType])
+    def test_tensor_like_operands_use_gm_lowering(self, source_type, index_type):
+        span = ir.Span.unknown()
+        extra_specs = [
+            ("src", source_type([ir.ConstInt(65536, DataType.INDEX, span)], DataType.FP32)),
+            ("idx", index_type([ir.ConstInt(n, DataType.INDEX, span) for n in (1, 16)], DataType.INT32)),
+        ]
+        before = _make_before(
+            in_specs=[],
+            extra_specs=extra_specs,
+            out_shape=[1, 16],
+            out_dtype=DataType.FP32,
+            body=lambda ib, ins, extras: ib.let("y", tensor_ops.gather(extras[0], extras[1])),
+        )
+
+        def expected_body(ib, ins, extras):
+            idx = ib.let(
+                "gather_idx",
+                tile_ops.load(extras[1], [0, 0], [1, 16], [1, 16], target_memory=MemorySpace.Vec),
+            )
+            return ib.let("y_tile", tile_ops.mgather(extras[0], idx, coalesce="elem"))
+
+        expected = _make_expected(
+            in_specs=[],
+            extra_specs=extra_specs,
+            out_shape=[1, 16],
+            out_dtype=DataType.FP32,
+            body=expected_body,
+            preload=False,
+        )
+        ir.assert_structural_equal(passes.convert_tensor_to_tile_ops()(before), expected)
+
+    def test_tensor_index_lowered_to_mat_is_rejected(self):
+        def body(ib, ins):
+            idx = ib.let("idx", tensor_ops.create_l1([1, 16], DataType.INT32))
+            return ib.let("y", tensor_ops.gather(ins[0], index=idx))
+
+        before = _make_before(
+            in_specs=[("src", [65536], DataType.FP32)], out_shape=[1, 16], out_dtype=DataType.FP32, body=body
+        )
+        with pytest.raises(ValueError, match="indices in Vec"):
+            passes.convert_tensor_to_tile_ops()(before)
+
+    def test_converter_rechecks_index_layout(self):
+        def body(ib, ins):
+            idx = ib.let("idx", tile_ops.load(ins[1], [0, 0], [16, 16], target_memory=MemorySpace.Vec))
+            idx = ib.let("transposed", tile_ops.transpose_view(idx))
+            # A typed call models IR supplied by an earlier transform; the
+            # converter must check the actual lowered operand as well.
+            call = ir.Call(
+                ir.get_op("tensor.gather"),
+                [ins[0], idx],
+                ir.TensorType([16, 16], DataType.FP32),
+                ir.Span.unknown(),
+            )
+            return ib.let("y", call)
+
+        before = _make_before(
+            in_specs=[("src", [1024], DataType.FP32), ("idx", [16, 16], DataType.INT32)],
+            out_shape=[16, 16],
+            out_dtype=DataType.FP32,
+            body=body,
+        )
+        with pytest.raises(ValueError, match="indices with an unboxed row-major layout"):
+            passes.convert_tensor_to_tile_ops()(before)
+
+    def test_gm_source_is_not_loaded(self):
+        specs = [("src", [65536], DataType.FP32), ("idx", [1, 16], DataType.INT32)]
+        before = _make_before(
+            in_specs=specs,
+            out_shape=[1, 16],
+            out_dtype=DataType.FP32,
+            body=lambda ib, ins: ib.let("y", tensor_ops.gather(ins[0], index=ins[1])),
+        )
+
+        def expected_body(ib, ins):
+            idx = ib.let(
+                "gather_idx", tile_ops.load(ins[1], [0, 0], [1, 16], [1, 16], target_memory=MemorySpace.Vec)
+            )
+            return ib.let("y_tile", tile_ops.mgather(ins[0], idx, coalesce="elem"))
+
+        expected = _make_expected(
+            in_specs=specs,
+            out_shape=[1, 16],
+            out_dtype=DataType.FP32,
+            body=expected_body,
+            preload=False,
+        )
+        after = passes.convert_tensor_to_tile_ops()(before)
+        ir.assert_structural_equal(after, expected)
+        ir.assert_structural_equal(parse(str(before)), before)
+
+    @pytest.mark.parametrize("dtype", [DataType.FP16, DataType.FP32, DataType.INT16, DataType.INT32])
+    @pytest.mark.parametrize(
+        "source_mode", ["computed", "alias", "valid", "strided", "strided_alias", "strided_valid"]
+    )
+    def test_computed_source_uses_tile_gather(self, dtype, source_mode):
+        specs = [("src", [4, 32], dtype), ("idx", [1, 16], DataType.INT32)]
+
+        def before_body(ib, ins):
+            local = ib.let("local", tensor_ops.add(ins[0], 1))
+            if source_mode.startswith("strided"):
+                local = ib.let("window", tensor_ops.slice(local, [4, 16], [0, 16]))
+            if source_mode.endswith("alias"):
+                local = ib.let("alias", local)
+            if source_mode.endswith("valid"):
+                local = ib.let(
+                    "valid",
+                    tensor_ops.set_validshape(local, 3, 16 if source_mode.startswith("strided") else 32),
+                )
+            return ib.let("y", tensor_ops.gather(local, index=ins[1]))
+
+        before = _make_before(in_specs=specs, out_shape=[1, 16], out_dtype=dtype, body=before_body)
+
+        def expected_body(ib, ins):
+            src = ib.let("src_tile", tile_ops.load(ins[0], [0, 0], [4, 32]))
+            local = ib.let("local_tile", tile_ops.add(src, 1))
+            shape = [4, 16] if source_mode.startswith("strided") else [4, 32]
+            if source_mode.startswith("strided"):
+                local = ib.let("window_tile", tile_ops.slice(local, shape, [0, 16]))
+            if source_mode.endswith("alias"):
+                local = ib.let("alias", local)
+            if source_mode.endswith("valid"):
+                local = ib.let("valid_tile", tile_ops.set_validshape(local, 3, shape[1]))
+            idx = ib.let(
+                "gather_idx", tile_ops.load(ins[1], [0, 0], [1, 16], [1, 16], target_memory=MemorySpace.Vec)
+            )
+            packed = local
+            if source_mode.startswith("strided"):
+                packed = ib.let(
+                    "gather_src",
+                    tile_ops.adds(local, 0)
+                    if dtype in (DataType.INT16, DataType.INT32)
+                    else tile_ops.extract(local, 0, 0, shape, target_memory=MemorySpace.Vec),
+                )
+            tmp = ib.let("gather_tmp", tile_ops.create([1, 16], DataType.INT32, MemorySpace.Vec))
+            valid_tmp = ib.let("gather_tmp_valid", tile_ops.set_validshape(tmp, 1, 16))
+            result = ib.let("gather_flat", tile_ops.gather(packed, idx, valid_tmp))
+            return ib.let("y_tile", tile_ops.set_validshape(result, 1, 16))
+
+        expected = _make_expected(
+            in_specs=specs,
+            out_shape=[1, 16],
+            out_dtype=dtype,
+            body=expected_body,
+            preload=False,
+        )
+        after = passes.convert_tensor_to_tile_ops()(before)
+        ir.assert_structural_equal(after, expected)
+
+    @pytest.mark.parametrize("dtype", [DataType.FP32, DataType.INT32])
+    def test_unknown_tile_parameter_keeps_packing(self, dtype):
+        specs = [("idx", [1, 16], DataType.INT32)]
+        extras: list[ExtraSpec] = [("src", ir.TileType([4, 32], dtype, memory_space=MemorySpace.Vec))]
+        before = _make_before(
+            in_specs=specs,
+            extra_specs=extras,
+            out_shape=[1, 16],
+            out_dtype=dtype,
+            body=lambda ib, ins, extra: ib.let("y", tensor_ops.gather(extra[0], ins[0])),
+        )
+
+        def expected_body(ib, ins, extra):
+            idx = ib.let(
+                "gather_idx", tile_ops.load(ins[0], [0, 0], [1, 16], [1, 16], target_memory=MemorySpace.Vec)
+            )
+            packed = ib.let(
+                "gather_src",
+                tile_ops.adds(extra[0], 0)
+                if dtype == DataType.INT32
+                else tile_ops.extract(extra[0], 0, 0, [4, 32], target_memory=MemorySpace.Vec),
+            )
+            tmp = ib.let("gather_tmp", tile_ops.create([1, 16], DataType.INT32, MemorySpace.Vec))
+            valid_tmp = ib.let("gather_tmp_valid", tile_ops.set_validshape(tmp, 1, 16))
+            result = ib.let("gather_flat", tile_ops.gather(packed, idx, valid_tmp))
+            return ib.let("y_tile", tile_ops.set_validshape(result, 1, 16))
+
+        expected = _make_expected(
+            in_specs=specs,
+            extra_specs=extras,
+            out_shape=[1, 16],
+            out_dtype=dtype,
+            body=expected_body,
+            preload=False,
+        )
+        ir.assert_structural_equal(passes.convert_tensor_to_tile_ops()(before), expected)
+
+    def test_unaligned_on_chip_rows_rejected(self):
+        specs = [("src", [4, 15], DataType.FP32), ("idx", [1, 16], DataType.INT32)]
+
+        def body(ib, ins):
+            local = ib.let("local", tensor_ops.add(ins[0], 1))
+            return ib.let("y", tensor_ops.gather(local, index=ins[1]))
+
+        before = _make_before(in_specs=specs, out_shape=[1, 16], out_dtype=DataType.FP32, body=body)
+        with pytest.raises(ValueError, match="32-byte aligned"):
+            passes.convert_tensor_to_tile_ops()(before)
+
+
 class TestConvertGatherOp:
     """Test conversion of tensor.gather (MVP: 2D + dim=-1).
 
     UT transforms conftest pins Ascend950 (A5), so the default path is the
-    full-tile flat-index lowering. A separate test switches to Ascend910B to
+    full-tile flat-index lowering. A separate test switches to Ascend910 to
     lock the legacy per-row loop.
     """
 
@@ -5544,7 +5800,7 @@ class TestConvertGatherOp:
     def test_gather_conversion_a2a3_per_row(self):
         """Non-A5 keeps the legacy per-row single-row gather loop."""
         backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
+        backend.set_backend_type(BackendType.Ascend910)
         try:
 
             @pl.program
@@ -6878,13 +7134,12 @@ class TestWindowSliceIncoreConversion:
 
     def test_all_to_all_v_keeps_send_counts_read_only(self):
         """``pld.tensor.all_to_all_v(input, target, signal, send_counts, recv_counts)``
-        lifts ``target`` and ``recv_counts`` to Out and ``signal`` to InOut, while
+        lifts ``target`` to Out and ``recv_counts`` and ``signal`` to InOut, while
         ``input`` and ``send_counts`` stay In.
 
-        ``recv_counts`` is deposited by a peer notify with ``Set``, which
-        overwrites the slot rather than accumulating into it, so like ``target``
-        it is written without being read. Only ``signal`` is both — notify writes
-        it, wait reads it back."""
+        The receiver-owned reset reads old ``recv_counts`` before atomic reset
+        and publication. ``target`` is written without being read; ``signal``
+        is written by notify and read by wait."""
         SIZE = 16
         nr = 2
         total = nr * 2
@@ -6914,7 +7169,7 @@ class TestWindowSliceIncoreConversion:
             "counts": ir.ParamDirection.In,
             "target": ir.ParamDirection.Out,
             "signal": ir.ParamDirection.InOut,
-            "recv_counts": ir.ParamDirection.Out,
+            "recv_counts": ir.ParamDirection.InOut,
         }
         for i, bp in enumerate(before_fn.params):
             want = expected_directions.get(bp.name_hint)
@@ -8094,6 +8349,39 @@ class TestTensorCastConversion:
         cast_calls = _find_calls_to(_require_function(after, "main_incore_0"), "tile.cast")
         assert len(cast_calls) == 1
         assert "saturation_mode" not in cast_calls[0].kwargs
+
+
+@pytest.mark.parametrize("rows", [1, 3, 63, 64, 65])
+def test_col_sum_binary_uses_half_row_scratch(rows):
+    scratch_rows = (rows + 1) // 2
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            x: pl.Tensor[[rows, 32], pl.FP32],
+            out: pl.Out[pl.Tensor[[1, 32], pl.FP32]],
+        ) -> pl.Tensor[[1, 32], pl.FP32]:
+            r = pl.col_sum(x, is_binary=True)
+            out[0:1, 0:32] = r
+            return out
+
+    @pl.program
+    class Expected:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            x: pl.Tensor[[rows, 32], pl.FP32],
+            out: pl.Out[pl.Tensor[[1, 32], pl.FP32]],
+        ) -> pl.Tensor[[1, 32], pl.FP32]:
+            xt = pl.load(x, [0, 0], [rows, 32])
+            tmp = pl.tile.create([scratch_rows, 32], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+            r = pl.tile.col_sum(xt, tmp)
+            stored = pl.store(r, [0, 0], out)
+            return stored
+
+    _assert_convert_equal(Before, Expected)
 
 
 if __name__ == "__main__":

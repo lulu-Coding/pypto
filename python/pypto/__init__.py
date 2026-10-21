@@ -13,7 +13,7 @@ PyPTO - Python Tensor Operations Library
 This package provides Python bindings for the PyPTO C++ library.
 """
 
-from typing import cast
+from pypto._cache_config import CacheConfig, CacheStats, cache_stats, configure_cache
 
 # Import IR module (includes operations and core IR types)
 from . import compile_profiling, ir, language, runtime
@@ -39,29 +39,34 @@ from .pypto_core import (
 )
 
 # Convenient dtype constants
-DT_BOOL: DataType = cast(DataType, DataType.BOOL)
-DT_INT4: DataType = cast(DataType, DataType.INT4)
-DT_INT8: DataType = cast(DataType, DataType.INT8)
-DT_INT16: DataType = cast(DataType, DataType.INT16)
-DT_INT32: DataType = cast(DataType, DataType.INT32)
-DT_INT64: DataType = cast(DataType, DataType.INT64)
-DT_UINT4: DataType = cast(DataType, DataType.UINT4)
-DT_UINT8: DataType = cast(DataType, DataType.UINT8)
-DT_UINT16: DataType = cast(DataType, DataType.UINT16)
-DT_UINT32: DataType = cast(DataType, DataType.UINT32)
-DT_UINT64: DataType = cast(DataType, DataType.UINT64)
-DT_FP4: DataType = cast(DataType, DataType.FP4)
-DT_FP8E4M3FN: DataType = cast(DataType, DataType.FP8E4M3FN)
-DT_FP8E5M2: DataType = cast(DataType, DataType.FP8E5M2)
-DT_FP8E8M0: DataType = cast(DataType, DataType.FP8E8M0)
-DT_FP16: DataType = cast(DataType, DataType.FP16)
-DT_FP32: DataType = cast(DataType, DataType.FP32)
-DT_BF16: DataType = cast(DataType, DataType.BF16)
-DT_HF4: DataType = cast(DataType, DataType.HF4)
-DT_HF8: DataType = cast(DataType, DataType.HF8)
-DT_INDEX: DataType = cast(DataType, DataType.INDEX)
+DT_BOOL: DataType = DataType.BOOL
+DT_INT4: DataType = DataType.INT4
+DT_INT8: DataType = DataType.INT8
+DT_INT16: DataType = DataType.INT16
+DT_INT32: DataType = DataType.INT32
+DT_INT64: DataType = DataType.INT64
+DT_UINT4: DataType = DataType.UINT4
+DT_UINT8: DataType = DataType.UINT8
+DT_UINT16: DataType = DataType.UINT16
+DT_UINT32: DataType = DataType.UINT32
+DT_UINT64: DataType = DataType.UINT64
+DT_FP4: DataType = DataType.FP4
+DT_FP4E2M1X2: DataType = DataType.FP4E2M1X2
+DT_FP8E4M3FN: DataType = DataType.FP8E4M3FN
+DT_FP8E5M2: DataType = DataType.FP8E5M2
+DT_FP8E8M0: DataType = DataType.FP8E8M0
+DT_FP16: DataType = DataType.FP16
+DT_FP32: DataType = DataType.FP32
+DT_BF16: DataType = DataType.BF16
+DT_HF4: DataType = DataType.HF4
+DT_HF8: DataType = DataType.HF8
+DT_INDEX: DataType = DataType.INDEX
 
 __all__ = [
+    "CacheConfig",
+    "CacheStats",
+    "cache_stats",
+    "configure_cache",
     # Modules
     "codegen",
     "ir",
@@ -100,6 +105,7 @@ __all__ = [
     "DT_UINT32",
     "DT_UINT64",
     "DT_FP4",
+    "DT_FP4E2M1X2",
     "DT_FP8E4M3FN",
     "DT_FP8E5M2",
     "DT_FP8E8M0",

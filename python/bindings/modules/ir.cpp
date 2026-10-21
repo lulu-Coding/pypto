@@ -53,6 +53,7 @@
 #include "pypto/ir/transforms/printer.h"
 #include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/deep_clone_utils.h"
+#include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/parent_stmt_analysis.h"
 #include "pypto/ir/transforms/utils/tensor_view_semantics.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
@@ -296,7 +297,8 @@ std::vector<std::pair<std::string, std::any>> ConvertKwargsDict(const nb::dict& 
   return kwargs;
 }
 
-std::vector<std::pair<std::string, std::any>> ConvertAttrsFromPython(const nb::object& attrs_or_none) {
+std::vector<std::pair<std::string, std::any>> ConvertAttrsFromPython(const nb::object& attrs_or_none,
+                                                                     bool wrap_core_num) {
   std::vector<std::pair<std::string, std::any>> attrs;
   if (attrs_or_none.is_none()) {
     // no-op
@@ -319,7 +321,7 @@ std::vector<std::pair<std::string, std::any>> ConvertAttrsFromPython(const nb::o
   // Load-bearing for the dispatch Call attrs the outliner now emits, as well as
   // a legacy Function-level spec.
   for (auto& [key, value] : attrs) {
-    if (key == "core_num" && value.type() == typeid(int)) {
+    if (wrap_core_num && key == "core_num" && value.type() == typeid(int)) {
       auto n = std::any_cast<int>(value);
       value = std::static_pointer_cast<const Expr>(
           std::make_shared<const ConstInt>(n, DataType::INDEX, Span::unknown()));
@@ -401,6 +403,11 @@ void BindIR(nb::module_& m) {
   unknown_type_class.def_static(
       "get", []() { return GetUnknownType(); }, "Get the singleton UnknownType instance");
   BindFields<UnknownType>(unknown_type_class);
+
+  auto void_type_class = nb::class_<VoidType, Type>(ir, "VoidType", "Known absence of an SSA result");
+  void_type_class.def(nb::init<>(), "Create a void type");
+  void_type_class.def_static("get", &GetVoidType, "Get the singleton VoidType instance");
+  BindFields<VoidType>(void_type_class);
 
   // ScalarType - const shared_ptr
   auto scalar_type_class = nb::class_<ScalarType, Type>(ir, "ScalarType", "Scalar type representation");
@@ -505,7 +512,7 @@ void BindIR(nb::module_& m) {
   tvs.def("build_logical_strides_from_layout", &tensor_view_semantics::BuildLogicalStridesFromLayout,
           nb::arg("shape"), nb::arg("layout"),
           "Build packed canonical strides for (shape, layout). "
-          "NZ is row-major over its blocked rank-(r+2) shape, the same rule as ND. "
+          "NZ is row-major over its blocked rank-5 shape, the same rule as ND. "
           "Raises ValueError on DN with rank < 2.");
 
   tvs.def(
@@ -587,6 +594,11 @@ void BindIR(nb::module_& m) {
       nb::arg("window_buffer"),
       "Create a distributed tensor type produced by pld.window; window_buffer is the back-"
       "reference to the source WindowBuffer allocation.");
+  dist_tensor_type_class.def(nb::init<std::vector<ExprPtr>, DataType, std::optional<MemRefPtr>,
+                                      std::optional<TensorView>, std::optional<WindowBufferPtr>>(),
+                             nb::arg("shape"), nb::arg("dtype"), nb::arg("memref").none(),
+                             nb::arg("tensor_view").none(), nb::arg("window_buffer").none(),
+                             "Create a distributed tensor type preserving all optional metadata.");
   BindFields<DistributedTensorType>(dist_tensor_type_class);
 
   // TileType - const shared_ptr
@@ -744,6 +756,26 @@ void BindIR(nb::module_& m) {
       .value("null", CompactMode::null, "Ordinary non-compact layout")
       .value("normal", CompactMode::normal, "Compact valid-region layout");
 
+  // Final device buffer descriptors carry no MemRef or runtime expressions.
+  auto buffer_type_class = nb::class_<BufferType, Type>(
+      ir, "BufferType", "Physical descriptor for a mutable on-chip buffer handle");
+  buffer_type_class.def(
+      nb::init<std::vector<int64_t>, DataType, MemorySpace, std::vector<int64_t>, TileLayout, TileLayout,
+               uint64_t, PadValue, CompactMode>(),
+      nb::arg("shape"), nb::arg("dtype"), nb::arg("memory_space"),
+      nb::arg("valid_shape") = std::vector<int64_t>{}, nb::arg("blayout") = TileLayout::row_major,
+      nb::arg("slayout") = TileLayout::none_box, nb::arg("fractal") = 512, nb::arg("pad") = PadValue::null,
+      nb::arg("compact") = CompactMode::null,
+      "Create a static physical descriptor; -1 in valid_shape denotes a runtime valid extent");
+  BindFields<BufferType>(buffer_type_class);
+
+  auto multi_buffer_type_class = nb::class_<MultiBufferType, Type>(
+      ir, "MultiBufferType", "Descriptor for an explicit multi-slot buffer allocation");
+  multi_buffer_type_class.def(nb::init<BufferTypePtr, int64_t>(), nb::arg("element_type"),
+                              nb::arg("slot_count"),
+                              "Create a multi-buffer descriptor with positive slot count");
+  BindFields<MultiBufferType>(multi_buffer_type_class);
+
   // TileView - immutable struct for tile view information.
   //
   // Fields are read-only from Python so that hash and equality remain stable
@@ -812,6 +844,43 @@ void BindIR(nb::module_& m) {
   comm_layout_mod.attr("COMM_CTX_SIZE") = pypto::codegen::distributed::comm_layout::kCommCtxSize;
 
   // OpRegistry
+  nb::enum_<OpIRStage>(ir, "OpIRStage", "Representation consumed and produced by an operator")
+      .value("Functional", OpIRStage::Functional)
+      .value("Buffer", OpIRStage::Buffer);
+  nb::enum_<BufferAccess>(ir, "BufferAccess", "Access to buffer data or descriptor metadata")
+      .value("None_", BufferAccess::None)
+      .value("Read", BufferAccess::Read)
+      .value("Write", BufferAccess::Write)
+      .value("ReadWrite", BufferAccess::ReadWrite);
+  nb::enum_<BufferResultBehavior>(ir, "BufferResultBehavior", "Storage ownership of an actual SSA result")
+      .value("None_", BufferResultBehavior::None)
+      .value("Allocate", BufferResultBehavior::Allocate)
+      .value("Alias", BufferResultBehavior::Alias)
+      .value("Borrow", BufferResultBehavior::Borrow)
+      .value("Value", BufferResultBehavior::Value);
+  nb::class_<BufferArgEffect>(ir, "BufferArgEffect", "Explicit data and metadata effects of one operand")
+      .def_ro("data", &BufferArgEffect::data)
+      .def_ro("metadata", &BufferArgEffect::metadata)
+      .def_ro("non_memory", &BufferArgEffect::non_memory);
+  nb::class_<BufferResultSpec>(ir, "BufferResultSpec", "Ownership and alias source of one SSA result")
+      .def_ro("behavior", &BufferResultSpec::behavior)
+      .def_ro("alias_arg", &BufferResultSpec::alias_arg);
+  ir.def(
+      "get_op_ir_stage",
+      [](const std::string& op_name) { return OpRegistry::GetInstance().GetEntry(op_name).GetIRStage(); },
+      nb::arg("op_name"), "Get the operator's explicitly declared IR stage");
+  ir.def(
+      "get_op_buffer_arg_effect",
+      [](const std::string& op_name, size_t arg_index) {
+        return OpRegistry::GetInstance().GetEntry(op_name).GetBufferArgEffect(arg_index);
+      },
+      nb::arg("op_name"), nb::arg("arg_index"), "Get explicit data and metadata effects of a buffer operand");
+  ir.def(
+      "get_op_buffer_result_spec",
+      [](const std::string& op_name, size_t result_index) {
+        return OpRegistry::GetInstance().GetEntry(op_name).GetBufferResultSpec(result_index);
+      },
+      nb::arg("op_name"), nb::arg("result_index") = 0, "Get ownership and alias source of one buffer result");
   ir.def(
       "create_op_call",
       [](const std::string& op_name, const std::vector<ExprPtr>& args, const Span& span) {
@@ -839,7 +908,8 @@ void BindIR(nb::module_& m) {
   // re-checks the invariants the printer stamps before calling in, so the
   // guard `internal_only` provides is enforced at the user-facing surface
   // rather than dropped. `create_op_call` still routes through
-  // `CreateUserFacing` and is unaffected.
+  // `CreateUserFacing` and is unaffected. Buffer lowering additionally supplies
+  // an explicit result descriptor for allocation and view operators.
   ir.def(
       "_create_internal_op_call",
       [](const std::string& op_name, const std::vector<ExprPtr>& args, const nb::dict& kwargs_dict,
@@ -849,6 +919,16 @@ void BindIR(nb::module_& m) {
       },
       nb::arg("op_name"), nb::arg("args"), nb::arg("kwargs"), nb::arg("span"),
       "Create a Call expression for a compiler-internal operator (round-trip parser only)");
+
+  ir.def(
+      "_create_internal_op_call",
+      [](const std::string& op_name, const std::vector<ExprPtr>& args, const nb::dict& kwargs_dict,
+         const TypePtr& result_type, const Span& span) {
+        auto kwargs = ConvertKwargsDict(kwargs_dict);
+        return OpRegistry::GetInstance().CreateInternal(op_name, args, kwargs, result_type, span);
+      },
+      nb::arg("op_name"), nb::arg("args"), nb::arg("kwargs"), nb::arg("type"), nb::arg("span"),
+      "Create an internal Buffer call with a validated explicit result descriptor");
 
   ir.def(
       "set_call_attrs",
@@ -877,7 +957,7 @@ void BindIR(nb::module_& m) {
   ir.def(
       "get_op_output_arity",
       [](const std::string& op_name) { return OpRegistry::GetInstance().GetEntry(op_name).GetOutputArity(); },
-      nb::arg("op_name"), "Number of values an operator produces (>1 means a TupleType result)");
+      nb::arg("op_name"), "Number of SSA results (0 means VoidType, >1 means TupleType)");
 
   ir.def(
       "op_arg_is_workspace",
@@ -1031,7 +1111,7 @@ void BindIR(nb::module_& m) {
       .def(
           "__init__",
           [](MemRef* self, const VarPtr& base, int64_t byte_offset, uint64_t size, const Span& span,
-             bool is_pinned, uint64_t slots, const ExprPtr& slot) {
+             bool is_pinned, uint64_t slots, const std::optional<ExprPtr>& slot) {
             CheckSlotCount(slots);
             new (self) MemRef(base, byte_offset, size, span, is_pinned, slots, slot);
           },
@@ -1043,7 +1123,7 @@ void BindIR(nb::module_& m) {
       .def(
           "__init__",
           [](MemRef* self, const VarPtr& base, const ExprPtr& byte_offset, uint64_t size, const Span& span,
-             uint64_t slots, const ExprPtr& slot) {
+             uint64_t slots, const std::optional<ExprPtr>& slot) {
             CheckSlotCount(slots);
             new (self) MemRef(base, byte_offset, size, span, /*is_pinned=*/false, slots, slot);
           },
@@ -1212,7 +1292,9 @@ void BindIR(nb::module_& m) {
       [](Call* self, const OpPtr& op, const std::vector<ExprPtr>& args, const nb::dict& kwargs_dict,
          const nb::object& attrs_or_none, const TypePtr& type, const Span& span) {
         auto kwargs = ConvertKwargsDict(kwargs_dict);
-        auto attrs = ConvertAttrsFromPython(attrs_or_none);
+        // Builtin kernel metadata stores core_num as an integer, whereas
+        // outlined user dispatches store the SPMD launch expression.
+        auto attrs = ConvertAttrsFromPython(attrs_or_none, !op || op->name_.rfind("builtin.", 0) != 0);
         new (self) Call(op, args, std::move(kwargs), std::move(attrs), type, span);
       },
       nb::arg("op"), nb::arg("args"), nb::arg("kwargs"), nb::arg("attrs").none(), nb::arg("type"),
@@ -1450,54 +1532,58 @@ void BindIR(nb::module_& m) {
 
 #undef BIND_UNARY_EXPR
 
-  // Bind structural hash and equality functions
-  // structural_hash overloads share the same auto-mapping semantics:
-  //   enable_auto_mapping=True  -> variable names are ignored (x+1 and y+1 hash the same)
-  //   enable_auto_mapping=False -> variable identity is preserved deterministically
-  ir.def("structural_hash", static_cast<uint64_t (*)(const IRNodePtr&, bool)>(&structural_hash),
-         nb::arg("node"), nb::arg("enable_auto_mapping") = false,
-         "Compute deterministic structural hash of an IR node (ignores Span). "
-         "If enable_auto_mapping=True, variable names are ignored (e.g., x+1 and y+1 hash the same). "
-         "If enable_auto_mapping=False (default), different variable objects produce different hashes.");
-  ir.def("structural_hash", static_cast<uint64_t (*)(const TypePtr&, bool)>(&structural_hash),
-         nb::arg("type"), nb::arg("enable_auto_mapping") = false,
-         "Compute deterministic structural hash of a type. "
-         "enable_auto_mapping only affects variables embedded in the type (e.g., shape expressions).");
+  static nb::exception<StructuralComparisonUnsupported> unsupported(ir, "StructuralComparisonUnsupported",
+                                                                    PyExc_TypeError);
+  nb::register_exception_translator([](const std::exception_ptr& error, void*) {
+    try {
+      if (error) std::rethrow_exception(error);
+    } catch (const StructuralComparisonUnsupported& e) {
+      nb::object instance = nb::borrow<nb::object>(unsupported.ptr())(e.what());
+      instance.attr("reason") = nb::str(e.reason().c_str());
+      instance.attr("field_path") = nb::str(e.field_path().c_str());
+      PyErr_SetObject(unsupported.ptr(), instance.ptr());
+    }
+  });
 
-  ir.def("structural_equal",
-         static_cast<bool (*)(const IRNodePtr&, const IRNodePtr&, bool)>(&structural_equal), nb::arg("lhs"),
-         nb::arg("rhs"), nb::arg("enable_auto_mapping") = false,
-         "Check if two IR nodes are structurally equal. "
-         "Ignores source location (Span). Returns True if IR nodes have identical structure. "
-         "If enable_auto_mapping=True, automatically map variables (e.g., x+1 equals y+1). "
-         "If enable_auto_mapping=False (default), variable objects must be exactly the same (not just same "
-         "name).");
-  ir.def("structural_equal", static_cast<bool (*)(const TypePtr&, const TypePtr&, bool)>(&structural_equal),
-         nb::arg("lhs"), nb::arg("rhs"), nb::arg("enable_auto_mapping") = false,
-         "Check if two types are structurally equal. "
-         "Ignores source location (Span). Returns True if types have identical structure. "
-         "If enable_auto_mapping=True, automatically map variables (e.g., x+1 equals y+1). "
-         "If enable_auto_mapping=False (default), variable objects must be exactly the same (not just same "
-         "name).");
+  auto bind_comparison = [&](auto pointer) {
+    using Ptr = decltype(pointer);
+    ir.def(
+        "structural_hash",
+        [](const Ptr& node, bool auto_mapping) { return structural_hash(node, auto_mapping); },
+        nb::arg("node"), nb::arg("enable_auto_mapping") = false,
+        "Hash IR structure with the same variable policy as structural_equal. "
+        "Definitions are alpha-renamed; free variables preserve identity unless auto-mapping is enabled. "
+        "Compares exact dtype and float bits, including attached storage.");
+    ir.def(
+        "structural_equal",
+        [](const Ptr& lhs, const Ptr& rhs, bool auto_mapping) {
+          return structural_equal(lhs, rhs, auto_mapping);
+        },
+        nb::arg("lhs"), nb::arg("rhs"), nb::arg("enable_auto_mapping") = false,
+        "Compare IR structure, ignoring source locations and bound names. "
+        "Free variables preserve identity unless auto-mapping is enabled. "
+        "Compares exact dtype, float bits, operator kind and semantic fields.");
+    ir.def(
+        "assert_structural_equal",
+        [](const Ptr& lhs, const Ptr& rhs, bool auto_mapping) {
+          assert_structural_equal(lhs, rhs, auto_mapping);
+        },
+        nb::arg("lhs"), nb::arg("rhs"), nb::arg("enable_auto_mapping") = false,
+        "Assert structural equality under the same policy as structural_equal. "
+        "Raises ValueError with a mismatch path, or StructuralComparisonUnsupported.");
+  };
+  bind_comparison(IRNodePtr{});
+  bind_comparison(TypePtr{});
+  // Preserve the original Type overload's keyword spelling as well as node=.
+  ir.def(
+      "structural_hash",
+      [](const TypePtr& type, bool auto_mapping) { return structural_hash(type, auto_mapping); },
+      nb::arg("type"), nb::arg("enable_auto_mapping") = false);
 
-  ir.def("assert_structural_equal",
-         static_cast<void (*)(const IRNodePtr&, const IRNodePtr&, bool)>(&assert_structural_equal),
-         nb::arg("lhs"), nb::arg("rhs"), nb::arg("enable_auto_mapping") = false,
-         "Assert two IR nodes are structurally equal. "
-         "Raises ValueError with detailed error message showing the first mismatch location if they differ. "
-         "Ignores source location (Span). "
-         "If enable_auto_mapping=True, automatically map variables (e.g., x+1 equals y+1). "
-         "If enable_auto_mapping=False (default), variable objects must be exactly the same (not just same "
-         "name).");
-  ir.def("assert_structural_equal",
-         static_cast<void (*)(const TypePtr&, const TypePtr&, bool)>(&assert_structural_equal),
-         nb::arg("lhs"), nb::arg("rhs"), nb::arg("enable_auto_mapping") = false,
-         "Assert two types are structurally equal. "
-         "Raises ValueError with detailed error message showing the first mismatch location if they differ. "
-         "Ignores source location (Span). "
-         "If enable_auto_mapping=True, automatically map variables (e.g., x+1 equals y+1). "
-         "If enable_auto_mapping=False (default), variable objects must be exactly the same (not just same "
-         "name).");
+  ir.def("_without_type_memref", &CloneTypeWithoutMemRef, nb::arg("type"),
+         "Remove binding-owned allocation annotations for explicit value-type compatibility checks.");
+  ir.def("verify_structural_bindings", &verify_structural_bindings, nb::arg("node"),
+         "Verify binding visibility and unique definitions; comparison itself does not validate IR.");
 
   // Serialization functions
   ir.def(
@@ -1887,6 +1973,10 @@ void BindIR(nb::module_& m) {
                         nb::arg("language"), nb::arg("span"), "Create an inline statement");
   BindFields<InlineStmt>(inline_stmt_class);
 
+  nb::enum_<FunctionIRStage>(ir, "FunctionIRStage", "Function body representation")
+      .value("Functional", FunctionIRStage::Functional, "Tensor/Tile value semantics (default)")
+      .value("Buffer", FunctionIRStage::Buffer, "Explicit storage handles and destination writes");
+
   // FunctionType enum
   nb::enum_<FunctionType>(ir, "FunctionType", "Function type classification")
       .value("Opaque", FunctionType::Opaque, "Unspecified function type (default)")
@@ -1972,7 +2062,7 @@ void BindIR(nb::module_& m) {
       [](Function* self, const std::string& name, const nb::list& params,
          const std::vector<TypePtr>& return_types, const StmtPtr& body, const Span& span, FunctionType type,
          std::optional<Level> level, std::optional<Role> role, const nb::object& attrs_or_none,
-         bool requires_runtime_binding) {
+         bool requires_runtime_binding, FunctionIRStage ir_stage) {
         std::vector<VarPtr> param_vars;
         std::vector<ParamDirection> param_dirs;
         param_vars.reserve(nb::len(params));
@@ -1993,12 +2083,12 @@ void BindIR(nb::module_& m) {
         }
         auto attrs = ConvertAttrsFromPython(attrs_or_none);
         new (self) Function(name, std::move(param_vars), std::move(param_dirs), return_types, body, span,
-                            type, level, role, std::move(attrs), requires_runtime_binding);
+                            type, level, role, std::move(attrs), requires_runtime_binding, ir_stage);
       },
       nb::arg("name"), nb::arg("params"), nb::arg("return_types"), nb::arg("body"), nb::arg("span"),
       nb::arg("type") = FunctionType::Opaque, nb::arg("level") = nb::none(), nb::arg("role") = nb::none(),
       nb::arg("attrs") = nb::none(), nb::arg("requires_runtime_binding") = false,
-      "Create a function definition");
+      nb::arg("ir_stage") = FunctionIRStage::Functional, "Create a function definition");
   BindFields<Function>(function_class);
   // Use the shared attr converter so Function readback covers every value type
   // accepted by ConvertKwargsDict, including enum, list, Var, and Expr attrs.

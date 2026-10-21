@@ -8,11 +8,12 @@ The policy is a *contract the author states*, never a hint the compiler infers.
 It is therefore written explicitly, at one of two granularities, and is carried
 unchanged from the DSL to codegen.
 
-> **Current status**: PTOAS has no L2-bypass path yet
-> ([PTOAS#1356](https://github.com/hw-native-sys/PTOAS/issues/1356)), so a
-> `BYPASS` declaration currently **warns and compiles as an ordinary cached
-> access**. Generated code is byte-identical with and without it. See
-> [Current status](#current-status).
+> **Requires PTOAS >= v0.64** (`PTOAS_VERSION` in `toolchain/versions.env`), and
+> **has an effect on a2a3 only**. A `BYPASS` declaration becomes a
+> `cache_policy` attribute on `pto.tload` plus an `offset` operand carrying that
+> device's no-cache alias distance, which the assembler adds to that one load's
+> source address. See [What codegen emits](#what-codegen-emits) and
+> [Architectures](#architectures).
 
 ## Two surfaces
 
@@ -143,13 +144,13 @@ pl.set_cache_policy(b, BYPASS)                 statement, consumed at parse
   -> ScopeStmt.attrs_["cache_policy_vars"]     parse .. pass 9   (Var identity)
   -> Function attr "cache_policy"              pass 9 .. pass 11 (param INDICES)
   -> tile.load kwarg "cache"                   pass 11 .. codegen
-  -> codegen: warn, emit an ordinary cached access
+  -> codegen: `cache_policy` attribute on each emitted `pto.tload`
 ```
 
 | Hop | Carrier | Payload type | Written by | Consumed by |
 | --- | ------- | ------------ | ---------- | ----------- |
 | 1 | `ScopeStmt.attrs_[kAttrCachePolicyVars]` | `vector<pair<VarPtr, int>>` | DSL parser | [`OutlineIncoreScopes`](../passes/09-outline_incore_scopes.md) (pass 9) |
-| 2 | `Function.attrs_[kAttrCachePolicyParams]` | `vector<pair<int32_t, int>>`, sorted by index | pass 9 | [`ConvertTensorToTileOps`](../passes/11-convert_tensor_to_tile_ops.md) (pass 11) |
+| 2 | `Function.attrs_[kAttrCachePolicyParams]` | `vector<pair<int32_t, int>>`, sorted by index | pass 9 | [`ConvertTensorToTileOps`](../passes/12-convert_tensor_to_tile_ops.md) (pass 11) |
 | 3 | `tile.load` kwarg `cache` | `int` (`ir::CachePolicy`) | pass 11 | PTO codegen |
 
 Design notes that keep the chain honest:
@@ -157,16 +158,16 @@ Design notes that keep the chain honest:
 - **Not a field on `TensorView`.** A plain kernel parameter has no
   `tensor_view_` at all, so stamping a policy there would force one into
   existence — dragging in the strict `TensorViewCanonical` verifier, and
-  [`MaterializeTensorStrides`](../passes/33-materialize_tensor_strides.md)
+  [`MaterializeTensorStrides`](../passes/34-materialize_tensor_strides.md)
   rebuilds the view through a positional constructor that would silently drop
   the field.
 - **Param indices are valid only across passes 8..10.** Only
   `OutlineClusterScopes` sits between them, and it does not mutate an outlined
   InCore param list. Downstream passes *do*:
-  [`InjectGMPipeBuffer`](../passes/25-inject_gm_pipe_buffer.md) and
-  [`MaterializeDistTensorCtx`](../passes/47-materialize_dist_tensor_ctx.md)
+  [`InjectGMPipeBuffer`](../passes/26-inject_gm_pipe_buffer.md) and
+  [`MaterializeDistTensorCtx`](../passes/49-materialize_dist_tensor_ctx.md)
   append, and
-  [`MaterializeValidShapeSymbols`](../passes/52-materialize_valid_shape_symbols.md)
+  [`MaterializeValidShapeSymbols`](../passes/54-materialize_valid_shape_symbols.md)
   *prepends*. That is why pass 11 erases the attr after converting it.
 - **The kwarg is an `int`, not the enum.** It follows `tile.store`'s `atomic`
   kwarg, so the serializer, deserializer, `structural_hash` and
@@ -195,24 +196,105 @@ with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm"):
 | Otherwise-empty scope | A scope holding only a declaration prints the marker instead of `pass` |
 | Function attr (`cache_policy`) | Prints as a list of `(index, policy)` tuples, so a pass dump taken between pass 9 and pass 11 — the only window where it exists — re-parses |
 
-## Current status
+## What codegen emits
 
-PTOAS has no L2-bypass path yet
-([PTOAS#1356](https://github.com/hw-native-sys/PTOAS/issues/1356)). Codegen
-therefore carries the request all the way down, then compiles it as an ordinary
-cached access and warns once per tensor per kernel (not once per emitted load —
-an unrolled loop emits the same load many times):
+A `BYPASS` read becomes one attribute on the emitted load and one operand — the
+distance from the tensor's address to the uncached alias of the same bytes:
 
-```text
-[warning] [CacheBypassUnsupported] tensor 'b' requests CachePolicy.BYPASS, but PTOAS
-has no L2-bypass path yet (https://github.com/hw-native-sys/PTOAS/issues/1356);
-compiling as an ordinary cached access at <file>:<line>
+```mlir
+func.func @main(%arg0: !pto.ptr<f32>, %arg1: !pto.ptr<f32>,
+                %__pypto_l2_cache_offset: i64) {
+  ...
+  pto.tload ins(%b__ssa_v0_pview : !pto.partition_tensor_view<256x256xf32>)
+            outs(%b__ssa_v0_mat  : !pto.tile_buf<loc=mat, ...>)
+            {cache_policy = #pto.load_cache_policy<l2_bypass>}
+            offset = %__pypto_l2_cache_offset : i64
 ```
 
-The generated MLIR is **byte-identical** with and without the declaration.
-Writing it today is what makes a kernel pick the bypass up for free when the
-PTOAS side lands: at that point the warn site is replaced in place by a
-bypass-rooted tensor view, and nothing upstream of codegen changes.
+The attribute alone declares the policy and moves no address: PTOAS applies the
+offset only to a load that also declared `l2_bypass`, and a declaration without
+one compiles to an ordinary cached load. Both together are what bypasses L2 —
+which is why the offset, not the attribute, is what makes the feature real, and
+why [only a2a3 has one](#architectures).
+
+### Where the offset comes from
+
+A2/A3 maps every GM page twice — once cached, once not — and a load issued
+against the uncached alias does not allocate in L2. The distance between the two
+mappings is a per-device value only the driver knows (`rtGetL2CacheOffset`), so
+it cannot be a constant in the compiler: one box answers `0x80000000000` where a
+pto-isa comment names `0x100000000000`.
+
+simpler queries it once per Worker and carries it to every core's
+`GlobalContext`, where an incore kernel reads it with
+`get_l2_cache_offset(args)` (simpler PR #2323). The generated kernel wrapper
+reads it **once at entry** — the value cannot change during a dispatch, so a
+per-load read would go back through GM for a constant — and forwards it through
+the synthetic `%__pypto_l2_cache_offset` parameter:
+
+```cpp
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
+    // ... tensor unpacking ...
+    uint64_t __pypto_l2_cache_offset = get_l2_cache_offset(args);
+    main(a__ssa_v0, b__ssa_v0, out__ssa_v0, __pypto_l2_cache_offset);
+}
+```
+
+PTOAS >= v0.64 turns the pair into address arithmetic on a *copy* of the source
+descriptor, so other loads of the same tensor keep the cached address, and then
+issues an ordinary `TLOAD`:
+
+```diff
+-  TLOAD(v45, v50);
++  __gm__ uint8_t* v51 = reinterpret_cast<__gm__ uint8_t*>(PTOAS__GLOBAL_TENSOR_DATA(v50));
++  __gm__ float* v52 = (__gm__ float*) (v51 + v5);
++  GlobalTensor<float, ...> v53(nullptr);
++  v53 = v50;
++  TASSIGN(v53, v52);
++  TLOAD(v45, v53);
+```
+
+Zero is a valid answer, not a failure: an a2a3 device that exposes no alias
+reports zero, `addr + 0` is the ordinary address, and the declaration costs
+bandwidth rather than correctness. The simulator is that case by construction.
+That is a *device* answering zero — distinct from an architecture that has no
+alias at all, which never gets an offset operand to begin with.
+
+Five properties of the emit are worth stating, because each one is asserted in
+`tests/ut/codegen/test_cache_policy_codegen.py` (the argument order, in
+`tests/ut/codegen/test_prefetch_codegen.py`):
+
+| Property | Why |
+| -------- | --- |
+| `CachePolicy.DEFAULT` emits **nothing** | A kernel that states no policy keeps the PTO form it had before this existed, so the attribute, the operand and the parameter are the only difference between two otherwise identical kernels |
+| The attribute is emitted **per load**, not per tensor | It is a property of the instruction; a hint on only the first of two loads would leave the second one allocating in L2 (the superseded `[CacheBypassUnsupported]` diagnostic was deliberately once-per-tensor — the opposite granularity) |
+| The offset parameter is appended **once per kernel** | One runtime value serves every bypassing load, read once at entry |
+| It joins the MX `layout` in **one** attribute dict, after it, and the operand follows the dict | PTOAS takes all present attributes in a single dict; keeping `layout` first leaves an MX load that declares no policy byte-identical |
+| a5 emits the attribute and **no** offset | There is no second mapping to address (see [Architectures](#architectures)), and no accessor to read a distance from |
+
+### Architectures
+
+The double mapping is an a2a3 property, and so is everything built on it:
+
+| Target | What a `BYPASS` declaration does today |
+| ------ | -------------------------------------- |
+| a2a3 device | The load is issued against the uncached alias, `addr + get_l2_cache_offset(args)`. This is the case the feature exists for |
+| a2a3 device with no alias | The driver reports `0`, `addr + 0` is the ordinary address, and the read is cached — correct, one optimisation short. The simulator is this case by construction |
+| a5 | Codegen emits the attribute and no offset, and PTOAS v0.64 lowers a bare attribute to an ordinary `TLOAD`. The declaration is accepted and **does nothing** |
+
+A5 is not a missing offset waiting to be supplied: it has no second mapping to
+address. pto-isa carries an L2 hint on A5's `TLOAD` as an instruction operand
+instead, which is where a future A5 path would go — it is not wired to
+`cache_policy` in v0.64, so nothing in the emitted CCE distinguishes a declared
+load from an undeclared one there.
+
+### Older assemblers
+
+The emit itself is unconditional — `offset` is a v0.64 addition, and an older
+assembler would fail it at the `pto.tload` verifier. That never happens in
+practice: before the first `.pto` is assembled, codegen runs `ptoas --version`
+and rejects any assembler older than the `PTOAS_VERSION` this repo pins, with
+an error that names both versions.
 
 ### Limits
 
@@ -235,10 +317,13 @@ bypass-rooted tensor view, and nothing upstream of codegen changes.
 | Lowering | `src/ir/transforms/convert_tensor_to_tile_ops_pass.cpp` |
 | Printer | `src/ir/transforms/python_printer.cpp` (`PrintScopeCachePolicyStmts`) |
 | Codegen | `src/backend/common/pto_ops_memory.cpp` (`MakeTileLoadCodegenPTO`) |
+| Synthetic param | `src/codegen/pto/pto_codegen.cpp` (`MemRefCollectorVisitor::UsesL2BypassLoad`, signature emission) |
+| Kernel wrapper | `python/pypto/backend/pto_backend.py` (`_uses_l2_cache_offset`, `_generate_kernel_wrapper`) |
+| Runtime accessor | `runtime/src/a2a3/runtime/*/common/intrinsic.h` (`get_l2_cache_offset`), `runtime/docs/l2-cache-bypass.md` |
 
 ## See Also
 
 - [Statements and Control Flow](01-statements.md) — scope forms and the other
   parse-time markers (`pl.dump_tag`, `pl.static_assert`).
 - [OutlineIncoreScopes](../passes/09-outline_incore_scopes.md) — hop 1 → hop 2.
-- [ConvertTensorToTileOps](../passes/11-convert_tensor_to_tile_ops.md) — hop 2 → hop 3.
+- [ConvertTensorToTileOps](../passes/12-convert_tensor_to_tile_ops.md) — hop 2 → hop 3.
