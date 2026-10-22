@@ -34,11 +34,17 @@ would be followed by either (a) converting the weight to flat NZ offline or
 
 Run:
 
+    # device_wall benchmark
     python examples/advanced/10c_group_matmul_i8_flat_nz_2d.py -p a5 -d 0 --rounds 20
+
+    # same measurement as the autot (swimlane level 4, one DFX run, no benchmark)
+    python examples/advanced/10c_group_matmul_i8_flat_nz_2d.py -p a5 -d 0 --profile
+    python examples/utils/swimlane_summary.py <printed record path>
 """
 
 import argparse
 import time
+from pathlib import Path
 
 import pypto.language as pl
 import torch
@@ -159,12 +165,29 @@ def main() -> None:
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--rounds", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=3)
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="single DFX run (swimlane level 4 + PMU) instead of benchmark; use with swimlane_summary.py",
+    )
+    parser.add_argument("--artifacts-dir", default="build_output/gmm_flat_nz_2d_profile")
     args = parser.parse_args()
 
     if args.platform == "a5sim":
         print("warning: 256x256 INT32 accumulators fill L0C; older a5sim executors may crash")
 
-    cfg = RunConfig(platform=args.platform, device_id=args.device)
+    if args.profile:
+        cfg = RunConfig(
+            platform=args.platform,
+            device_id=args.device,
+            enable_chip_swimlane=4,
+            enable_pmu=2,
+            enable_dep_gen=True,
+            save_kernels=True,
+            save_kernels_dir=args.artifacts_dir,
+        )
+    else:
+        cfg = RunConfig(platform=args.platform, device_id=args.device)
 
     torch.manual_seed(0)
     print("generating inputs ...")
@@ -189,6 +212,25 @@ def main() -> None:
         diff = (out - expected).abs()
         raise SystemExit(f"FAIL: max abs diff {diff.max().item()}, mismatches {int((diff != 0).sum())}")
     print("OK  bit-exact")
+
+    if args.profile:
+        roots = [Path(args.artifacts_dir)]
+        output_dir = getattr(compiled, "output_dir", None)
+        if output_dir:
+            roots.append(Path(output_dir))
+        records = []
+        for root in roots:
+            if root.exists():
+                records.extend(root.rglob("chip_swimlane_records.json"))
+        print("profile artifacts:")
+        for record in sorted(set(records)):
+            print(f"  {record}")
+        if records:
+            print("\nsummarize the AICore span with:")
+            print(f"  python examples/utils/swimlane_summary.py {sorted(set(records))[0]}")
+        else:
+            print(f"no chip_swimlane_records.json under {[str(root) for root in roots]}")
+        return
 
     print(f"benchmark: {args.warmup} warmup + {args.rounds} measured launches ...")
     stats = benchmark(compiled, [x, w_nz, out], rounds=args.rounds, warmup=args.warmup, config=cfg)
