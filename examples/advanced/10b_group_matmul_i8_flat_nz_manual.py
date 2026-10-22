@@ -88,8 +88,12 @@ def _gemm_strip(
     out: pl.InOut[pl.Tensor[[M, N], pl.INT32]],
 ):
     """One [TILE_M, N] strip: seed chunk + flat 28-chunk L0 pipeline."""
-    row = pl.tile.get_block_idx() * TILE_M
-    wbase = (row // GROUP_M) * K
+    # Keep both offsets as plain products of the block index. The NZ offset
+    # prover tracks non-negativity through get_block_idx and products, but not
+    # through the equivalent ``(row // GROUP_M) * K`` floor-division chain.
+    block = pl.tile.get_block_idx()
+    row = block * TILE_M
+    wbase = block * K
 
     for n_i in pl.range(N_TILES):
         n0 = n_i * TILE_N
