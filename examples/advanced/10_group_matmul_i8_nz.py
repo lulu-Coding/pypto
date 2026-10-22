@@ -24,8 +24,11 @@ bytes.
 
 Kernel layout. One SPMD block per group (32 groups = 32 AIC on this device):
 
-    - K is explicitly split into seven 512-deep panels; the head panel seeds the
-      accumulator and the remaining six run under ``pl.pipeline(stage=2)``.
+    - K is split into 256-deep panels; the head panel seeds the accumulator and
+      the rest run under ``pl.pipeline(stage=2)``. The default PYPTO planner ran
+      the original 512-deep panel at 362.69us; the 256-deep panel is the first
+      variant that leaves DSA_RP / PTOAS enough L1 room to place their
+      double-buffered plan. (The AscendC reference uses stepK=4, i.e. 512.)
     - N is split into twelve 256-wide blocks; each block is one [1, 256, 256]
       INT32 accumulator, which is the AscendC arch35 base block.
     - L0 tiling inside each panel is left to AutoTileMatmulL0. This is required
@@ -45,6 +48,9 @@ Run on A5:
 
     # pipe-utilization PMU + swimlane profiling (skips the benchmark)
     SIMPLER_DFX=1 python examples/advanced/10_group_matmul_i8_nz.py -p a5 -d 0 --profile --planner ptoas
+
+    # recorded reference: PYPTO planner, L1_K=512 -> 362.69us / 497.4 TFLOPS
+    # this file currently uses L1_K=256 so DSA_RP/PTOAS can place their plan.
 
 The [256, 256] INT32 output block fills L0C exactly, so the legacy PYPTO planner
 runs it with a single accumulator. The DSA_RP / PTOAS planners let AutoTile
@@ -73,9 +79,9 @@ K, N = 3584, 3072
 M = GROUP_M * GROUP
 
 N_TILE = 256                             # AscendC baseN
-L1_K = 512                               # AscendC stepK = 4, L0 chunk 128
+L1_K = 256                               # half of AscendC stepK=4; fits DSA_RP/PTOAS L1
 N_TILES = N // N_TILE                    # 12 N blocks per group
-N_PANELS = K // L1_K                     # 7 K panels
+N_PANELS = K // L1_K                     # 14 K panels
 
 NZ_C0 = 32                               # 256 bits / INT8 = 32 elements
 
