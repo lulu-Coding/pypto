@@ -35,14 +35,21 @@ Kernel layout. One SPMD block per group (32 groups = 32 AIC on this device):
 
 Run on A5:
 
-    # device latency + bit-exact check
+    # device latency + bit-exact check (default PYPTO planner)
     python examples/advanced/10_group_matmul_i8_nz.py -p a5 -d 0 --rounds 20
 
-    # pipe-utilization PMU + swimlane profiling (skips the benchmark)
-    SIMPLER_DFX=1 python examples/advanced/10_group_matmul_i8_nz.py -p a5 -d 0 --profile
+    # same kernel under the newer planners: DSA_RP / PTOAS auto-enable AutoTile
+    # dbC=2 (L0C double buffering) and slot-based pipelines
+    python examples/advanced/10_group_matmul_i8_nz.py -p a5 -d 0 --rounds 20 --planner dsa_rp
+    python examples/advanced/10_group_matmul_i8_nz.py -p a5 -d 0 --rounds 20 --planner ptoas
 
-The [256, 256] INT32 output block fills L0C exactly. Older a5sim executors may
-crash on this tiling; use the real device.
+    # pipe-utilization PMU + swimlane profiling (skips the benchmark)
+    SIMPLER_DFX=1 python examples/advanced/10_group_matmul_i8_nz.py -p a5 -d 0 --profile --planner ptoas
+
+The [256, 256] INT32 output block fills L0C exactly, so the legacy PYPTO planner
+runs it with a single accumulator. The DSA_RP / PTOAS planners let AutoTile
+choose dbC=2 and overlap the L0C drain with the next block, which is the main
+thing the default-planner profile shows as serialized.
 """
 
 import argparse
@@ -53,6 +60,7 @@ from pathlib import Path
 import pypto.language as pl
 import torch
 
+from pypto.pypto_core.passes import MemoryPlanner
 from pypto.runtime import RunConfig, benchmark
 
 # ---------------------------------------------------------------------------
@@ -245,23 +253,38 @@ def main() -> None:
         help="collect PMU (pipe utilization) + swimlane and skip the benchmark",
     )
     parser.add_argument("--artifacts-dir", default="build_output/gmm_nz_profile")
+    parser.add_argument(
+        "--planner",
+        choices=["pypto", "dsa_rp", "ptoas"],
+        default="pypto",
+        help="on-chip memory planner; dsa_rp/ptoas enable AutoTile L0C double buffering",
+    )
     args = parser.parse_args()
 
     if args.platform == "a5sim":
         print("warning: 256x256 INT32 output blocks fill L0C; older a5sim executors crash on this tiling")
 
+    planners = {
+        "pypto": MemoryPlanner.PYPTO,
+        "dsa_rp": MemoryPlanner.DSA_RP,
+        "ptoas": MemoryPlanner.PTOAS,
+    }
+    planner = planners[args.planner]
+    artifacts_dir = f"{args.artifacts_dir}_{args.planner}"
+
     if args.profile:
         cfg = RunConfig(
             platform=args.platform,
             device_id=args.device,
+            memory_planner=planner,
             enable_chip_swimlane=4,
             enable_pmu=2,
             enable_dep_gen=True,
             save_kernels=True,
-            save_kernels_dir=args.artifacts_dir,
+            save_kernels_dir=artifacts_dir,
         )
     else:
-        cfg = RunConfig(platform=args.platform, device_id=args.device)
+        cfg = RunConfig(platform=args.platform, device_id=args.device, memory_planner=planner)
 
     torch.manual_seed(0)
     print("generating inputs ...")
@@ -272,7 +295,7 @@ def main() -> None:
 
     print(
         f"compiling: {GROUP} groups x {N_TILES} N blocks, "
-        f"K panel {L1_K}, per-group NZ weight ..."
+        f"K panel {L1_K}, per-group NZ weight, planner={args.planner} ..."
     )
     t0 = time.perf_counter()
     compiled = group_matmul_i8_nz.compile(x, w_nz, out, config=cfg)
@@ -288,7 +311,7 @@ def main() -> None:
     print("OK  bit-exact")
 
     if args.profile:
-        _print_profile_artifacts(compiled, args.artifacts_dir)
+        _print_profile_artifacts(compiled, artifacts_dir)
         print(
             "\nprofile run complete. Send the PMU summary and perf_hints.log above "
             "(plus any compile buffer-limit warnings)."
