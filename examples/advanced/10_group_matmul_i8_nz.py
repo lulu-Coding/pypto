@@ -35,14 +35,20 @@ Kernel layout. One SPMD block per group (32 groups = 32 AIC on this device):
 
 Run on A5:
 
+    # device latency + bit-exact check
     python examples/advanced/10_group_matmul_i8_nz.py -p a5 -d 0 --rounds 20
+
+    # pipe-utilization PMU + swimlane profiling (skips the benchmark)
+    SIMPLER_DFX=1 python examples/advanced/10_group_matmul_i8_nz.py -p a5 -d 0 --profile
 
 The [256, 256] INT32 output block fills L0C exactly. Older a5sim executors may
 crash on this tiling; use the real device.
 """
 
 import argparse
+import csv
 import time
+from pathlib import Path
 
 import pypto.language as pl
 import torch
@@ -151,18 +157,111 @@ def grouped_matmul_ref(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _as_float(value: str | None) -> float | None:
+    """Parse a PMU field as a number, accepting decimal or 0x-prefixed values."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        try:
+            return float(int(value, 0))
+        except ValueError:
+            return None
+
+
+def _print_pmu_summary(path: Path) -> None:
+    """Print per-column mean/max for a PMU CSV so it can be pasted back."""
+    try:
+        with path.open(newline="") as handle:
+            reader = csv.DictReader(handle)
+            rows = list(reader)
+    except OSError as exc:
+        print(f"  could not read {path}: {exc}")
+        return
+
+    fields = reader.fieldnames or []
+    print(f"  rows={len(rows)} columns={fields}")
+    for field in fields:
+        values = [v for v in (_as_float(row.get(field, "")) for row in rows) if v is not None]
+        if values:
+            mean = sum(values) / len(values)
+            print(f"    {field}: mean={mean:.3f} max={max(values):.3f}")
+
+
+def _print_profile_artifacts(compiled: object, artifacts_dir: str) -> None:
+    """Locate and print the small DFX artefacts produced by a profile run."""
+    roots = [Path(artifacts_dir)]
+    output_dir = getattr(compiled, "output_dir", None)
+    if output_dir:
+        roots.append(Path(output_dir))
+    seen: set[Path] = set()
+
+    for root in roots:
+        if not root.exists():
+            continue
+        root = root.resolve()
+        if root in seen:
+            continue
+        seen.add(root)
+
+        files = [path for path in sorted(root.rglob("*")) if path.is_file()]
+        if not files:
+            continue
+
+        interesting = [
+            path
+            for path in files
+            if path.name in {"pmu.csv", "perf_hints.log", "chip_swimlane_records.json", "deps.json"}
+            or path.name.startswith("merged_swimlane_")
+        ]
+        print(f"\nprofile artifacts under {root} ({len(files)} files):")
+        if not interesting:
+            print("  no pmu.csv / perf_hints.log / swimlane files found")
+        for path in interesting:
+            print(f"  {path.relative_to(root)}  ({path.stat().st_size} bytes)")
+            if path.name == "pmu.csv":
+                _print_pmu_summary(path)
+            elif path.name == "perf_hints.log":
+                text = path.read_text(errors="replace").splitlines()
+                print("  perf_hints.log:")
+                for line in text[:120]:
+                    print(f"    {line}")
+                if len(text) > 120:
+                    print(f"    ... {len(text) - 120} more lines")
+            elif path.name.startswith("merged_swimlane_"):
+                print("  (merged swimlane trace; keep this path for a converter run)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Per-group NZ INT8 grouped matmul (A5)")
     parser.add_argument("-p", "--platform", default="a5", choices=["a5", "a5sim", "a2a3", "a2a3sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--rounds", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=3)
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="collect PMU (pipe utilization) + swimlane and skip the benchmark",
+    )
+    parser.add_argument("--artifacts-dir", default="build_output/gmm_nz_profile")
     args = parser.parse_args()
 
     if args.platform == "a5sim":
         print("warning: 256x256 INT32 output blocks fill L0C; older a5sim executors crash on this tiling")
 
-    cfg = RunConfig(platform=args.platform, device_id=args.device)
+    if args.profile:
+        cfg = RunConfig(
+            platform=args.platform,
+            device_id=args.device,
+            enable_chip_swimlane=4,
+            enable_pmu=2,
+            enable_dep_gen=True,
+            save_kernels=True,
+            save_kernels_dir=args.artifacts_dir,
+        )
+    else:
+        cfg = RunConfig(platform=args.platform, device_id=args.device)
 
     torch.manual_seed(0)
     print("generating inputs ...")
@@ -187,6 +286,14 @@ def main() -> None:
         diff = (out - expected).abs()
         raise SystemExit(f"FAIL: max abs diff {diff.max().item()}, mismatches {int((diff != 0).sum())}")
     print("OK  bit-exact")
+
+    if args.profile:
+        _print_profile_artifacts(compiled, args.artifacts_dir)
+        print(
+            "\nprofile run complete. Send the PMU summary and perf_hints.log above "
+            "(plus any compile buffer-limit warnings)."
+        )
+        return
 
     print(f"benchmark: {args.warmup} warmup + {args.rounds} measured launches ...")
     stats = benchmark(
