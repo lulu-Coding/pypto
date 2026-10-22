@@ -1958,6 +1958,7 @@ def matmul_acc(
     rhs: Expr,
     span: Span | None = None,
     *,
+    acc_phase: AccPhase = AccPhase.Unspecified,
     init_cond: Expr | None = None,
 ) -> Call:
     """Matrix multiplication with accumulation.
@@ -1977,6 +1978,11 @@ def matmul_acc(
         lhs: Left-hand side tile (TileType)
         rhs: Right-hand side tile (TileType)
         span: Optional source span for debugging (auto-captured if not provided)
+        acc_phase: Producer-side unit-flag phase. ``Partial`` marks an
+            accumulation that does not complete the L0C tile; ``Final`` marks
+            the last accumulation, makes the tile ready, and sets the unit flag.
+            A Final producer must be consumed by a store with ``st_phase=Final``
+            in the same straight-line region.
         init_cond: Optional BOOL scalar predicate selecting overwrite over accumulate
 
     Returns:
@@ -1984,7 +1990,10 @@ def matmul_acc(
     """
     actual_span = _get_span_or_capture(span)
     args = [acc, lhs, rhs] if init_cond is None else [acc, lhs, rhs, init_cond]
-    return _ir_core.create_op_call("tile.matmul_acc", args, {}, actual_span)
+    # Keep the default IR shape kwarg-free so existing printers/round-trips do
+    # not grow an explicit ``acc_phase=Unspecified``.
+    kwargs = {} if acc_phase == AccPhase.Unspecified else {"acc_phase": int(acc_phase)}
+    return _ir_core.create_op_call("tile.matmul_acc", args, kwargs, actual_span)
 
 
 def matmul_bias(lhs: Expr, rhs: Expr, bias: Expr, span: Span | None = None) -> Call:

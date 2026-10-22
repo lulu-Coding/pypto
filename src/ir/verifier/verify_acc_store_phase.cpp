@@ -13,8 +13,9 @@
  * @file verify_acc_store_phase.cpp
  * @brief Verify the final accumulator-producer / final-store unit-flag protocol.
  *
- * On A2/A3, ``acc_phase=pl.AccPhase.Final`` lowers to a producer-side
- * check-and-set. The matching ``st_phase=pl.STPhase.Final`` store performs the
+ * On the unit-flag-capable A2/A3 and A5 cube paths, ``acc_phase=pl.AccPhase.Final``
+ * lowers to a producer-side check-and-set. The matching
+ * ``st_phase=pl.STPhase.Final`` store performs the
  * consumer-side check-and-clear. Omitting either side is not a benign metadata
  * mismatch: the device can wait forever on an unset flag, or leave a set flag
  * behind and stall a later accumulator producer.
@@ -76,7 +77,8 @@ struct FinalProducer {
 };
 
 bool IsPhasedAccumulatorProducer(const CallPtr& call) {
-  return IsOp(call, "tile.gemv") || IsOp(call, "tile.gemv_acc") || IsOp(call, "tile.gemv_bias");
+  return IsOp(call, "tile.matmul_acc") || IsOp(call, "tile.gemv") || IsOp(call, "tile.gemv_acc") ||
+         IsOp(call, "tile.gemv_bias");
 }
 
 bool IsFinalAccumulatorProducer(const CallPtr& call) {
@@ -268,8 +270,9 @@ class AccStorePhaseVisitor : public IRVisitor {
         diagnostics_.emplace_back(
             DiagnosticSeverity::Error, "AccStorePhaseValid", /*error_code=*/1,
             "tile.store(..., st_phase=pl.STPhase.Final) in function '" + func_name_ +
-                "' must consume the exact SSA value produced by tile.gemv, tile.gemv_acc, or "
-                "tile.gemv_bias with acc_phase=pl.AccPhase.Final in the same straight-line region. A final "
+                "' must consume the exact SSA value produced by tile.matmul_acc, tile.gemv, "
+                "tile.gemv_acc, or tile.gemv_bias with acc_phase=pl.AccPhase.Final in the same "
+                "straight-line region. A final "
                 "store "
                 "without a matching producer waits on a unit flag that was never set and can stall device "
                 "execution.",

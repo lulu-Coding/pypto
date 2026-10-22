@@ -576,6 +576,40 @@ def test_pto_codegen_gemv_family_uses_exact_ops_and_single_row_mat_layout():
     assert acc_in.group(1) == acc_out.group(1), acc_line
 
 
+def test_pto_codegen_matmul_acc_phase_emits_unit_flag_attrs():
+    """Matmul accumulations carry accPhase, and the final store carries stPhase."""
+
+    @pl.program
+    class MatmulAccPhaseProgram:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            a: pl.Tensor[[16, 128], pl.FP16],
+            b: pl.Tensor[[128, 16], pl.FP16],
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            a_mat = pl.load(a, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
+            b_mat = pl.load(b, [0, 0], [128, 16], target_memory=pl.MemorySpace.Mat)
+            lhs = pl.tile.extract(a_mat, 0, 0, [16, 128], target_memory=pl.MemorySpace.Left)
+            rhs = pl.tile.extract(b_mat, 0, 0, [128, 16], target_memory=pl.MemorySpace.Right)
+            acc = pl.tile.matmul(lhs, rhs)
+            acc = pl.tile.matmul_acc(acc, lhs, rhs, acc_phase=pl.AccPhase.Partial)
+            acc = pl.tile.matmul_acc(acc, lhs, rhs, acc_phase=pl.AccPhase.Final)
+            out = pl.store(acc, [0, 0], out, st_phase=pl.STPhase.Final)
+            return out
+
+    mlir_code = _generate_default_mlir(MatmulAccPhaseProgram)
+
+    assert "pto.tmatmul ins(" in mlir_code
+    acc_lines = [line for line in mlir_code.splitlines() if "pto.tmatmul.acc ins(" in line]
+    assert len(acc_lines) == 2, mlir_code
+    assert any("{accPhase = #pto<acc_phase partial>}" in line for line in acc_lines), mlir_code
+    assert any("{accPhase = #pto<acc_phase final>}" in line for line in acc_lines), mlir_code
+
+    tstore_lines = [line for line in mlir_code.splitlines() if "pto.tstore" in line]
+    assert any("{stPhase = #pto<st_phase final>}" in line for line in tstore_lines), mlir_code
+
+
 def test_pto_codegen_fillpad_shared_memref_uses_single_alloc_tile():
     """Test that shared MemRef tiles emit one alloc_tile and preserve merged TileView info."""
     span = ir.Span.unknown()

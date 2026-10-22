@@ -287,10 +287,10 @@ static std::string MakeNaryCodegenPTO(const std::string& pto_op_name, size_t ari
   return "";
 }
 
-static std::string GemvAccPhaseAttr(const CallPtr& op) {
+static std::string AccPhaseAttr(const CallPtr& op) {
   const int acc_phase = op->GetKwarg<int>("acc_phase", static_cast<int>(ir::AccPhase::kUnspecified));
   INTERNAL_CHECK_SPAN(ir::IsValidAccPhase(acc_phase), op->span_)
-      << "GEMV acc_phase must encode AccPhase::kUnspecified, kPartial, or kFinal, got " << acc_phase;
+      << "acc_phase must encode AccPhase::kUnspecified, kPartial, or kFinal, got " << acc_phase;
   if (acc_phase == static_cast<int>(ir::AccPhase::kUnspecified)) return "";
   return " {accPhase = #pto<acc_phase " + ir::AccPhaseToPTOString(static_cast<ir::AccPhase>(acc_phase)) +
          ">}";
@@ -300,7 +300,7 @@ static std::string MakeGemvCodegenPTO(const std::string& pto_op_name, size_t ari
                                       codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
   CheckArity(op, pto_op_name, arity);
-  codegen.Emit(pto_op_name + " " + GenerateInsOutsClause(op, codegen) + GemvAccPhaseAttr(op));
+  codegen.Emit(pto_op_name + " " + GenerateInsOutsClause(op, codegen) + AccPhaseAttr(op));
   return "";
 }
 
@@ -1348,7 +1348,7 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
       std::string dst_type = codegen.GetCurrentResultTileBufTypeString();
       std::string lhs_type = codegen.GetExprTypeAnnotation(op->args_[1]);
       std::string rhs_type = codegen.GetExprTypeAnnotation(op->args_[2]);
-      const std::string acc_phase = GemvAccPhaseAttr(op);
+      const std::string acc_phase = AccPhaseAttr(op);
 
       // ins() carries the accumulator only on the accumulating form; the
       // initializing form reads lhs/rhs alone and writes dst from scratch.

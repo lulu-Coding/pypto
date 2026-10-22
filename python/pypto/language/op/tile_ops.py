@@ -1449,7 +1449,14 @@ def batch_matmul(lhs: Tile, rhs: Tile) -> Tile:
     return Tile(expr=call_expr)
 
 
-def matmul_acc(acc: Tile, lhs: Tile, rhs: Tile, init_cond: BoolLike | None = None) -> Tile:
+def matmul_acc(
+    acc: Tile,
+    lhs: Tile,
+    rhs: Tile,
+    init_cond: BoolLike | None = None,
+    *,
+    acc_phase: AccPhase = AccPhase.Unspecified,
+) -> Tile:
     """Matrix multiplication with accumulation: acc += lhs @ rhs.
 
     ``init_cond`` makes the accumulator's initial value conditional: on the steps
@@ -1464,6 +1471,15 @@ def matmul_acc(acc: Tile, lhs: Tile, rhs: Tile, init_cond: BoolLike | None = Non
 
     A literal ``True`` / ``False`` selects one form at compile time; a runtime
     predicate lowers to a branch over the two, with no phi on the accumulator.
+
+    ``acc_phase`` selects the producer side of the hardware unit-flag protocol.
+    ``pl.AccPhase.Partial`` marks every accumulation that does not finish the
+    output tile; ``pl.AccPhase.Final`` marks the last one, makes the L0C tile
+    ready, and performs the producer-side check-and-set. The matching
+    ``pl.store(..., st_phase=pl.STPhase.Final)`` consumes the flag with a
+    check-and-clear. The producer and store must be in the same straight-line
+    region, so the final K step must be peeled out of a pipeline loop rather
+    than marked Final inside the loop body.
 
     Note:
         When ``acc`` is a window of a larger ``Mem.Acc`` (L0C) tile, slice it
@@ -1482,12 +1498,17 @@ def matmul_acc(acc: Tile, lhs: Tile, rhs: Tile, init_cond: BoolLike | None = Non
         lhs: Left-hand side tile
         rhs: Right-hand side tile
         init_cond: Optional predicate selecting overwrite over accumulate
+        acc_phase: Producer-side unit-flag phase; see above
 
     Returns:
         Tile wrapping the matmul_acc operation
     """
     call_expr = _ir_ops.matmul_acc(
-        acc.unwrap(), lhs.unwrap(), rhs.unwrap(), init_cond=predicate_to_expr(init_cond)
+        acc.unwrap(),
+        lhs.unwrap(),
+        rhs.unwrap(),
+        init_cond=predicate_to_expr(init_cond),
+        acc_phase=acc_phase,
     )
     return Tile(expr=call_expr)
 

@@ -88,6 +88,22 @@ MatmulProductInfo DeduceMatmulProductInfo(const TileTypePtr& lhs_type, const Til
   return MatmulProductInfo{{lhs_shape[0], rhs_shape[1]}, {lhs_valid[0], rhs_valid[1]}, accumulator_dtype};
 }
 
+/// Validate the unit-flag phase shared by matmul and the GEMV variants.
+///
+/// ``Unspecified`` keeps the legacy (software-synchronized) instruction form.
+/// ``Partial`` marks an accumulation that does not complete the L0C tile, and
+/// ``Final`` marks the last accumulation that makes the tile ready and sets the
+/// producer-side unit flag. A Final producer must be paired with a
+/// ``tile.store(..., st_phase=STPhase.Final)`` consumer.
+void ValidateAccPhase(const std::vector<std::pair<std::string, std::any>>& kwargs,
+                      const std::string& op_name) {
+  const int acc_phase = GetKwargOr<int>(kwargs, "acc_phase", static_cast<int>(AccPhase::kUnspecified));
+  CHECK(IsValidAccPhase(acc_phase)) << "The operator " << op_name
+                                    << " requires acc_phase to be AccPhase.Unspecified, AccPhase.Partial, "
+                                       "or AccPhase.Final, but got int "
+                                    << acc_phase;
+}
+
 }  // namespace
 
 TypePtr DeduceTileMatMulType(const std::vector<ExprPtr>& args,
@@ -124,6 +140,7 @@ TypePtr DeduceTileMatMulType(const std::vector<ExprPtr>& args,
 TypePtr DeduceTileMatMulAccType(const std::vector<ExprPtr>& args,
                                 const std::vector<std::pair<std::string, std::any>>& kwargs,
                                 const std::string& op_name) {
+  ValidateAccPhase(kwargs, op_name);
   CHECK(args.size() == 3 || args.size() == 4)
       << "The operator " << op_name << " requires 3 arguments (acc, lhs, rhs) or 4 with the optional "
       << "init_cond predicate, but got " << args.size();
@@ -281,15 +298,6 @@ TypePtr DeduceTileMatMulBiasType(const std::vector<ExprPtr>& args,
 
 namespace {
 
-void ValidateGemvAccPhase(const std::vector<std::pair<std::string, std::any>>& kwargs,
-                          const std::string& op_name) {
-  const int acc_phase = GetKwargOr<int>(kwargs, "acc_phase", static_cast<int>(AccPhase::kUnspecified));
-  CHECK(IsValidAccPhase(acc_phase)) << "The operator " << op_name
-                                    << " requires acc_phase to be AccPhase.Unspecified, AccPhase.Partial, "
-                                       "or AccPhase.Final, but got int "
-                                    << acc_phase;
-}
-
 DataType ValidateGemvInputDtypes(const TileTypePtr& lhs_type, const TileTypePtr& rhs_type,
                                  const std::string& op_name) {
   CHECK(lhs_type->dtype_ == rhs_type->dtype_)
@@ -337,7 +345,7 @@ TileTypePtr BuildGemvResultType(const TypePtr& inferred, const TileTypePtr& lhs_
 TypePtr DeduceTileGemvType(const std::vector<ExprPtr>& args,
                            const std::vector<std::pair<std::string, std::any>>& kwargs,
                            const std::string& op_name) {
-  ValidateGemvAccPhase(kwargs, op_name);
+  ValidateAccPhase(kwargs, op_name);
   TypePtr inferred = DeduceTileMatMulType(args, kwargs, op_name);
   auto lhs_type = As<TileType>(args[0]->GetType());
   auto rhs_type = As<TileType>(args[1]->GetType());
@@ -348,7 +356,7 @@ TypePtr DeduceTileGemvType(const std::vector<ExprPtr>& args,
 TypePtr DeduceTileGemvAccType(const std::vector<ExprPtr>& args,
                               const std::vector<std::pair<std::string, std::any>>& kwargs,
                               const std::string& op_name) {
-  ValidateGemvAccPhase(kwargs, op_name);
+  ValidateAccPhase(kwargs, op_name);
   CHECK(args.size() == 3 || args.size() == 4)
       << "The operator " << op_name << " requires 3 arguments (acc, lhs, rhs) or 4 with the optional "
       << "init_cond predicate, but got " << args.size();
@@ -390,7 +398,7 @@ TypePtr DeduceTileGemvAccType(const std::vector<ExprPtr>& args,
 TypePtr DeduceTileGemvBiasType(const std::vector<ExprPtr>& args,
                                const std::vector<std::pair<std::string, std::any>>& kwargs,
                                const std::string& op_name) {
-  ValidateGemvAccPhase(kwargs, op_name);
+  ValidateAccPhase(kwargs, op_name);
   TypePtr inferred = DeduceTileMatMulBiasType(args, kwargs, op_name);
   auto lhs_type = As<TileType>(args[0]->GetType());
   auto rhs_type = As<TileType>(args[1]->GetType());
@@ -437,6 +445,7 @@ REGISTER_OP("tile.matmul_acc")
     .add_argument("init_cond",
                   "Optional BOOL scalar; where it holds the accumulator is overwritten with "
                   "lhs @ rhs instead of accumulated into (the split-K `k == 0` step)")
+    .set_attr<int>("acc_phase")
     .set_input_memory(0, MemorySpace::Acc)
     .set_input_memory(1, MemorySpace::Left)
     .set_input_memory(2, MemorySpace::Right)

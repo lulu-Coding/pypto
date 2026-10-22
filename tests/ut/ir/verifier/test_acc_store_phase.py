@@ -53,6 +53,29 @@ def _gemv_program(
     return Prog
 
 
+def _matmul_program(
+    *,
+    producer_phase=pl.AccPhase.Final,
+    store_phase=pl.STPhase.Final,
+):
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            a: pl.Tensor[[16, 128], pl.FP16],
+            b: pl.Tensor[[128, 16], pl.FP16],
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+        ):
+            lhs = pl.load(a, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
+            rhs = pl.load(b, [0, 0], [128, 16], target_memory=pl.MemorySpace.Mat)
+            acc = pl.tile.matmul(lhs, rhs)
+            result = pl.tile.matmul_acc(acc, lhs, rhs, acc_phase=producer_phase)
+            out = pl.store(result, [0, 0], out, st_phase=store_phase)
+
+    return Prog
+
+
 def _double_store_program():
     @pl.program
     class Prog:
@@ -199,6 +222,25 @@ def _inline_final_producer_program():
 
 def test_matching_final_gemv_and_store_are_accepted():
     assert _verify(_gemv_program()) == []
+
+
+def test_matching_final_matmul_acc_and_store_are_accepted():
+    assert _verify(_matmul_program()) == []
+
+
+def test_final_matmul_acc_with_plain_store_is_rejected():
+    diagnostics = _verify(_matmul_program(store_phase=pl.STPhase.Unspecified))
+    assert len(diagnostics) == 1
+    assert diagnostics[0].rule_name == "AccStorePhaseValid"
+    assert "st_phase=pl.STPhase.Unspecified" in diagnostics[0].message
+    assert "st_phase=pl.STPhase.Final" in diagnostics[0].message
+
+
+def test_final_store_without_final_matmul_acc_producer_is_rejected():
+    diagnostics = _verify(_matmul_program(producer_phase=pl.AccPhase.Unspecified))
+    assert len(diagnostics) == 1
+    assert diagnostics[0].rule_name == "AccStorePhaseValid"
+    assert "unit flag that was never set" in diagnostics[0].message
 
 
 def test_all_phase_aware_gemv_variants_are_accepted():
