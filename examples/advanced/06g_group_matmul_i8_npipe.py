@@ -16,19 +16,31 @@ n-block's first panel load therefore cannot overlap the current n-block's tail
 L1 tiles so the load for one output block overlaps the drain of the previous.
 
 06g is the minimal way to ask the compiler for it: keep 06's kernel body
-byte-for-byte, but turn the outer n-loop into ``pl.pipeline(..., stage=2)`` so
-the n-transitions pipeline too (now a nest: inner k-pipeline inside an outer
-n-pipeline).
+byte-for-byte, but turn the outer n-loop into ``pl.pipeline(..., stage=2)``
+(now a nest: inner k-pipeline inside an outer n-pipeline).
 
-*** This is the 06c experiment.  06c failed to compile with a TileView parser
-*** error, but that predates the PH-MR-001 pipeline fix (1b41affe), so it is
-*** worth re-testing.  If it fails again, capture the exact parser error.
+*** STATUS: DOES NOT COMPILE (compiler limitation, not a kernel bug). ***
 
-Shape: M = GROUP_M * GROUP = 8192 TOTAL rows (256 per group, NOT per-group 8192).
+A nest of two ``pl.pipeline`` levels MULTIPLIES their buffering, and
+``allocate_memory_addr_pass`` charges every level against the physical space.
+Measured on a5sim:
+
+  L1_K=512, N_STAGE=2  -> Mat  buffer 1048576 > 524288   (2*2*256KB = 1MB)
+  L1_K=256, N_STAGE=2  -> Right buffer 131072 >  65536   (2*2*32KB  = 128KB L0B)
+
+i.e. Mat first, then L0B, both blow up by the SAME product (N_STAGE x inner-k
+buffers).  To fit, N_STAGE * (L1_K/L0_K) must be <= 2 -- which means either the
+n-pipeline or the k-pipeline has to be stage 1, defeating the point.
+
+AscendC does not have this problem because its L1 depth (L1_STAGES) and its L0
+double-buffering (L0A/L0B_STAGES) are chosen independently by the block config,
+not by a single "stage" that cascades.  So this is really a request for PyPTO:
+let the two pipeline levels carry INDEPENDENT buffer counts.
+
+Kept here as a reproducer.  Shape: M = GROUP_M * GROUP = 8192 TOTAL rows.
 
 Run:
     python examples/advanced/06g_group_matmul_i8_npipe.py -p a5sim
-    python examples/advanced/06g_group_matmul_i8_npipe.py            # a5
 """
 
 import argparse
@@ -47,7 +59,7 @@ K, N = 3584, 3072
 M = GROUP_M * GROUP                      # 8192 total rows
 TILE_M, TILE_N = 256, 256               # AscendC arch35 exact: 256x256 fills L0C/L0A/L0B
 L0_K = 128                              # L0 chunk depth: L0B/2/(TILE_N*1B)
-L1_K = 256                              # half 06's panel: nested n*k buffering must fit Mat
+L1_K = 512                              # AscendC arch35: stepK=4, deep MTE2 prefetch
 N_STAGE = 2                             # n-block pipeline depth
 # ===================================================
 
@@ -69,12 +81,14 @@ assert L0_K == (L0B_BYTES // 2) // (TILE_N * 1) & ~15, "L0_K must follow the arc
 assert TILE_M * TILE_N * 4 <= L0C_BYTES, "acc block exceeds A5 L0C (256KB)"
 assert 2 * (TILE_M * L0_K) <= L0A_BYTES, "L0A double-buffer does not fit"
 assert 2 * (L0_K * TILE_N) <= L0B_BYTES, "L0B double-buffer does not fit"
-# A nest of two pipelines multiplies their buffering: the panel held per (n,k)
-# step is duplicated N_STAGE x (inner k stage = 2) times.  At L1_K=512 that is
-# 2*2*256KB = 1MB and the old compiler rejected it ("Mat buffer usage (1048576)
-# exceeds platform limit (524288)"); L1_K=256 brings it to 2*2*128KB = 512KB.
-assert N_STAGE * 2 * (TILE_M * L1_K + L1_K * TILE_N) <= MAT_BYTES, \
-    "nested n/k pipeline buffers exceed L1; lower L1_K or N_STAGE"
+# A nest of two pipelines multiplies their buffering, so a working 06g would
+# require N_STAGE * (L1_K/L0_K) <= 2 AND N_STAGE * (L1_K/L0_K) * L0B_chunk <= L0B.
+# At 06's tiling (L1_K=512, stepK=4, N_STAGE=2) that product is 8 -- unsatisfiable,
+# which is exactly the limitation this file reproduces (see the module docstring).
+# The check is left OFF on purpose: the point is to surface the compiler error.
+# assert N_STAGE * (L1_K // L0_K) * (TILE_M * L0_K) <= L0A_BYTES, "..."
+# assert N_STAGE * (L1_K // L0_K) * (L0_K * TILE_N) <= L0B_BYTES, "..."
+# assert N_STAGE * 2 * (TILE_M * L1_K + L1_K * TILE_N) <= MAT_BYTES, "..."
 assert 127 * 127 * K < 2**31, "INT32 accumulator overflow at this K"
 
 
