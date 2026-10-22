@@ -42,6 +42,7 @@ import time
 import pypto.language as pl
 import torch
 
+from pypto.pypto_core.passes import MemoryPlanner
 from pypto.runtime import RunConfig, benchmark
 
 # ---------------------------------------------------------------------------
@@ -182,12 +183,23 @@ def main() -> None:
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--rounds", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=3)
+    parser.add_argument(
+        "--planner",
+        choices=["pypto", "dsa_rp", "ptoas"],
+        default="pypto",
+        help="on-chip memory planner; the manual L0 tiles are 32 KB so all three fit",
+    )
     args = parser.parse_args()
 
     if args.platform == "a5sim":
         print("warning: 256x256 accumulator fills L0C; older a5sim executors may crash")
 
-    cfg = RunConfig(platform=args.platform, device_id=args.device)
+    planners = {
+        "pypto": MemoryPlanner.PYPTO,
+        "dsa_rp": MemoryPlanner.DSA_RP,
+        "ptoas": MemoryPlanner.PTOAS,
+    }
+    cfg = RunConfig(platform=args.platform, device_id=args.device, memory_planner=planners[args.planner])
 
     torch.manual_seed(0)
     print("generating inputs ...")
@@ -199,7 +211,7 @@ def main() -> None:
 
     print(
         f"compiling: {GROUP} SPMD blocks, flat L0 pipeline stage={FLAT_STAGE}, "
-        f"block {TILE_M}x{TILE_N}x{L0_K}, flat NZ weight ..."
+        f"block {TILE_M}x{TILE_N}x{L0_K}, flat NZ weight, planner={args.planner} ..."
     )
     t0 = time.perf_counter()
     compiled = group_matmul_i8_flat_nz_manual.compile(x, w_nz, out, config=cfg)
