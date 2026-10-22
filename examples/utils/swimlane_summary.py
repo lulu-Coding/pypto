@@ -101,10 +101,24 @@ def summarize(path: Path) -> None:
         print(f"top-level keys: {sorted(data.keys())}")
         return
 
-    aic_rows = [row for row in rows if len(row) >= 5 and _is_aic(int(row[0]), core_types)]
+    aic_rows = [
+        row
+        for row in rows
+        if isinstance(row, (list, tuple)) and len(row) >= 5 and _is_aic(int(row[0]), core_types)
+    ]
     if not aic_rows:
         print("no AIC rows found (only AIV rows?)")
+        if rows:
+            print(f"first raw row: {rows[0]}")
         return
+
+    # The raw record's documented prefix is
+    # [core_id, task_token_raw, reg_task_id, start_cycles, end_cycles], but the
+    # runtime may append extra fields. Print the first row and index the prefix
+    # rather than unpacking a fixed width.
+    print(f"first_aic_row: {aic_rows[0]}")
+    if len(aic_rows[0]) != 5:
+        print(f"note: raw rows carry {len(aic_rows[0])} columns; using the first five")
 
     starts = [row[3] for row in aic_rows]
     ends = [row[4] for row in aic_rows]
@@ -114,8 +128,11 @@ def summarize(path: Path) -> None:
     end_spread_us = (last_end - min(ends)) / clock_hz * 1e6
 
     busy_cycles: dict[int, int] = defaultdict(int)
-    for core_id, _token, _reg_id, start, end in aic_rows:
-        busy_cycles[int(core_id)] += end - start
+    for row in aic_rows:
+        core_id = int(row[0])
+        start = row[3]
+        end = row[4]
+        busy_cycles[core_id] += end - start
     busy_us = sorted(cycles / clock_hz * 1e6 for cycles in busy_cycles.values())
     total_busy_us = sum(busy_us)
     active_cores = len(busy_cycles)
@@ -129,7 +146,6 @@ def summarize(path: Path) -> None:
     )
     print(f"sum_core_busy_us: {total_busy_us:.2f}  active_cores: {active_cores}")
     print(f"core_busy_utilization_pct: {utilization:.1f}")
-    print(f"first_aic_row: {aic_rows[0]}")
 
     print("\nread:")
     print("- makespan is the AICore kernel span.")
