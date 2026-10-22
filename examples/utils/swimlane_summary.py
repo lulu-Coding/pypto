@@ -12,8 +12,9 @@
 This is a post-process helper for the DFX output of a profile run; it does not
 run a kernel. It reads the raw AICore task stream (not the merged Perfetto
 trace) and reports the AICore makespan, per-core busy time, dispatch skew, and
-core utilization. Use it to separate in-kernel idle time from runtime
-orchestration overhead.
+core utilization. If a ``pmu.csv`` sits next to the record, it also prints the
+mean/max of every PMU counter (cube/MTE1/MTE2/MTE3/FIX for event type 2). Use
+it to separate in-kernel idle time from runtime orchestration overhead.
 
 Produce a fresh profile (the workload is executed and checked, but not
 benchmarked):
@@ -40,6 +41,7 @@ the cycle-to-microsecond factor (1e9 on A5), and each ``aicore_tasks`` row is
 """
 
 import argparse
+import csv
 import json
 import statistics
 import sys
@@ -77,6 +79,37 @@ def _select_record(explicit: str | None) -> Path | None:
 
 def _is_aic(core_id: int, core_types: list[str]) -> bool:
     return not core_types or (0 <= core_id < len(core_types) and core_types[core_id] == "aic")
+
+
+def _as_float(value: str | None) -> float | None:
+    """Parse a PMU field as a number, accepting decimal or 0x-prefixed values."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        try:
+            return float(int(value, 0))
+        except ValueError:
+            return None
+
+
+def _print_pmu_summary(path: Path) -> None:
+    """Print per-column mean/max for a PMU CSV emitted next to the swimlane."""
+    try:
+        with path.open(newline="") as handle:
+            reader = csv.DictReader(handle)
+            rows = list(reader)
+    except OSError as exc:
+        print(f"  could not read {path}: {exc}")
+        return
+
+    fields = reader.fieldnames or []
+    print(f"  rows={len(rows)} columns={fields}")
+    for field in fields:
+        values = [v for v in (_as_float(row.get(field, "")) for row in rows) if v is not None]
+        if values:
+            print(f"    {field}: mean={sum(values) / len(values):.3f} max={max(values):.3f}")
 
 
 def summarize(path: Path) -> None:
@@ -153,6 +186,11 @@ def summarize(path: Path) -> None:
     print("  much smaller means the rest is runtime/orchestration overhead.")
     print("- start_spread is dispatch skew; a large spread means blocks started in waves.")
     print("- core_busy_utilization_pct is busy/makespan; use it to size the in-kernel idle.")
+
+    pmu_files = sorted(path.parent.rglob("pmu.csv"))
+    if pmu_files:
+        print(f"\nPMU: {pmu_files[0]}")
+        _print_pmu_summary(pmu_files[0])
 
 
 def main() -> None:
