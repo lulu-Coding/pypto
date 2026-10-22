@@ -47,7 +47,7 @@ K, N = 3584, 3072
 M = GROUP_M * GROUP                      # 8192 total rows
 TILE_M, TILE_N = 256, 256               # AscendC arch35 exact: 256x256 fills L0C/L0A/L0B
 L0_K = 128                              # L0 chunk depth: L0B/2/(TILE_N*1B)
-L1_K = 512                              # AscendC arch35: stepK=4, deep MTE2 prefetch
+L1_K = 256                              # half 06's panel: nested n*k buffering must fit Mat
 N_STAGE = 2                             # n-block pipeline depth
 # ===================================================
 
@@ -69,8 +69,12 @@ assert L0_K == (L0B_BYTES // 2) // (TILE_N * 1) & ~15, "L0_K must follow the arc
 assert TILE_M * TILE_N * 4 <= L0C_BYTES, "acc block exceeds A5 L0C (256KB)"
 assert 2 * (TILE_M * L0_K) <= L0A_BYTES, "L0A double-buffer does not fit"
 assert 2 * (L0_K * TILE_N) <= L0B_BYTES, "L0B double-buffer does not fit"
-assert 2 * (TILE_M * L1_K + L1_K * TILE_N) <= MAT_BYTES, \
-    "Mat panels x pipeline double-buffer exceed L1; lower L1_K"
+# A nest of two pipelines multiplies their buffering: the panel held per (n,k)
+# step is duplicated N_STAGE x (inner k stage = 2) times.  At L1_K=512 that is
+# 2*2*256KB = 1MB and the old compiler rejected it ("Mat buffer usage (1048576)
+# exceeds platform limit (524288)"); L1_K=256 brings it to 2*2*128KB = 512KB.
+assert N_STAGE * 2 * (TILE_M * L1_K + L1_K * TILE_N) <= MAT_BYTES, \
+    "nested n/k pipeline buffers exceed L1; lower L1_K or N_STAGE"
 assert 127 * 127 * K < 2**31, "INT32 accumulator overflow at this K"
 
 

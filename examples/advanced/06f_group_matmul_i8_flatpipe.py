@@ -23,7 +23,10 @@ keep that many chunks in flight -- at the cost of the L1 panel reuse that 06's
 ``L1_K=512`` panel buys (each Mat tile is now exactly one L0 chunk).
 
 Mat budget for the flat loop: stage * (TILE_M*L0_K + L0_K*TILE_N) bytes.
-stage=4 -> 256KB, stage=8 -> 512KB (= whole Mat).
+But the pipeliner multi-buffers the L0 tiles as well, and at TILE_M=TILE_N=256,
+L0_K=128 every chunk is 32KB in L0A and L0B, so L0 caps the stage at 2
+(2*32KB = 64KB = the whole L0A/L0B).  stage=4 on the old compiler died with
+"Right buffer usage (131072) exceeds platform limit (65536)".
 
 Shape: M = GROUP_M * GROUP = 8192 TOTAL rows (256 per group, NOT per-group 8192).
 
@@ -48,7 +51,7 @@ K, N = 3584, 3072
 M = GROUP_M * GROUP                      # 8192 total rows
 TILE_M, TILE_N = 256, 256               # AscendC arch35 exact: 256x256 fills L0C/L0A/L0B
 L0_K = 128                              # L0 chunk depth: L0B/2/(TILE_N*1B)
-FLAT_STAGE = 4                          # chunks kept in flight (Mat budget: 4*64KB)
+FLAT_STAGE = 2                          # chunks in flight; L0 is the binding limit here
 # ===================================================
 
 L0C_BYTES = 256 * 1024
@@ -67,6 +70,10 @@ for _d in (M, K, N, TILE_M, TILE_N, L0_K):
 assert TILE_M * TILE_N * 4 <= L0C_BYTES, "acc block exceeds A5 L0C (256KB)"
 assert 2 * (TILE_M * L0_K) <= L0A_BYTES, "L0A double-buffer does not fit"
 assert 2 * (L0_K * TILE_N) <= L0B_BYTES, "L0B double-buffer does not fit"
+# The flat pipeliner multi-buffers the L0 tiles too, so L0 (not Mat) caps the stage:
+# FLAT_STAGE * TILE_M*L0_K <= L0A and FLAT_STAGE * L0_K*TILE_N <= L0B.
+assert FLAT_STAGE * (TILE_M * L0_K) <= L0A_BYTES, "flat-pipeline L0A budget exceeds L0A; lower FLAT_STAGE"
+assert FLAT_STAGE * (L0_K * TILE_N) <= L0B_BYTES, "flat-pipeline L0B budget exceeds L0B; lower FLAT_STAGE"
 assert FLAT_STAGE * (TILE_M * L0_K + L0_K * TILE_N) <= MAT_BYTES, \
     "flat-pipeline Mat budget exceeds L1; lower FLAT_STAGE"
 assert 127 * 127 * K < 2**31, "INT32 accumulator overflow at this K"
