@@ -14,4 +14,5 @@ Utility examples — parsing, cross-function calls, error handling.
   - cross_function_calls.py — @pl.jit cross-function calls
   - phase_fence_dep_compression.py — manual_scope phase-fence dependency compression example
   - error_handling.py       — SSA violation detection
+  - swimlane_summary.py     — summarize a raw chip_swimlane_records.json
 """

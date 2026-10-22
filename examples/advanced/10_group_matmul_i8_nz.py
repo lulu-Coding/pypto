@@ -46,6 +46,9 @@ Run on A5:
     # pipe-utilization PMU + swimlane profiling (skips the benchmark)
     SIMPLER_DFX=1 python examples/advanced/10_group_matmul_i8_nz.py -p a5 -d 0 --profile --planner pypto
 
+    # after a profile run, summarize the AICore span / idle from the raw records:
+    python examples/utils/swimlane_summary.py
+
     # Planner sweep: set L1_K=128 above first. All three then fit, but measured
     # PYPTO ~317.5us, DSA_RP ~316.1us, PTOAS ~315.1us -- none beats L1_K=256.
 
