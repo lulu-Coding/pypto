@@ -24,11 +24,11 @@ bytes.
 
 Kernel layout. One SPMD block per group (32 groups = 32 AIC on this device):
 
-    - K is split into 256-deep panels; the head panel seeds the accumulator and
-      the rest run under ``pl.pipeline(stage=2)``. The default PYPTO planner ran
-      the original 512-deep panel at 362.69us; the 256-deep panel is the first
-      variant that leaves DSA_RP / PTOAS enough L1 room to place their
-      double-buffered plan. (The AscendC reference uses stepK=4, i.e. 512.)
+    - K is split into 128-deep panels; the head panel seeds the accumulator and
+      the rest run under ``pl.pipeline(stage=2)``. This is the L0A-fit variant:
+      at K=256, DSA_RP/PTOAS try to double-buffer a [256, 256] INT8 A tile
+      (64 KB), which needs 128 KB of the 64 KB L0A and fails. A 128-deep panel
+      caps the L0 A tile at [256, 128] = 32 KB, so two buffers fit.
     - N is split into twelve 256-wide blocks; each block is one [1, 256, 256]
       INT32 accumulator, which is the AscendC arch35 base block.
     - L0 tiling inside each panel is left to AutoTileMatmulL0. This is required
@@ -49,8 +49,9 @@ Run on A5:
     # pipe-utilization PMU + swimlane profiling (skips the benchmark)
     SIMPLER_DFX=1 python examples/advanced/10_group_matmul_i8_nz.py -p a5 -d 0 --profile --planner ptoas
 
-    # recorded reference: PYPTO planner, L1_K=512 -> 362.69us / 497.4 TFLOPS
-    # this file currently uses L1_K=256 so DSA_RP/PTOAS can place their plan.
+    # recorded: PYPTO L1_K=512 -> 362.69us / 497.4 TFLOPS
+    #           PYPTO L1_K=256 -> 312.83us / 576.6 TFLOPS
+    # current L1_K=128 is the L0A-fit variant for DSA_RP/PTOAS.
 
 The [256, 256] INT32 output block fills L0C exactly, so the legacy PYPTO planner
 runs it with a single accumulator. The DSA_RP / PTOAS planners let AutoTile
@@ -79,9 +80,9 @@ K, N = 3584, 3072
 M = GROUP_M * GROUP
 
 N_TILE = 256                             # AscendC baseN
-L1_K = 256                               # half of AscendC stepK=4; fits DSA_RP/PTOAS L1
+L1_K = 128                               # force L0 A tile <= 256x128 so dbL0A=2 fits
 N_TILES = N // N_TILE                    # 12 N blocks per group
-N_PANELS = K // L1_K                     # 14 K panels
+N_PANELS = K // L1_K                     # 28 K panels
 
 NZ_C0 = 32                               # 256 bits / INT8 = 32 elements
 
