@@ -255,6 +255,50 @@ task-submit --device auto --max-time 0 --timeout 0 \
 `chip_swimlane_records.json`、`pmu.csv`、`deps.json`，同时打印用
 `swimlane_summary.py` 查看 makespan 的命令。
 
+## AscendC INT8 参考基准
+
+CANN 9.3 已安装 grouped-matmul 的 aclnn 算子
+（`aclnnGroupedMatmulWeightNz`、`aclnnGroupedMatmulV5`；`libopapi.so` 导出了
+两者），不需要先编译 ops-transformer。`scripts/bench/ascendc_gmm_int8_bench.cpp`
+用与 PyPTO 10k 相同的 shape、dtype 和 per-group NZ 布局调用它：
+
+```text
+x          [8192, 3584] INT8 ND
+weight     [32, 3584, 3072] INT8, per-group NZ [32, 96, 224, 16, 32]
+out        [8192, 3072] INT32
+groupType  0, groupList 累积和, splitItem 3
+```
+
+通过 task-submit 运行 `scripts/bench/run_ascendc_gmm_int8.sh`。每组 NZ 单独转换
+（一次性 352MB TransData 会触发向量核异常），再在 device 内拼成一个 stacked
+tensor；GMM 算子收到长度为 1 的 weight list。
+
+同一 28 核板卡实测：
+
+| 指标 | 数值 |
+| ---- | ---- |
+| AscendC msprof Task Duration | 286.6 / 288.4 / 290.9 us（Block Dim 28，cube） |
+| AscendC ACL event（预热后） | 322.0–323.4 us |
+| PyPTO 10k AICore makespan | 332.8 us |
+| PyPTO 10k PMU cube / MTE2 | 每核 240.6 / 313.9 us |
+| AscendC PMU cube / MTE2 | 每核 243.3 / 269.0 us |
+
+cube 已经打平。剩下的约 15% 在 MTE2：两边都约 97% MTE2 忙碌、每核搬运同样的
+约 25.1MB，但 AscendC 约 89GB/s，PyPTO 约 82GB/s。AscendC 的 fixpipe（111us）
+被 MTE2 覆盖；PyPTO 只有 25us，所以 unit-flag 重叠不是缺失的那一块。
+
+`msprof op` 默认只 profile 第一次 kernel launch。该基准先做 32 次 weight
+TransData 转换、1 次 GMM 预热，然后 5 次测量；跳过 33 次 launch 可抓到预热后的
+GMM kernel：
+
+```bash
+msprof op --output=./msprof_gmm --launch-skip-before-match 33 \
+    --launch-count 1 --warm-up 0 ./ascendc_gmm_int8_bench
+```
+
+项目笔记里的 220us 是 32 核 Ascend950DT_9582 上的 FP8 数据，不是这块板卡的
+INT8 目标。
+
 ## 核数
 
 8 张白名单设备（0–7）都报告 **28 AIC @ 1.65 GHz**。作业提交层可能把任务放到任意

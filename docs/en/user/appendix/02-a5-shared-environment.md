@@ -266,6 +266,53 @@ The example verifies bit-exactness against an FP64 reference, writes
 `build_output/gmm_flat_nz_unitflag_profile/dfx_outputs/`, and prints the
 `swimlane_summary.py` command for the makespan.
 
+## AscendC INT8 reference
+
+CANN 9.3 already installs the grouped-matmul aclnn operator
+(`aclnnGroupedMatmulWeightNz`, `aclnnGroupedMatmulV5`; `libopapi.so` exports
+both), so no ops-transformer build is needed. `scripts/bench/ascendc_gmm_int8_bench.cpp`
+drives it with the same shape, dtype and per-group NZ layout as the PyPTO 10k
+kernel:
+
+```text
+x          [8192, 3584] INT8 ND
+weight     [32, 3584, 3072] INT8, per-group NZ [32, 96, 224, 16, 32]
+out        [8192, 3072] INT32
+groupType  0, groupList cumulative, splitItem 3
+```
+
+Build and run `scripts/bench/run_ascendc_gmm_int8.sh` through `task-submit`.
+The per-group NZ blocks are converted separately (one 352 MB TransData faults)
+and concatenated into one stacked device tensor; the GMM op receives a weight
+list of one.
+
+Measured on the 28-AIC board:
+
+| Metric | Value |
+| ------ | ----- |
+| AscendC msprof Task Duration | 286.6 / 288.4 / 290.9 us (Block Dim 28, cube) |
+| AscendC ACL event around a warmed launch | 322.0–323.4 us |
+| PyPTO 10k AICore makespan | 332.8 us |
+| PyPTO 10k PMU cube / MTE2 | 240.6 / 313.9 us per core |
+| AscendC PMU cube / MTE2 | 243.3 / 269.0 us per core |
+
+Cube is already matched. The remaining ~15% is MTE2: both kernels are ~97%
+MTE2-busy and move the same ~25.1 MB per core, but AscendC sustains ~89 GB/s
+versus PyPTO's ~82 GB/s. AscendC's fixpipe (111 us) is overlapped under MTE2;
+PyPTO's is only 25 us, so unit-flag overlap is not the missing piece.
+
+`msprof op` profiles only the first kernel launch by default. The harness runs
+32 weight TransData conversions, one GMM warm-up, then five measured GMM calls.
+Skip 33 launches to capture a warmed GMM kernel:
+
+```bash
+msprof op --output=./msprof_gmm --launch-skip-before-match 33 \
+    --launch-count 1 --warm-up 0 ./ascendc_gmm_int8_bench
+```
+
+The 220 us FP8 figure in the project notes is a different dtype on a 32-AIC
+Ascend950DT_9582; it is not the INT8 target for this board.
+
 ## Core count
 
 All eight whitelisted devices (0-7) report **28 AIC at 1.65 GHz**. The job
