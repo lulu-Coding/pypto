@@ -15,8 +15,8 @@
  *
  * ``pl.Tensor[[E, N, K], pl.INT8, pl.NZ]`` asserts that the bytes in GM are
  * already in PTO-native NZ fractal order while keeping the *logical* shape and
- * slicing at the DSL level. pto-isa describes such a buffer with a blocked
- * rank-(r+2) GlobalTensor (``pto/common/pto_tile.hpp``):
+ * slicing at the DSL level. pto-isa describes such a buffer with a canonical
+ * rank-5 GlobalTensor (``pto/common/pto_tile.hpp``):
  *
  *     shape   = [E, K/c0, N/16, 16, c0]
  *     strides = [K*N,     N*c0, 16*c0, c0, 1]      (c0 = 256 / dtype bits)
@@ -32,8 +32,9 @@
  *   Phase 2 — every ``tile.load`` reading such a tensor gets its offsets /
  *             shapes / valid_shape rewritten into blocked coordinates, while
  *             its result ``TileType`` is preserved verbatim: the GM partition
- *             becomes rank-(r+2) but the destination tile stays the logical
- *             2-D ``[N_TILE, K_TILE]``.
+ *             becomes rank-5 but the destination tile stays the logical
+ *             2-D ``[N_TILE, K_TILE]``. A rank-2 NZ tensor gets an implicit
+ *             outer axis ``E = 1``, which is what makes its blocked form rank 5.
  *
  * After this pass no logical-shaped NZ TensorType survives, so nothing
  * downstream — including codegen, which derives every rank from
@@ -345,8 +346,8 @@ class BlockNzMutator : public IRMutator {
     if (!args_changed && !type_changed) return op;
 
     // Direct ctor, not OpRegistry::Create: re-deducing ``tile.load``'s type
-    // from the now rank-(r+2) shapes argument would turn the destination tile
-    // into a rank-(r+2) TileType. The GM partition is blocked; the tile is not.
+    // from the now rank-5 shapes argument would turn the destination tile
+    // into a rank-5 TileType. The GM partition is blocked; the tile is not.
     return std::make_shared<Call>(op->op_, std::move(new_args), op->kwargs_, op->attrs_,
                                   std::move(new_return_type), op->span_);
   }

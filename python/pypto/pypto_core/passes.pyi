@@ -518,12 +518,13 @@ def optimize_orch_tensors() -> Pass:
 def block_nz_tensor_views() -> Pass:
     """Create a pass that rewrites logical ``pl.NZ`` tensors into blocked NZ form.
 
-    An NZ ``TensorType`` shape ``[..., R, C]`` becomes ``[..., C/c0, R/16, 16, c0]``,
-    where ``c0`` is the number of elements in a 32-byte C0 line (``256 / dtype
-    bits``) — the blocked rank-(r+2) form pto-isa's ``Layout::NZ`` GlobalTensor
-    requires. Every consuming ``tile.load`` has its offsets / shapes / valid_shape
-    rewritten into blocked coordinates while its logical 2-D destination
-    ``TileType`` is preserved.
+    An NZ ``TensorType`` shape ``[..., R, C]`` becomes the canonical rank-5
+    descriptor ``[E, C/c0, R/16, 16, c0]``, where ``c0`` is the number of
+    elements in a 32-byte C0 line (``256 / dtype bits``) and ``E`` is the
+    logical outer axis — or an implicit ``1`` for a rank-2 tensor. PTOAS
+    rejects the bare rank-4 form. Every consuming ``tile.load`` has its offsets
+    / shapes / valid_shape rewritten into blocked coordinates while its logical
+    2-D destination ``TileType`` is preserved.
 
     Must run after ``convert_tensor_to_tile_ops`` and **after**
     ``flatten_tile_nd_to_2d`` — it requires ``TileOps2D``, because blocking a

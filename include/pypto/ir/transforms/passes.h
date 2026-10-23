@@ -528,12 +528,14 @@ Pass OptimizeOrchTensors();
  *
  * A ``pl.Tensor[[..., R, C], dtype, pl.NZ]`` annotation asserts that the GM
  * bytes are already in PTO-native NZ fractal order while the DSL keeps the
- * logical shape and slicing. pto-isa describes such a buffer with a blocked
- * rank-(r+2) GlobalTensor, so this pass rewrites:
+ * logical shape and slicing. pto-isa and PTOAS require a canonical rank-5
+ * GlobalTensor, so this pass rewrites:
  *
- *   - every NZ ``TensorType`` shape to ``[..., C/c0, R/16, 16, c0]``, where
- *     ``c0`` is the number of elements in a 32-byte C0 line (``256 / bits``);
- *     strides stay empty for ``MaterializeTensorStrides``, whose plain
+ *   - every NZ ``TensorType`` shape to ``[E, C/c0, R/16, 16, c0]``, where
+ *     ``c0`` is the number of elements in a 32-byte C0 line (``256 / bits``).
+ *     A rank-3 logical shape supplies ``E``; a rank-2 one gets an implicit
+ *     ``E = 1`` so the result is still rank 5 (PTOAS rejects rank 4).
+ *     Strides stay empty for ``MaterializeTensorStrides``, whose plain
  *     row-major rule already yields pto-isa's NZ strides once blocked;
  *   - every consuming ``tile.load``'s offsets / shapes / valid_shape into
  *     blocked coordinates, preserving the logical 2-D destination ``TileType``.

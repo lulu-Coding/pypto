@@ -22,15 +22,21 @@ describes an NZ buffer as (`pto/common/pto_tile.hpp`, `TileShape2D` /
 `BaseShape2D` specialisations for `Layout::NZ`):
 
 ```text
-shape   = [..., C/c0, R/16, 16, c0]
-strides = [..., C*R,  R*c0, 16*c0, c0, 1]
+shape   = [E, C/c0, R/16, 16, c0]
+strides = [C*R, R*c0, 16*c0, c0, 1]
 ```
 
 Reading the shape from the inside out: `c0` contiguous elements form one 32-byte
 C0 line, 16 rows form one `16 x c0` fractal (512 bytes), `R/16` fractals walk
-down the row axis, and the **outermost** dim steps between column blocks. That
-is "column blocks outside, row fractals inside" — the same byte order the tile
-side expresses as `blayout=col_major, slayout=row_major, fractal=512`.
+down the row axis, `C/c0` steps between column blocks, and `E` steps between
+outer batches. That is "column blocks outside, row fractals inside" — the same
+byte order the tile side expresses as `blayout=col_major, slayout=row_major,
+fractal=512`.
+
+The descriptor is **rank 5, always**. A rank-3 logical tensor `[E, R, C]`
+supplies `E` directly; a rank-2 `[R, C]` tensor has no outer axis, so the pass
+inserts an implicit `E = 1`. PTOAS rejects an NZ view of any other rank,
+including the bare rank-4 `[C/c0, R/16, 16, c0]`.
 
 ### Why NZ needs no stride rule of its own
 
@@ -50,7 +56,7 @@ and `BuildLogicalStridesFromLayout` handles it through the same
 stride later; this pass only rewrites the shape.
 
 This amends RFC #1300's claim that NZ has "no logical-stride representation" —
-true of a logical 2-D shape, false of the blocked rank-(r+2) one.
+true of a logical 2-D shape, false of the blocked rank-5 descriptor.
 
 ## Position in the pipeline
 
@@ -83,6 +89,11 @@ w: pl.Tensor[[32, 2048, 4096], pl.INT8, pl.NZ]
 
 # after  (c0 = 32:  4096/32 = 128,  2048/16 = 128)
 w: pl.Tensor[[32, 128, 128, 16, 32], pl.INT8, pl.NZ]
+
+# a rank-2 weight gets the implicit outer axis
+w: pl.Tensor[[256, 512], pl.INT8, pl.NZ]
+# after  (c0 = 32:  512/32 = 16,  256/16 = 16)
+w: pl.Tensor[[1, 16, 16, 16, 32], pl.INT8, pl.NZ]
 ```
 
 **Phase 2 — retarget the consuming `tile.load`.**
@@ -169,9 +180,9 @@ written inline and waved through once bound to a name.
 [#2543]: https://github.com/hw-native-sys/pypto/pull/2543
 
 The destination `TileType` is **preserved verbatim**: the GM partition becomes
-rank-(r+2), the tile stays the logical 2-D operand. The load is therefore rebuilt
+rank-5, the tile stays the logical 2-D operand. The load is therefore rebuilt
 with the explicit-type `Call` constructor rather than `OpRegistry::Create`, which
-would re-deduce a rank-(r+2) tile from the blocked shapes argument.
+would re-deduce a rank-5 tile from the blocked shapes argument.
 
 After this pass no logical-shaped NZ `TensorType` survives, so nothing
 downstream needs to know NZ is special — including codegen, which derives the

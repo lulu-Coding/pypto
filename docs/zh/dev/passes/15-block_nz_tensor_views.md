@@ -19,14 +19,18 @@ GlobalTensor 所要求的*分块*形式，并同步改写读取它的 `tile.load
 `Layout::NZ` 特化）：
 
 ```text
-shape   = [..., C/c0, R/16, 16, c0]
-strides = [..., C*R,  R*c0, 16*c0, c0, 1]
+shape   = [E, C/c0, R/16, 16, c0]
+strides = [C*R, R*c0, 16*c0, c0, 1]
 ```
 
 从内往外读：`c0` 个连续元素构成一条 32 字节 C0 线，16 行构成一个 `16 x c0` 分形
-（512 字节），`R/16` 个分形沿行轴排列，**最外层**才在列块之间步进。即"列块在外、
-行分形在内"——与 tile 侧的 `blayout=col_major, slayout=row_major, fractal=512`
-描述的是同一个字节序。
+（512 字节），`R/16` 个分形沿行轴排列，`C/c0` 在列块之间步进，`E` 在外层批/组
+之间步进。即"列块在外、行分形在内"——与 tile 侧的
+`blayout=col_major, slayout=row_major, fractal=512` 描述的是同一个字节序。
+
+该描述符**始终是 rank 5**。逻辑 rank-3 的 `[E, R, C]` 直接提供 `E`；逻辑
+rank-2 的 `[R, C]` 没有外层轴，因此本 pass 插入隐式的 `E = 1`。PTOAS 会拒绝
+其他秩的 NZ view，包括裸的 rank-4 `[C/c0, R/16, 16, c0]`。
 
 ### 为什么 NZ 不需要自己的 stride 规则
 
@@ -45,7 +49,7 @@ strides = [..., C*R,  R*c0, 16*c0, c0, 1]
 它。stride 由 `MaterializeTensorStrides`（pass 33）稍后填充；本 pass 只改写 shape。
 
 这修正了 RFC #1300 中"NZ 没有 logical-stride 表示"的结论——该结论对逻辑 2-D shape
-成立，对分块后的 rank-(r+2) shape 不成立。
+成立，对分块后的 rank-5 描述符不成立。
 
 ## 在流水线中的位置
 
@@ -76,6 +80,11 @@ w: pl.Tensor[[32, 2048, 4096], pl.INT8, pl.NZ]
 
 # after  (c0 = 32:  4096/32 = 128,  2048/16 = 128)
 w: pl.Tensor[[32, 128, 128, 16, 32], pl.INT8, pl.NZ]
+
+# rank-2 权重会补上隐式外层轴
+w: pl.Tensor[[256, 512], pl.INT8, pl.NZ]
+# after  (c0 = 32:  512/32 = 16,  256/16 = 16)
+w: pl.Tensor[[1, 16, 16, 16, 32], pl.INT8, pl.NZ]
 ```
 
 **阶段 2 —— 改写消费它的 `tile.load`。**
@@ -152,9 +161,9 @@ x * (256 / 16)   ==  268435456    # 重组后：不回绕，读到错误的 frac
 
 [#2543]: https://github.com/hw-native-sys/pypto/pull/2543
 
-目标 `TileType` **原样保留**：GM 分区变成 rank-(r+2)，而 tile 保持逻辑 2-D 操作数。
+目标 `TileType` **原样保留**：GM 分区变成 rank-5，而 tile 保持逻辑 2-D 操作数。
 因此该 load 使用显式类型的 `Call` 构造函数重建，而不是 `OpRegistry::Create`——后者
-会从分块后的 shapes 参数重新推导出 rank-(r+2) 的 tile。
+会从分块后的 shapes 参数重新推导出 rank-5 的 tile。
 
 本 pass 之后不再有逻辑 shape 的 NZ `TensorType` 存活，因此下游（包括 codegen）
 都不需要知道 NZ 的特殊性——codegen 会分别从 `TensorType::shape_` 推导

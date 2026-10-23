@@ -62,7 +62,7 @@ namespace {
 /// Assert that an NZ view has already been rewritten into its blocked form.
 ///
 /// ``BlockNzTensorViews`` turns every logical ``pl.Tensor[..., pl.NZ]``
-/// annotation into the blocked rank-(r+2) shape whose trailing dims are
+/// annotation into the blocked rank-5 shape whose trailing dims are
 /// ``[16, c0]`` (see ``BlockNzShape``). Only in that form does NZ have a
 /// canonical stride — the plain row-major one this pass is about to build.
 ///

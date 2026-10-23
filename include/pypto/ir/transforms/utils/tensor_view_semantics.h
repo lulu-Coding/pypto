@@ -127,15 +127,15 @@ inline int64_t NzC0Elems(DataType dtype) {
   return kNzC0SizeBit / bits;
 }
 
-/// True when ``shape`` is already in blocked NZ form: rank >= 4 with trailing
-/// dims ``[16, c0]``.
+/// True when ``shape`` is already in canonical blocked NZ form: rank 5 with
+/// trailing dims ``[16, c0]``.
 ///
 /// This is the post-``BlockNzTensorViews`` invariant. It is a *structural*
 /// test, not a proof of provenance — an ordinary ND tensor that happens to end
 /// in ``[16, c0]`` also satisfies it. Callers use it to assert that a tensor
 /// *tagged* NZ has been blocked, never to infer that a tensor *is* NZ.
 inline bool IsBlockedNzShape(const std::vector<ExprPtr>& shape, DataType dtype) {
-  if (shape.size() < 4) return false;
+  if (shape.size() != 5) return false;
   // A predicate must answer, not throw: a dtype with no NZ C0 line simply has
   // no blocked form. ``NzC0Elems`` raises for those, so screen them here.
   const auto bits = static_cast<int64_t>(dtype.GetBit());
@@ -145,15 +145,21 @@ inline bool IsBlockedNzShape(const std::vector<ExprPtr>& shape, DataType dtype) 
   return fractal && line && fractal->value_ == kNzFractalRow && line->value_ == NzC0Elems(dtype);
 }
 
-/// Rewrite a logical shape ``[..., R, C]`` into the blocked NZ shape
-/// ``[..., C/c0, R/16, 16, c0]`` that pto-isa's ``Layout::NZ`` GlobalTensor
-/// requires. Rank grows by 2 (the trailing logical pair becomes four dims).
+/// Rewrite a logical shape ``[..., R, C]`` into the canonical rank-5 NZ
+/// descriptor ``[E, C/c0, R/16, 16, c0]`` that pto-isa's ``Layout::NZ``
+/// GlobalTensor and PTOAS require.
+///
+/// A rank-3 logical shape supplies the outer axis ``E`` directly. A rank-2
+/// logical shape has no outer axis, so it gets an implicit ``E = 1`` — PTOAS
+/// rejects an NZ view of any other rank, including the bare rank-4
+/// ``[C/c0, R/16, 16, c0]``. The trailing logical pair always becomes four
+/// dims, so only logical ranks 2 and 3 have a rank-5 representation.
 ///
 /// The blocked shape's *row-major* strides are exactly pto-isa's NZ strides:
 ///
-///   row-major over ``[..., C/c0, R/16, 16, c0]``
-///     = ``[..., (C/c0)*R*c0, (R/16)*16*c0, 16*c0, c0, 1]``
-///     = ``[..., C*R,          R*c0,         16*c0, c0, 1]``
+///   row-major over ``[E, C/c0, R/16, 16, c0]``
+///     = ``[(C/c0)*R*c0, (R/16)*16*c0, 16*c0, c0, 1]``
+///     = ``[C*R,          R*c0,         16*c0, c0, 1]``
 ///     = ``BaseShape2D<T, R, C, Layout::NZ>``
 ///
 /// so NZ needs no dedicated stride rule — ``BuildLogicalStridesFromLayout``
@@ -168,6 +174,10 @@ inline std::vector<ExprPtr> BlockNzShape(const std::vector<ExprPtr>& shape, Data
   CHECK_SPAN(shape.size() >= 2, span)
       << "NZ layout requires a tensor of rank >= 2 (the trailing pair is the fractal plane), got rank "
       << shape.size();
+  CHECK_SPAN(shape.size() <= 3, span)
+      << "NZ layout supports logical ranks 2 and 3 only: the canonical PTOAS descriptor is rank 5 "
+         "[E, C/c0, R/16, 16, c0], with an implicit E = 1 for a rank-2 tensor. Got rank "
+      << shape.size() << ".";
   const int64_t c0 = NzC0Elems(dtype);
 
   auto rows = As<ConstInt>(shape[shape.size() - 2]);
@@ -185,10 +195,12 @@ inline std::vector<ExprPtr> BlockNzShape(const std::vector<ExprPtr>& shape, Data
       << " bits / " << dtype.GetBit() << "-bit '" << dtype.ToString() << "'), got " << cols->value_ << ".";
 
   std::vector<ExprPtr> blocked;
-  blocked.reserve(shape.size() + 2);
-  for (size_t i = 0; i + 2 < shape.size(); ++i) blocked.push_back(shape[i]);
+  const bool implicit_outer = shape.size() == 2;
+  blocked.reserve(shape.size() + (implicit_outer ? 3 : 2));
   auto make_index = [&span](int64_t v) { return std::make_shared<ConstInt>(v, DataType::INDEX, span); };
-  blocked.push_back(make_index(cols->value_ / c0));             // C/c0  — column blocks (outermost)
+  if (implicit_outer) blocked.push_back(make_index(1));          // E = 1 — implicit outer axis
+  for (size_t i = 0; i + 2 < shape.size(); ++i) blocked.push_back(shape[i]);
+  blocked.push_back(make_index(cols->value_ / c0));             // C/c0  — column blocks
   blocked.push_back(make_index(rows->value_ / kNzFractalRow));  // R/16 — row fractals
   blocked.push_back(make_index(kNzFractalRow));                 // 16    — rows within a fractal
   blocked.push_back(make_index(c0));                            // c0    — contiguous C0 line
@@ -333,8 +345,9 @@ inline bool IsProvableNonNegative(const ExprPtr& expr, const NzOffsetFacts& fact
   return false;
 }
 
-/// Map logical offsets ``[..., r0, c0off]`` into the blocked NZ coordinate
-/// system ``[..., c0off/c0, r0/16, 0, 0]`` produced by ``BlockNzShape``.
+/// Map logical offsets ``[..., r0, c0off]`` into the rank-5 blocked NZ
+/// coordinate system ``[Eoff, c0off/c0, r0/16, 0, 0]`` produced by
+/// ``BlockNzShape``. A rank-2 logical tensor gets an implicit ``Eoff = 0``.
 ///
 /// A slice must start on a fractal boundary. A constant offset is folded
 /// directly; a symbolic one is accepted only when ``IsProvableMultipleOf``
@@ -345,6 +358,10 @@ inline std::vector<ExprPtr> BlockNzOffsets(const std::vector<ExprPtr>& offsets, 
                                            const Span& span = Span::unknown(),
                                            const NzOffsetFacts& facts = {}) {
   CHECK_SPAN(offsets.size() >= 2, span) << "NZ layout requires rank >= 2 offsets, got " << offsets.size();
+  CHECK_SPAN(offsets.size() <= 3, span)
+      << "NZ layout supports logical ranks 2 and 3 only: the canonical PTOAS descriptor is rank 5 "
+         "[E, C/c0, R/16, 16, c0], with an implicit E = 1 for a rank-2 tensor. Got rank "
+      << offsets.size() << " offsets.";
   const int64_t c0 = NzC0Elems(dtype);
 
   // A constant keeps its own diagnostic: the offending value is in hand, so the
@@ -389,9 +406,11 @@ inline std::vector<ExprPtr> BlockNzOffsets(const std::vector<ExprPtr>& offsets, 
   auto col_blocked = block_axis(offsets.back(), c0, "-1", "c0 = " + std::to_string(c0));
 
   std::vector<ExprPtr> blocked;
-  blocked.reserve(offsets.size() + 2);
-  for (size_t i = 0; i + 2 < offsets.size(); ++i) blocked.push_back(offsets[i]);
+  const bool implicit_outer = offsets.size() == 2;
+  blocked.reserve(offsets.size() + (implicit_outer ? 3 : 2));
   auto make_index = [&span](int64_t v) { return std::make_shared<ConstInt>(v, DataType::INDEX, span); };
+  if (implicit_outer) blocked.push_back(make_index(0));  // E = 1: its only offset is 0
+  for (size_t i = 0; i + 2 < offsets.size(); ++i) blocked.push_back(offsets[i]);
   blocked.push_back(std::move(col_blocked));
   blocked.push_back(std::move(row_blocked));
   blocked.push_back(make_index(0));  // start of the fractal's rows
@@ -424,12 +443,12 @@ inline bool IsBlockedMxShape(const std::vector<ExprPtr>& shape) {
 ///   DN : strides[n-2] = 1; strides[n-1] = shape[n-2];
 ///        strides[n-3] = shape[n-2] * shape[n-1];
 ///        strides[k]   = strides[k+1] * shape[k+1]   (k = n-4 .. 0)
-///   NZ : row-major over the *blocked* shape (see ``BlockNzShape``). RFC #1300
-///        originally declared NZ unrepresentable; that holds for a logical 2-D
-///        shape but not for the blocked rank-(r+2) form, whose strides are
-///        ordinary row-major and match pto-isa's ``BaseShape2D<..., NZ>``
-///        exactly. Callers must block the shape first — ``CheckNzViewIsBlocked``
-///        enforces that invariant downstream.
+///   NZ : row-major over the canonical rank-5 blocked shape (see
+///        ``BlockNzShape``). RFC #1300 originally declared NZ unrepresentable;
+///        that holds for a logical 2-D shape but not for the blocked rank-5
+///        descriptor, whose strides are ordinary row-major and match pto-isa's
+///        ``BaseShape2D<..., NZ>`` exactly. Callers must block the shape first —
+///        ``CheckNzViewIsBlocked`` enforces that invariant downstream.
 ///   MX : row-major over the blocked rank-5 shape. Logical rank-2 MX strides
 ///        are not physical GM addressing; callers must block first, and
 ///        ``IsBlockedMxShape`` enforces that invariant downstream.
@@ -569,7 +588,7 @@ inline CanonicalCheckResult CheckCanonicalView(const std::vector<ExprPtr>& shape
 
   size_t n = shape.size();
 
-  // Blocked NZ is row-major over its rank-(r+2) shape, so it shares the ND
+  // Blocked NZ is row-major over its canonical rank-5 shape, so it shares the ND
   // canonical form. ``CheckNzViewIsBlocked`` separately enforces that an NZ
   // view has actually been blocked; this only checks the stride structure.
   if (layout == TensorLayout::ND || layout == TensorLayout::NZ || IsMxTensorLayout(layout)) {

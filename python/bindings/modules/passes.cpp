@@ -526,9 +526,11 @@ void BindPass(nb::module_& m) {
              "(convert tile.assemble loops to tile.store loops).");
   passes.def("block_nz_tensor_views", &pass::BlockNzTensorViews,
              "Create a pass that rewrites logical pl.NZ tensors into pto-isa's blocked NZ form\n\n"
-             "An NZ TensorType shape [..., R, C] becomes [..., C/c0, R/16, 16, c0], where\n"
-             "c0 is the element count of a 32-byte C0 line (256 / dtype bits), and every\n"
-             "consuming tile.load has its offsets / shapes / valid_shape rewritten into\n"
+             "An NZ TensorType shape [..., R, C] becomes the canonical rank-5 descriptor\n"
+             "[E, C/c0, R/16, 16, c0], where c0 is the element count of a 32-byte C0\n"
+             "line (256 / dtype bits) and E is the logical outer axis (or an implicit 1\n"
+             "for a rank-2 tensor). Every consuming tile.load has its offsets / shapes /\n"
+             "valid_shape rewritten into\n"
              "blocked coordinates while its logical 2-D destination TileType is preserved.\n"
              "Must run after ConvertTensorToTileOps and after FlattenTileNdTo2D (it\n"
              "requires TileOps2D: the destination tile must already be 2-D).");
