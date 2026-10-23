@@ -333,6 +333,22 @@ inline bool IsProvableNonNegative(const ExprPtr& expr, const NzOffsetFacts& fact
            IsProvableNonNegative(add->right_, facts, budget);
   }
 
+  // Floor division and modulo by a positive constant preserve non-negativity:
+  // floor(a / b) >= 0 and a % b in [0, b) whenever a >= 0 and b > 0. This is
+  // what makes a flat task index usable as a blocked coordinate — the common
+  // mapping ``group = task // N_TILES`` otherwise has no provable sign. Only a
+  // *constant* divisor qualifies; a symbolic one carries no known sign here.
+  if (auto div = As<FloorDiv>(expr)) {
+    if (auto divisor = As<ConstInt>(div->right_); divisor && divisor->value_ > 0) {
+      return IsProvableNonNegative(div->left_, facts, budget);
+    }
+  }
+  if (auto mod = As<FloorMod>(expr)) {
+    if (auto divisor = As<ConstInt>(mod->right_); divisor && divisor->value_ > 0) {
+      return IsProvableNonNegative(mod->left_, facts, budget);
+    }
+  }
+
   if (auto var = As<Var>(expr)) {
     if (facts.is_non_negative && facts.is_non_negative(var)) return true;
     if (facts.definition) {
@@ -391,9 +407,9 @@ inline std::vector<ExprPtr> BlockNzOffsets(const std::vector<ExprPtr>& offsets, 
         << "] to be non-negative, and this one cannot be proven to be. A negative offset is clamped to 0 "
         << "at the partition view rather than rejected, so it would read the wrong fractal silently. "
         << "Provable forms are a non-negative constant, the SPMD block index, a loop variable whose "
-        << "start and step are both non-negative, and any sum or product built from those — note that a "
-        << "difference never qualifies. Slice from a non-negative offset, or annotate the tensor as "
-        << "pl.ND.";
+        << "start and step are both non-negative, any sum or product built from those, and a floor "
+        << "division or modulo of a non-negative value by a positive constant — note that a difference "
+        << "never qualifies. Slice from a non-negative offset, or annotate the tensor as pl.ND.";
     // Divide the offset's *result*, never its arithmetic: the expression keeps
     // its own dtype and wraparound behaviour, and only the value it produces is
     // divided. See ``IsProvableMultipleOf`` for why re-association is unsound.

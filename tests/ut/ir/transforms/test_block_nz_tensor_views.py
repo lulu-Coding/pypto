@@ -377,6 +377,48 @@ def test_does_not_reassociate_the_offset_arithmetic():
     ], "a reduced-factor multiply was synthesized"
 
 
+def test_maps_floor_division_and_modulo_task_offsets():
+    """A flat task index can supply both NZ axes.
+
+    ``g = task // 12`` and ``n_i = task % 12`` are non-negative whenever ``task``
+    is, so their products stay provable multiples of the fractal factors. The
+    sign prover handles floor division and modulo by a positive constant; before
+    that, a per-output-tile task split could not address a flat NZ weight.
+    """
+
+    @pl.program
+    class FlatTasks:
+        @pl.function(type=pl.FunctionType.InCore)
+        def main(
+            self,
+            x: pl.Tensor[[64, 512], pl.INT8],
+            w: pl.Tensor[[512, 512], pl.INT8, pl.NZ],
+            out: pl.Tensor[[64, 256], pl.INT32],
+        ):
+            task = pl.tile.get_block_idx()
+            grid = pl.tile.get_block_num()
+            per_block = (24 + grid - 1) // grid
+            for i in pl.range(per_block):
+                t = task + i * grid
+                if t < 24:
+                    g = t // 12
+                    n_i = t % 12
+                    xt = pl.load(x, [0, 0], [64, 512], target_memory=pl.Mem.Mat)
+                    wt = pl.load(w, [g * 32, n_i * 32], [512, 256], target_memory=pl.Mem.Mat)
+                    acc = pl.matmul(xt, wt, out_dtype=pl.INT32)
+                    pl.store(acc, [0, 0], out)
+            return out
+
+    call = _nz_load(_run(FlatTasks))
+    # [512, 256] INT8 -> [1, 8, 32, 16, 32]
+    assert _values(_elements(call.args[2])) == [1, 8, 32, 16, 32]
+    offsets = _elements(call.args[1])
+    assert _const(offsets[0]) == 0
+    assert isinstance(offsets[1], ir.FloorDiv)  # (n_i * 32) // 32
+    assert isinstance(offsets[2], ir.FloorDiv)  # (g * 32) // 16
+    assert (_const(offsets[3]), _const(offsets[4])) == (0, 0)
+
+
 def test_maps_a_loop_variable_slice_offset():
     """A `pl.pipeline` index divides by c0 once start and step are both multiples.
 

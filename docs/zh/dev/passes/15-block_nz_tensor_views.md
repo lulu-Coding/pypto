@@ -112,8 +112,11 @@ wt: pl.Tile[[256, 512], pl.INT8, pl.Mem.Mat] =
 | `ForStmt`（`for k0 in pl.pipeline(512, 4096, 512)`） | `start` 与 `step` 同时是倍数 | `start` 与 `step` 同时非负 |
 | `tile.get_block_idx` / `tile.get_block_num` | —— | lane 编号不可能为负 |
 | `ConstInt` | 该值本身是倍数 | 该值 `>= 0` |
+| 除以正常量的 `FloorDiv` / `FloorMod` | 继承被除数的因子 | 继承被除数的符号 |
 
-在此基础上，和与乘积可以组合；差能证明整除性但无法证明符号，因此被拒绝。**两列必须
+在此基础上，和与乘积可以组合；除以正常量的 floor 除法与取模继承被除数的符号，
+这使得扁平的 per-tile 任务下标可以同时寻址 NZ 的两个轴（`group = task // 12`、
+`n_i = task % 12`）。差能证明整除性但无法证明符号，因此被拒绝。**两列必须
 同时成立**——见[为什么符号也要证明](#为什么符号也要证明)。因此催生该特性的
 grouped-matmul 权重路径现在可以编译：
 
