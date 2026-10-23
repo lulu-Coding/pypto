@@ -26,9 +26,11 @@ it. The strided mapping keeps 97% core busy at 331.7us.
 Weight layout is the flat [G*K, N] NZ form, as in 10c/10h. This is not
 AscendC's per-group NZ form.
 
-Measured on the 28-AIC test device with PYPTO_PTOAS_SYNC=bufid: 331.7us AICore
-makespan at 97.2% core busy. Raising the K pipeline to stage 3 measured 332.4us
-(within noise) while lowering MTE1 busy, so the default stays at stage 2.
+Measured on the 28-AIC test device with PYPTO_PTOAS_SYNC=bufid: 331.7-338.5us
+AICore makespan at 97.2% core busy across two runs; the benchmark device wall
+was 366.8us median (491.8 TFLOPS). Raising the K pipeline to stage 3 measured
+332.4us (within noise) while lowering MTE1 busy, so the default stays at
+stage 2.
 
 Run on A5 (profile first, then benchmark):
 

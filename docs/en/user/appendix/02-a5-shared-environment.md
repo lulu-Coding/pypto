@@ -13,8 +13,8 @@ and `/home/pyptouser/luxiaolu` are below).
 
 | Item | Value |
 | ---- | ----- |
-| Device | Ascend 950DT_9582 (A5) |
-| Nominal AI cores | 32 AIC (the scheduler may expose fewer; see [Core count](#core-count)) |
+| Device | Ascend950PR 9579 (A5), board A310-50-C00MM304A1; `npu-smi info -t board` |
+| Observed AI cores | 28 AIC at 1.65 GHz on all eight whitelisted devices; `npu-smi info -t common` |
 | OS / compiler | Ubuntu 24.04, system GCC 13.3.0 |
 | CANN | 9.3.0, `/usr/local/Ascend/ascend-toolkit` |
 | NPU access | shared machine; NPU work goes through `task-submit`, never a bare `python` |
@@ -268,19 +268,32 @@ The example verifies bit-exactness against an FP64 reference, writes
 
 ## Core count
 
-The nominal part has 32 AIC, but the job submission layer may place a task on a
-die or partition with fewer visible cores. Read the count from the swimlane
-record rather than assuming:
+All eight whitelisted devices (0-7) report **28 AIC at 1.65 GHz**. The job
+submission layer may place a task on any of them, but the visible count is 28.
+The 32-AIC / 220us AscendC baseline in the project notes was recorded on an
+Ascend950DT_9582, which is a different board: do not compare makespans across
+the two without normalizing for the core count.
+
+A 32-block SPMD launch on this board runs 28 blocks in the first wave and 4 in
+a second wave; the makespan then includes two full block latencies and
+`core_busy_utilization_pct` is low. Read the count from the swimlane record
+rather than assuming, and size the grid with
+`pl.system.available_cluster_count()`:
 
 ```bash
 python examples/utils/swimlane_summary.py <record>
 # record: ... core_types: ['aic', ...]
 ```
 
-A 32-block SPMD launch on a 28-AIC placement runs 28 blocks in the first wave
-and 4 in a second wave; the makespan then includes two full block latencies and
-`core_busy_utilization_pct` is low. Compare makespans only between runs with the
-same visible core count, or make the grid match the placement.
+`npu-smi` is only usable inside a `task-submit` task (the submission adds the
+`HwHiAiUser` group); it fails with `-8005` from a plain SSH shell:
+
+```bash
+task-submit --device 1 --run /path/to/a5_coreinfo.sh
+# npu-smi info -t common -i "$TASK_DEVICE"
+#   Aicore Count : 28
+#   Aicore Freq(MHZ) : 1650
+```
 
 ## Known limitations observed
 
@@ -293,8 +306,11 @@ same visible core count, or make the grid match the placement.
 - `PYPTO_PTOAS_SYNC=bufid` selects PTOAS's A5 buffer-id sync pass instead. It
   replaces the M->FIX event pair with `get_buf(PIPE_FIX, ...)` / `rls_buf`, and
   the balanced 10h kernel measured 354.6us AICore makespan at 97.7% core busy
-  (versus 376.4us with the event path), bit-exact. The option is A5-only and
-  opt-in because the PTOAS bufid pass does not convert every GM dependency.
+  (versus 376.4us with the event path), bit-exact. The balanced AutoTile
+  variant (10i) measured 331.7-338.5us at 97.2% core busy across two runs with
+  the same option. The
+  setting is A5-only and opt-in because the PTOAS bufid pass does not convert
+  every GM dependency.
 - The 10g example peels the first and last K chunks out of the pipeline, so per
   N tile two matmul/load phases run without the flat pipeline's overlap. Keep
   this in mind when comparing its cube time with a fully pipelined variant.

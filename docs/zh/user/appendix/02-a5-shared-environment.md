@@ -12,8 +12,8 @@ Ascend A5 测试机。它用于复现环境、以及解读该机器上跑出的�
 
 | 项目 | 值 |
 | ---- | -- |
-| 设备 | Ascend 950DT_9582（A5） |
-| 标称 AI Core | 32 AIC（调度器可能只暴露更少，见[核数](#核数)） |
+| 设备 | Ascend950PR 9579（A5），板卡 A310-50-C00MM304A1；`npu-smi info -t board` |
+| 实测 AI Core | 8 张白名单设备均为 28 AIC @ 1.65 GHz；`npu-smi info -t common` |
 | 系统 / 编译器 | Ubuntu 24.04，系统 GCC 13.3.0 |
 | CANN | 9.3.0，`/usr/local/Ascend/ascend-toolkit` |
 | NPU 访问 | 共享机；所有 NPU 工作通过 `task-submit`，不要直接跑 `python` |
@@ -257,17 +257,29 @@ task-submit --device auto --max-time 0 --timeout 0 \
 
 ## 核数
 
-器件标称 32 AIC，但作业提交层可能把任务放到只暴露更少核的 die 或分区上。不要假设，
-从 swimlane 记录中读取实际数量：
+8 张白名单设备（0–7）都报告 **28 AIC @ 1.65 GHz**。作业提交层可能把任务放到任意
+一张卡上，但可见核数是 28。项目笔记里的 32 AIC / 220us AscendC 基线是在
+Ascend950DT_9582 上测的，那是另一块板卡；在按核数归一化之前，不要直接比较两者的
+makespan。
+
+在这块板卡上，32 个 block 的 SPMD 启动第一波跑 28 个，第二波跑 4 个；makespan
+因此包含两整轮 block 延迟，`core_busy_utilization_pct` 也会偏低。不要假设核数，
+从 swimlane 记录读取，并用 `pl.system.available_cluster_count()` 决定网格宽度：
 
 ```bash
 python examples/utils/swimlane_summary.py <record>
 # record: ... core_types: ['aic', ...]
 ```
 
-32 个 block 的 SPMD 启动落在 28 AIC 的放置上时，第一波跑 28 个 block，第二波跑
-4 个；makespan 因此包含两整轮 block 延迟，`core_busy_utilization_pct` 也会偏低。
-只有在可见核数相同的两次运行之间比较 makespan，或者让网格匹配实际放置。
+`npu-smi` 只能在 `task-submit` 任务内使用（提交时会补上 `HwHiAiUser` 组）；普通
+SSH shell 里会以 `-8005` 失败：
+
+```bash
+task-submit --device 1 --run /path/to/a5_coreinfo.sh
+# npu-smi info -t common -i "$TASK_DEVICE"
+#   Aicore Count : 28
+#   Aicore Freq(MHZ) : 1650
+```
 
 ## 已观察到的限制
 
@@ -279,8 +291,9 @@ python examples/utils/swimlane_summary.py <record>
 - `PYPTO_PTOAS_SYNC=bufid` 会选择 PTOAS 的 A5 buffer-id 同步 pass。它把 M→FIX
   事件对替换成 `get_buf(PIPE_FIX, ...)` / `rls_buf`，均衡化后的 10h 用例在该模式下
   实测 AICore makespan 354.6us、core busy 97.7%（event 路径为 376.4us），且
-  bit-exact。该选项仅适用于 A5 且为显式开启，因为 PTOAS 的 bufid pass 并不转换
-  所有 GM 依赖。
+  bit-exact。均衡化的 AutoTile 版本（10i）在同样选项下两次运行实测
+  331.7–338.5us、core busy 97.2%。该选项仅适用于 A5 且为显式开启，因为 PTOAS
+  的 bufid pass 并不转换所有 GM 依赖。
 - 10g 用例把第一个和最后一个 K chunk 都从流水线中剥出，因此每个 N tile 有两段
   matmul/load 无法享受 flat pipeline 的重叠。将它和全流水变体的 cube 时间比较时
   需要留意。
