@@ -6,6 +6,7 @@ Reference material that does not belong to a workflow.
 | ---- | ----- |
 | [Feature matrix](00-feature-matrix.md) | Backend support, memory planners, verification levels, and the types you read but rarely write |
 | [FAQ and known limitations](01-faq.md) | Recurring questions, and the constraints behind them |
+| [Shared A5 test environment](02-a5-shared-environment.md) | Reproducing the toolchain, bundle transfer, runtime build, and `task-submit` workflow on a shared A5 machine |
 
 ## See Also
 
