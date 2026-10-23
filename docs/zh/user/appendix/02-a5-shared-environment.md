@@ -271,11 +271,16 @@ python examples/utils/swimlane_summary.py <record>
 
 ## 已观察到的限制
 
-- 静态 `AccPhase` / `STPhase` 属性确实进入了生成代码
+- 默认的 event 同步模式下，静态 `AccPhase` / `STPhase` 属性确实进入了生成代码
   （`TMATMUL_ACC<AccPhase::Final>`、`TSTORE<STPhase::Final>`），但 PTOAS 0.67 的
   同步插入仍会在 store 前后生成软件
   `set_flag(PIPE_M, PIPE_FIX) / wait_flag(PIPE_M, PIPE_FIX) / set_flag(PIPE_FIX, PIPE_M)`
-  事件对。因此当前环境下 unit flag 本身还不能消除 cube 与 fixpipe 的串行化。
+  事件对。因此在这条路径上 unit flag 本身还不能消除 cube 与 fixpipe 的串行化。
+- `PYPTO_PTOAS_SYNC=bufid` 会选择 PTOAS 的 A5 buffer-id 同步 pass。它把 M→FIX
+  事件对替换成 `get_buf(PIPE_FIX, ...)` / `rls_buf`，均衡化后的 10h 用例在该模式下
+  实测 AICore makespan 354.6us、core busy 97.7%（event 路径为 376.4us），且
+  bit-exact。该选项仅适用于 A5 且为显式开启，因为 PTOAS 的 bufid pass 并不转换
+  所有 GM 依赖。
 - 10g 用例把第一个和最后一个 K chunk 都从流水线中剥出，因此每个 N tile 有两段
   matmul/load 无法享受 flat pipeline 的重叠。将它和全流水变体的 cube 时间比较时
   需要留意。

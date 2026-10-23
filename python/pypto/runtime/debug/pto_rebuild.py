@@ -80,10 +80,21 @@ def _ptoas_flags(pto_content: str) -> list[str]:
     Backend-specific extras (from ``get_handler().get_extra_ptoas_flags()``)
     are intentionally omitted — the rebuild path has no backend handler in
     scope. Edits that rely on backend-specific flags require a fresh
-    ``ir.compile()`` instead of a ``.pto`` splice.
+    ``ir.compile()`` instead of a ``.pto`` splice. The sync mode does follow
+    ``PYPTO_PTOAS_SYNC`` so a rebuild of A5 ``.pto`` produced with the buffer-id
+    path stays on that path.
     """
     level = "level3" if _ALLOC_TILE_ADDR_RE.search(pto_content) else "level2"
-    return ["--enable-insert-sync", f"--pto-level={level}"]
+    sync_mode = os.environ.get("PYPTO_PTOAS_SYNC", "insert").strip().lower()
+    if sync_mode == "bufid":
+        sync_flag = "--enable-bufid_sync"
+    elif sync_mode == "insert":
+        sync_flag = "--enable-insert-sync"
+    else:
+        raise ValueError(
+            f"PYPTO_PTOAS_SYNC must be 'insert' or 'bufid', got {sync_mode!r}."
+        )
+    return [sync_flag, f"--pto-level={level}"]
 
 
 def _run_ptoas(ptoas_bin: str, pto_path: Path, out_cpp: Path) -> None:

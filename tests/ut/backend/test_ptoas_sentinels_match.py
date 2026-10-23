@@ -107,6 +107,41 @@ def test_memory_planner_selects_ptoas_level(monkeypatch, planner, expected_level
     assert expected_level in pto_backend._get_ptoas_flags(planner)
 
 
+def test_bufid_sync_flag_selected_on_a5(monkeypatch) -> None:
+    monkeypatch.setenv("PYPTO_PTOAS_SYNC", "bufid")
+    handler = SimpleNamespace(get_extra_ptoas_flags=lambda: ["--pto-arch", "a5"])
+    monkeypatch.setattr(pto_backend._backend_core, "get_handler", lambda: handler)
+
+    flags = pto_backend._get_ptoas_flags(MemoryPlanner.PYPTO)
+    assert "--enable-bufid_sync" in flags
+    assert "--enable-insert-sync" not in flags
+
+
+def test_bufid_sync_rejected_off_a5(monkeypatch) -> None:
+    monkeypatch.setenv("PYPTO_PTOAS_SYNC", "bufid")
+    handler = SimpleNamespace(get_extra_ptoas_flags=lambda: ["--pto-arch", "a3"])
+    monkeypatch.setattr(pto_backend._backend_core, "get_handler", lambda: handler)
+
+    with pytest.raises(ValueError, match="A5"):
+        pto_backend._get_ptoas_flags(MemoryPlanner.PYPTO)
+
+
+def test_unknown_sync_mode_rejected(monkeypatch) -> None:
+    monkeypatch.setenv("PYPTO_PTOAS_SYNC", "bogus")
+    handler = SimpleNamespace(get_extra_ptoas_flags=lambda: ["--pto-arch", "a5"])
+    monkeypatch.setattr(pto_backend._backend_core, "get_handler", lambda: handler)
+
+    with pytest.raises(ValueError, match="PYPTO_PTOAS_SYNC"):
+        pto_backend._get_ptoas_flags(MemoryPlanner.PYPTO)
+
+
+def test_rebuild_honors_bufid_sync(monkeypatch) -> None:
+    monkeypatch.setenv("PYPTO_PTOAS_SYNC", "bufid")
+    flags = pto_rebuild._ptoas_flags("%qk = pto.alloc_tile addr = %c0 : ...")
+    assert "--enable-bufid_sync" in flags
+    assert "--pto-level=level3" in flags
+
+
 def test_compile_pto_module_enables_per_unit_pass_dump(tmp_path, monkeypatch) -> None:
     captured: dict[str, object] = {}
 

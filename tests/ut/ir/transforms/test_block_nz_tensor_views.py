@@ -126,6 +126,11 @@ def _walk(stmt):
         yield stmt
         yield from _walk(stmt.body)
         return
+    if isinstance(stmt, ir.IfStmt):
+        yield stmt
+        yield from _walk(stmt.then_body)
+        yield from _walk(stmt.else_body)
+        return
     yield stmt
 
 

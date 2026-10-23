@@ -1332,10 +1332,33 @@ def _get_ptoas_flags(
     ``MemoryPlanner.PTOAS`` emits no addresses and lets the ptoas PlanMemory
     pass allocate (``--pto-level=level2``). When ``passes_dump_dir`` is set,
     request full-module IR snapshots after every ptoas pass.
+
+    ``PYPTO_PTOAS_SYNC`` selects the intra-core synchronization pass. The
+    default ``insert`` uses ptoas's event-based set_flag/wait_flag solver.
+    ``bufid`` uses the A5-only get_buf/rls_buf pass and is rejected for other
+    targets. It is opt-in because the PTOAS pass is A5-specific and does not
+    handle every GM dependency.
     """
     level = "level2" if memory_planner == _passes.MemoryPlanner.PTOAS else "level3"
+    extra_flags = _backend_core.get_handler().get_extra_ptoas_flags()
+    sync_mode = os.environ.get("PYPTO_PTOAS_SYNC", "insert").strip().lower()
+    if sync_mode == "bufid":
+        if "a5" not in extra_flags:
+            raise ValueError(
+                "PYPTO_PTOAS_SYNC=bufid requires the A5 backend: ptoas only implements "
+                "buffer-id synchronization for --pto-arch a5."
+            )
+        sync_flag = "--enable-bufid_sync"
+    elif sync_mode == "insert":
+        sync_flag = "--enable-insert-sync"
+    else:
+        raise ValueError(
+            f"PYPTO_PTOAS_SYNC must be 'insert' or 'bufid', got {sync_mode!r}. "
+            "'insert' is the default event-based synchronization; 'bufid' is the A5 "
+            "buffer-id path."
+        )
     flags = [
-        "--enable-insert-sync",
+        sync_flag,
         f"--pto-level={level}",
     ]
     if passes_dump_dir is not None:
@@ -1346,7 +1369,7 @@ def _get_ptoas_flags(
                 f"--mlir-print-ir-tree-dir={passes_dump_dir}",
             ]
         )
-    flags.extend(_backend_core.get_handler().get_extra_ptoas_flags())
+    flags.extend(extra_flags)
     return flags
 
 

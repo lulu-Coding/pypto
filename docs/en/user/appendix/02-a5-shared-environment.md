@@ -284,12 +284,17 @@ same visible core count, or make the grid match the placement.
 
 ## Known limitations observed
 
-- The static `AccPhase` / `STPhase` attributes reach the generated code
-  (`TMATMUL_ACC<AccPhase::Final>`, `TSTORE<STPhase::Final>`) but PTOAS 0.67's
-  sync inserter still emits the software
-  `set_flag(PIPE_M, PIPE_FIX) / wait_flag(PIPE_M, PIPE_FIX) / set_flag(PIPE_FIX, PIPE_M)`
-  pair around the store. Unit flags alone therefore do not currently remove the
-  cube/fixpipe serialization in this environment.
+- With the default event synchronization, the static `AccPhase` / `STPhase`
+  attributes reach the generated code (`TMATMUL_ACC<AccPhase::Final>`,
+  `TSTORE<STPhase::Final>`) but PTOAS 0.67's sync inserter still emits the
+  software `set_flag(PIPE_M, PIPE_FIX) / wait_flag(PIPE_M, PIPE_FIX) /
+  set_flag(PIPE_FIX, PIPE_M)` pair around the store. Unit flags alone therefore
+  do not remove the cube/fixpipe serialization on that path.
+- `PYPTO_PTOAS_SYNC=bufid` selects PTOAS's A5 buffer-id sync pass instead. It
+  replaces the M->FIX event pair with `get_buf(PIPE_FIX, ...)` / `rls_buf`, and
+  the balanced 10h kernel measured 354.6us AICore makespan at 97.7% core busy
+  (versus 376.4us with the event path), bit-exact. The option is A5-only and
+  opt-in because the PTOAS bufid pass does not convert every GM dependency.
 - The 10g example peels the first and last K chunks out of the pipeline, so per
   N tile two matmul/load phases run without the flat pipeline's overlap. Keep
   this in mind when comparing its cube time with a fully pipelined variant.

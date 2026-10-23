@@ -34,12 +34,22 @@ difference isolates the grid placement.
 Weight layout is the flat [G*K, N] NZ form, as in 10g. This is not AscendC's
 per-group NZ form; the layout is addressed after the scheduling result.
 
+On A5, exporting ``PYPTO_PTOAS_SYNC=bufid`` selects ptoas's buffer-id
+synchronization instead of the default event sync. The generated code replaces
+the M->FIX set_flag/wait_flag pair with get_buf/rls_buf(PIPE_FIX); on the 28-AIC
+test device this measured 354.6us AICore makespan at 97.7% core busy, versus
+376.4us for the default event path. Both were bit-exact. The option is opt-in
+because ptoas implements buffer-id sync only for A5 and does not convert every
+GM dependency.
+
 Run on A5 (profile first, then benchmark):
 
-    python examples/advanced/10h_group_matmul_i8_flat_nz_balanced.py -p a5 -d 0 --profile
+    PYPTO_PTOAS_SYNC=bufid python examples/advanced/10h_group_matmul_i8_flat_nz_balanced.py \
+        -p a5 -d 0 --profile
     python examples/utils/swimlane_summary.py <printed record path>
 
-    python examples/advanced/10h_group_matmul_i8_flat_nz_balanced.py -p a5 -d 0 --rounds 20
+    PYPTO_PTOAS_SYNC=bufid python examples/advanced/10h_group_matmul_i8_flat_nz_balanced.py \
+        -p a5 -d 0 --rounds 20
 """
 
 import argparse
