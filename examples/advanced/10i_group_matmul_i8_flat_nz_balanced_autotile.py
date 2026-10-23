@@ -16,10 +16,12 @@ manual 128-K pipeline in 10h. The hardware exposed here reports 28 AIC, so 10c's
 
 This variant keeps 10c's tensor-level body (TILE_K=256 panels, stage-2 K
 pipeline, assemble store) and changes only the work decomposition: the launch
-is ``pl.system.available_cluster_count()`` blocks and each block takes a
-contiguous range of the 384 [256, 256] output tiles. Every block gets 13 or 14
-tiles, and the 12 N tiles of a group stay together on one core, preserving the
-A-panel L2 locality that a strided task mapping would destroy.
+is ``pl.system.available_cluster_count()`` blocks and each block grid-strides
+over the 384 [256, 256] output tiles. Every block takes 13 or 14 tiles. The
+strided mapping was retained because a contiguous range was measured at 356.1us:
+clustering each group's 12 N tiles on one block left the 13-vs-14 split and the
+per-tile cost variation as a 58.6us tail, while the L2 locality did not recover
+it. The strided mapping keeps 97% core busy at 331.7us.
 
 Weight layout is the flat [G*K, N] NZ form, as in 10c/10h. This is not
 AscendC's per-group NZ form.
@@ -85,30 +87,28 @@ def _matmul_tasks(
     """Grid-stride over [TILE_M, TILE_N] tiles; one tile per loop iteration."""
     block = pl.tile.get_block_idx()
     grid = pl.tile.get_block_num()
-    # Contiguous task range: the loop index stays zero-based so its sign is
-    # provable, and the start is a floor division by the (positive) block count.
-    start = (block * TOTAL_TILES) // grid
-    end = ((block + 1) * TOTAL_TILES) // grid
+    per_block = (TOTAL_TILES + grid - 1) // grid
 
-    for j in pl.range(end - start):
-        t = start + j
-        g = t // N_TILES
-        n_i = t % N_TILES
-        x_base = g * GROUP_M
-        w_base = g * K
-        n0 = n_i * TILE_N
+    for i in pl.range(per_block):
+        t = block + i * grid
+        if t < TOTAL_TILES:
+            g = t // N_TILES
+            n_i = t % N_TILES
+            x_base = g * GROUP_M
+            w_base = g * K
+            n0 = n_i * TILE_N
 
-        a = x[x_base : x_base + GROUP_M, 0:TILE_K]
-        b = w[w_base : w_base + TILE_K, n0 : n0 + TILE_N]
-        acc = pl.matmul(a, b, out_dtype=pl.INT32)
+            a = x[x_base : x_base + GROUP_M, 0:TILE_K]
+            b = w[w_base : w_base + TILE_K, n0 : n0 + TILE_N]
+            acc = pl.matmul(a, b, out_dtype=pl.INT32)
 
-        for kb in pl.pipeline(1, K_CHUNKS, stage=2):
-            k0 = kb * TILE_K
-            a = x[x_base : x_base + GROUP_M, k0 : k0 + TILE_K]
-            b = w[w_base + k0 : w_base + k0 + TILE_K, n0 : n0 + TILE_N]
-            acc = pl.matmul_acc(acc, a, b)
+            for kb in pl.pipeline(1, K_CHUNKS, stage=2):
+                k0 = kb * TILE_K
+                a = x[x_base : x_base + GROUP_M, k0 : k0 + TILE_K]
+                b = w[w_base + k0 : w_base + k0 + TILE_K, n0 : n0 + TILE_N]
+                acc = pl.matmul_acc(acc, a, b)
 
-        out = pl.assemble(out, acc, [x_base, n0])
+            out = pl.assemble(out, acc, [x_base, n0])
 
     return out
 
