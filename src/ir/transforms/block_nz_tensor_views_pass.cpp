@@ -213,6 +213,7 @@ class NzOffsetFactStore {
       const auto& [start, step] = it->second;
       return start >= 0 && step >= 0;
     };
+    facts.is_positive = [this](const VarPtr& var) { return positive_vars_.count(var) != 0; };
     return facts;
   }
 
@@ -235,6 +236,11 @@ class NzOffsetFactStore {
         if (call && (IsOp(call, "tile.get_block_idx") || IsOp(call, "tile.get_block_num"))) {
           store_->non_negative_vars_.insert(op->var_);
         }
+        // A launch always has at least one block, so the block count is also a
+        // valid positive floor-divisor for a balanced task range.
+        if (call && IsOp(call, "tile.get_block_num")) {
+          store_->positive_vars_.insert(op->var_);
+        }
       }
       IRVisitor::VisitStmt_(op);
     }
@@ -255,6 +261,7 @@ class NzOffsetFactStore {
   std::unordered_map<VarPtr, ExprPtr> definitions_;
   std::unordered_map<VarPtr, std::pair<int64_t, int64_t>> loop_bindings_;
   std::unordered_set<VarPtr> non_negative_vars_;
+  std::unordered_set<VarPtr> positive_vars_;
 };
 
 /// Rewrite the elements of a ``MakeTuple`` coordinate argument into blocked NZ

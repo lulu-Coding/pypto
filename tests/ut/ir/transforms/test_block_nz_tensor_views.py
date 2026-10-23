@@ -387,8 +387,10 @@ def test_maps_floor_division_and_modulo_task_offsets():
 
     ``g = task // 12`` and ``n_i = task % 12`` are non-negative whenever ``task``
     is, so their products stay provable multiples of the fractal factors. The
-    sign prover handles floor division and modulo by a positive constant; before
-    that, a per-output-tile task split could not address a flat NZ weight.
+    sign prover handles floor division and modulo by a provably positive value:
+    here the balanced range is bounded by ``total * block // grid``, whose
+    divisor is the SPMD block count. Before that, a per-output-tile task split
+    could not address a flat NZ weight.
     """
 
     @pl.program
@@ -402,16 +404,16 @@ def test_maps_floor_division_and_modulo_task_offsets():
         ):
             task = pl.tile.get_block_idx()
             grid = pl.tile.get_block_num()
-            per_block = (24 + grid - 1) // grid
-            for i in pl.range(per_block):
-                t = task + i * grid
-                if t < 24:
-                    g = t // 12
-                    n_i = t % 12
-                    xt = pl.load(x, [0, 0], [64, 512], target_memory=pl.Mem.Mat)
-                    wt = pl.load(w, [g * 32, n_i * 32], [512, 256], target_memory=pl.Mem.Mat)
-                    acc = pl.matmul(xt, wt, out_dtype=pl.INT32)
-                    pl.store(acc, [0, 0], out)
+            start = (task * 24) // grid
+            end = ((task + 1) * 24) // grid
+            for j in pl.range(end - start):
+                t = start + j
+                g = t // 12
+                n_i = t % 12
+                xt = pl.load(x, [0, 0], [64, 512], target_memory=pl.Mem.Mat)
+                wt = pl.load(w, [g * 32, n_i * 32], [512, 256], target_memory=pl.Mem.Mat)
+                acc = pl.matmul(xt, wt, out_dtype=pl.INT32)
+                pl.store(acc, [0, 0], out)
             return out
 
     call = _nz_load(_run(FlatTasks))

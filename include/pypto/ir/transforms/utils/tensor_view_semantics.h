@@ -229,6 +229,11 @@ struct NzOffsetFacts {
   /// index). The second is an *operator* fact, which is why the owning pass
   /// supplies it rather than this header deciding it structurally.
   std::function<bool(const VarPtr&)> is_non_negative;
+  /// Whether a ``Var`` is strictly positive by construction. ``tile.get_block_num``
+  /// is the only source today: a launch always has at least one block. This
+  /// licenses using it as the divisor of a floor div/mod when proving the sign
+  /// of a balanced task range.
+  std::function<bool(const VarPtr&)> is_positive;
 };
 
 /// Node-visit allowance for one ``IsProvableMultipleOf`` walk.
@@ -301,6 +306,14 @@ inline bool IsProvableMultipleOf(const ExprPtr& expr, int64_t divisor, const NzO
   return false;
 }
 
+/// Whether ``expr`` is a divisor with a provably positive value: a positive
+/// constant, or a variable whose operator guarantees it (``get_block_num``).
+inline bool IsProvablyPositiveDivisor(const ExprPtr& expr, const NzOffsetFacts& facts) {
+  if (auto const_expr = As<ConstInt>(expr)) return const_expr->value_ > 0;
+  if (auto var = As<Var>(expr)) return facts.is_positive && facts.is_positive(var);
+  return false;
+}
+
 /// Whether every runtime value of ``expr`` is non-negative.
 ///
 /// Divisibility alone does not make a blocked coordinate safe. ``n0 = -16`` is
@@ -333,18 +346,19 @@ inline bool IsProvableNonNegative(const ExprPtr& expr, const NzOffsetFacts& fact
            IsProvableNonNegative(add->right_, facts, budget);
   }
 
-  // Floor division and modulo by a positive constant preserve non-negativity:
-  // floor(a / b) >= 0 and a % b in [0, b) whenever a >= 0 and b > 0. This is
-  // what makes a flat task index usable as a blocked coordinate — the common
-  // mapping ``group = task // N_TILES`` otherwise has no provable sign. Only a
-  // *constant* divisor qualifies; a symbolic one carries no known sign here.
+  // Floor division and modulo by a provably positive value preserve
+  // non-negativity: floor(a / b) >= 0 and a % b in [0, b) whenever a >= 0 and
+  // b > 0. This is what makes a flat task index usable as a blocked coordinate
+  // — the common mapping ``group = task // N_TILES`` otherwise has no provable
+  // sign. The balanced range uses ``get_block_num()`` as the divisor, so a
+  // symbolic positive divisor counts too.
   if (auto div = As<FloorDiv>(expr)) {
-    if (auto divisor = As<ConstInt>(div->right_); divisor && divisor->value_ > 0) {
+    if (IsProvablyPositiveDivisor(div->right_, facts)) {
       return IsProvableNonNegative(div->left_, facts, budget);
     }
   }
   if (auto mod = As<FloorMod>(expr)) {
-    if (auto divisor = As<ConstInt>(mod->right_); divisor && divisor->value_ > 0) {
+    if (IsProvablyPositiveDivisor(mod->right_, facts)) {
       return IsProvableNonNegative(mod->left_, facts, budget);
     }
   }
@@ -408,8 +422,9 @@ inline std::vector<ExprPtr> BlockNzOffsets(const std::vector<ExprPtr>& offsets, 
         << "at the partition view rather than rejected, so it would read the wrong fractal silently. "
         << "Provable forms are a non-negative constant, the SPMD block index, a loop variable whose "
         << "start and step are both non-negative, any sum or product built from those, and a floor "
-        << "division or modulo of a non-negative value by a positive constant — note that a difference "
-        << "never qualifies. Slice from a non-negative offset, or annotate the tensor as pl.ND.";
+        << "division or modulo of a non-negative value by a provably positive value (a constant or "
+        << "the SPMD block count) — note that a difference never qualifies. Slice from a non-negative "
+        << "offset, or annotate the tensor as pl.ND.";
     // Divide the offset's *result*, never its arithmetic: the expression keeps
     // its own dtype and wraparound behaviour, and only the value it produces is
     // divided. See ``IsProvableMultipleOf`` for why re-association is unsound.

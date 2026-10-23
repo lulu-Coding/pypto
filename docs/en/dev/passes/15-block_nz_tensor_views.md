@@ -122,13 +122,15 @@ the enclosing function in one read-only sweep:
 | `ForStmt` (`for k0 in pl.pipeline(512, 4096, 512)`) | `start` and `step` are both multiples | `start` and `step` are both non-negative |
 | `tile.get_block_idx` / `tile.get_block_num` | — | a lane number is never negative |
 | `ConstInt` | the value is a multiple | the value is `>= 0` |
-| `FloorDiv` / `FloorMod` by a positive constant | inherits the dividend's factor | inherits the dividend's sign |
+| `FloorDiv` / `FloorMod` by a provably positive value | inherits the dividend's factor | inherits the dividend's sign |
 
-Sums and products compose from those; floor division and modulo by a positive
-constant inherit their dividend's sign, which is what lets a flat per-tile task
-index address both NZ axes (`group = task // 12`, `n_i = task % 12`). A
-difference proves divisibility but never its sign, so it is refused. **Both**
-columns must hold — see [Why the sign is proven too](#why-the-sign-is-proven-too). The grouped-matmul weight path that
+Sums and products compose from those; floor division and modulo by a provably
+positive value — a positive constant, or `tile.get_block_num()` — inherit their
+dividend's sign. That is what lets a flat per-tile task index address both NZ
+axes (`group = task // 12`, `n_i = task % 12`), including a balanced range whose
+bounds are `total * block // grid`. A difference proves divisibility but never
+its sign, so it is refused. **Both** columns must hold — see
+[Why the sign is proven too](#why-the-sign-is-proven-too). The grouped-matmul weight path that
 motivated the feature therefore compiles:
 
 ```python
