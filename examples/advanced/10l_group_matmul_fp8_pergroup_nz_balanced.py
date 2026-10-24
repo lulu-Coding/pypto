@@ -16,11 +16,15 @@ grid, per-group NZ [G, N/32, K/16, 16, 32] weight, L1_K=256 panels, stage-2
 pipeline) with the data path changed to FP8.
 
 The A5 Cube accumulates FP8 in FP32 (pto-isa TMATMUL supports the plain
-`(f32, fp8, fp8)` triple; no MX scale is involved). The accumulator therefore
-stays FP32 through the K loop and leaves L0C through the unstrided FIXPIPE
-narrowing f32 -> f16, which the autotiler folds the final `pl.cast(..., "rint")`
-into. `out_dtype=pl.FP32` is required on the first matmul: `tensor.matmul_acc`
-demands the accumulator dtype to be the Cube's FP32 accumulator.
+`(f32, fp8, fp8)` triple; no MX scale is involved). The accumulator stays FP32
+through the K loop and the final store writes it straight into the FP16 output:
+`tile.store` performs no dtype check and the plain FIXPIPE writeback is exactly
+the f32 -> f16 narrowing (F322F16). Do not write an explicit `pl.cast(..., "rint")`
+here — the autotiler folds an f32->f16 cast only into a later matmul's Acc->Mat
+writeback, not into an Acc->GM store, so an explicit cast becomes a 256x256
+Vector tcvt (640 KB of Vec staging, over the UB limit). `out_dtype=pl.FP32` is
+required on the first matmul: `tensor.matmul_acc` demands the accumulator dtype
+to be the Cube's FP32 accumulator.
 
 Inputs are integers in [-4, 4], exactly representable in E4M3. Every product and
 partial sum is then an exact integer well below 2^24, so the FP32 accumulation
@@ -108,8 +112,8 @@ def _matmul_tasks(
                 w_k = w[g : g + 1, k1 : k1 + L1_K, n0 : n0 + TILE_N]
                 acc = pl.matmul_acc(acc, x_k, w_k)
 
-            acc_f16 = pl.cast(acc, pl.FP16, mode="rint")
-            out[row : row + GROUP_M, n0 : n0 + TILE_N] = pl.reshape(acc_f16, [GROUP_M, TILE_N])
+            # Acc (FP32) -> FP16 GM: the FIXPIPE narrowing is part of the store.
+            out[row : row + GROUP_M, n0 : n0 + TILE_N] = pl.reshape(acc, [GROUP_M, TILE_N])
 
     return out
 
