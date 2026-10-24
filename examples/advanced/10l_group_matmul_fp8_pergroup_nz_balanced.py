@@ -40,11 +40,21 @@ Run on A5 (profile first, then benchmark):
     PYPTO_PTOAS_SYNC=bufid python examples/advanced/10l_group_matmul_fp8_pergroup_nz_balanced.py \
         -p a5 -d 0 --rounds 20
 
-The reference to compare against is the user's AscendC custom no-scale FP8 kernel
-(220us on a 32-AIC 950DT). CANN's aclnnGroupedMatmulWeightNz cannot reproduce it:
-its 950 checker rejects FP8 with an FP16 output and a null scale
-(`161002 Parameter scale ... cannot be nullptr`). A same-board AscendC number
-would need that custom kernel's source; this file provides the PyPTO-side number.
+Measured on the 28-AIC board with PYPTO_PTOAS_SYNC=bufid, in the same task as
+10k: benchmark 335.7us / profile AICore makespan 302.3us, PMU per core cube
+239.5us, MTE2 282.8us, fixpipe 13.3us, 96.6% MTE2-busy. 10k INT8 measured
+365.8us benchmark / 332.8us profile, MTE2 313.9us. FP8 reaches 89 GB/s of
+MTE2, the same rate as the AscendC INT8 library on this board, and the
+kernel-level gap to that library is 5.5%.
+
+The user's AscendC custom no-scale FP8 kernel measures 220us on a 32-AIC
+950DT. CANN's aclnnGroupedMatmulWeightNz cannot reproduce it: its 950 checker
+rejects FP8 with an FP16 output and a null scale, and with an NZ weight it
+requires MX FLOAT8_E8M0 scale plus perTokenScale. The 220us is also below
+this board's memory floor: compulsory HBM reads are 352.3MB of weight (used
+once) plus 29.4MB of unique activations, so 220us needs 1.74TB/s while this
+board streams ~1.11TB/s (scripts/bench/mte2_bandwidth). A same-board AscendC
+number needs that custom kernel's source; this file provides the PyPTO number.
 """
 
 import argparse

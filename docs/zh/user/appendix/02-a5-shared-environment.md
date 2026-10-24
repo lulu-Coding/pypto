@@ -320,14 +320,92 @@ msprof op --output=./msprof_gmm --launch-skip-before-match 33 \
 ```
 
 项目笔记里的 220us 是 32 核 Ascend950DT_9582 上的 FP8 数据，不是这块板卡的
-INT8 目标。
+INT8 目标。FP8 用例以及该数字背后的带宽限制见下文。
+
+### FP8 no-scale 用例与 220us 基线
+
+`examples/advanced/10l_group_matmul_fp8_pergroup_nz_balanced.py` 用 10k 的调度
+跑 FP8E4M3FN 输入、FP16 输出，与用户 AscendC 的 dtype 和 per-group NZ 布局一致。
+A5 Cube 用普通 `TMATMUL` 以 FP32 累加 FP8（不涉及 MX scale）；累加器保持 FP32，
+由最后一次 Acc->GM store 窄化为 FP16。不要在该 store 前显式写
+`pl.cast(acc, pl.FP16, mode="rint")`：autotiler 只把它折进后续 matmul 的
+Acc->Mat 写回，不会折进 Acc->GM store，结果会变成 256x256 的 Vector `tcvt`，
+需要 640KB Vec 暂存并超出 UB。
+
+同一个任务（device 1，`PYPTO_PTOAS_SYNC=bufid`，3 次 warmup + 10 次测量）：
+
+| 内核 | 数据路径 | benchmark `device_us` | profile AICore makespan | cube | MTE2 | fixpipe |
+| ---- | -------- | --------------------- | ----------------------- | ---- | ---- | ------- |
+| 10k INT8 | INT8 -> INT32 | 365.8 us | 332.8 us | 240.6 us | 313.9 us | 25.3 us |
+| 10l FP8 | E4M3 -> FP16 | 335.7 us | 302.3 us | 239.5 us | 282.8 us | 13.3 us |
+| AscendC INT8 | INT8 -> INT32 | ACL 322-323 us | msprof 286.6-290.9 us | 243.3 us | 269.0 us | 111.0 us |
+
+PMU 是 1.65GHz 下的单核数据，两个 PyPTO 内核都从 GM 搬 25.1MB/core 到 L1。
+FP8 把 MTE2 从 80GB/s 提到 89GB/s，正好是本板 AscendC INT8 的速率；MTE2 占用
+96.6%，core busy 96.9%。cube + MTE2 合计 522.3us，而 makespan 只有 302.3us，
+因此至少有 220us 的 cube 在 MTE2 下运行；fixpipe 只有 13.3us。这与 AscendC
+trace 的 MTE2-bound 形态一致。FP8 相对 INT8 的 30us 收益对应 MTE2 减少 31.1us
+（313.9 -> 282.8us）；fixpipe 也减半（25.3 -> 13.3us），但它本就在 MTE2 之下，
+cube 不变。FP16 使输出字节减半。在核内层面，FP8 与同板 AscendC INT8 库算子的
+差距为 5.5%，而后者写的是字节数翻倍的 INT32 输出。
+
+CANN 库算子无法复现该用例。950 的 checker
+（`grouped_matmul_950_checker.cpp`，`CheckBasicQuantParams` 与
+`CheckWeightNzSpecialParams`）要求：输出不是 INT32 时 FP8 必须提供非空 scale；
+而当 weight 为 FRACTAL_NZ、输入为 E4M3 时，scale 和 perTokenScale 都必须是
+FLOAT8_E8M0，也就是 MX 路径。带 FLOAT32 单位 scale、没有 perTokenScale 的普通
+FP8 matmul 会报 `161002`。所以要在同板测用户那版 no-scale FP8 自定义 kernel，
+需要它的源码或可执行文件。
+
+复现 benchmark 和 profile：
+
+```bash
+PYPTO_PTOAS_SYNC=bufid python examples/advanced/10l_group_matmul_fp8_pergroup_nz_balanced.py \
+    -p a5 -d "$TASK_DEVICE" --rounds 10
+PYPTO_PTOAS_SYNC=bufid python examples/advanced/10l_group_matmul_fp8_pergroup_nz_balanced.py \
+    -p a5 -d "$TASK_DEVICE" --profile
+```
+
+#### 为什么本板达不到 220us
+
+核数不是全部差异。384 个输出 tile 各自从 L1 视角加载 0.917MB 激活和 0.917MB
+weight，共 704.6MB；一个 group 的 12 个 N tile 共享激活，所以唯一激活只有
+29.4MB；每个 group 的 `[K, N]` weight 只被该 group 使用，352.3MB 全部是必需的。
+FP16 输出再增加 50.3MB 写入。因此用户 32 核板上的 220us 至少需要
+381.7MB / 220us = 1.74TB/s 的 HBM 读；即使按核数完美折算到 28 核（251us），
+也需要 1.52TB/s。
+
+本板远低于这个值。`scripts/bench/mte2_bandwidth` 每次 launch 用 8 级 64KiB
+multibuffer 流式读取 1GiB 唯一 GM 数据：
+
+| blockDim | 聚合带宽 | 单核带宽 |
+| -------- | -------- | -------- |
+| 28 | 1.11 TB/s | 37-40 GB/s |
+| 14 | 1.08 TB/s | 77 GB/s |
+| 1 | 165 GB/s | 165 GB/s |
+
+FP8 GMM 在 302.3us 内的必需读为 381.7MB / 302.3us = 1.26TB/s，高于纯流式探针，
+所以探针是本板的保守下限。内核已经贴着存储下限；220us 所暗示的流水重叠差距
+并不存在。要让 220us 成立，32 核 950DT 需要提供大约 1.7-2.0TB/s。
+
+决定性的同板验证是在 32 核机器上跑同一个探针：
+
+```bash
+SOC_VERSION=ascend950dt_9582 bash scripts/bench/mte2_bandwidth/build.sh
+task-submit --device auto --max-time 0 --timeout 0 \
+    --run "bash scripts/bench/mte2_bandwidth/run.sh 32"
+```
+
+如果报告 ~1.7-2.0TB/s，220us 就是板卡差异；如果仍约 1.1TB/s，则用户的 kernel
+做了库算子无法表达的事情，需要其源码。
 
 ## 核数
 
 8 张白名单设备（0–7）都报告 **28 AIC @ 1.65 GHz**。作业提交层可能把任务放到任意
 一张卡上，但可见核数是 28。项目笔记里的 32 AIC / 220us AscendC 基线是在
 Ascend950DT_9582 上测的，那是另一块板卡；在按核数归一化之前，不要直接比较两者的
-makespan。
+makespan。仅按核数折算（28/32）时 220us 相当于本板的 251us，但上面的 FP8
+存储下限分析表明 950DT 的 HBM 带宽是更大的因素；需要在该板上跑流式探针来区分两者。
 
 在这块板卡上，32 个 block 的 SPMD 启动第一波跑 28 个，第二波跑 4 个；makespan
 因此包含两整轮 block 延迟，`core_busy_utilization_pct` 也会偏低。不要假设核数，

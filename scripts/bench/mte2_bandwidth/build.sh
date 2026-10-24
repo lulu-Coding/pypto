@@ -21,7 +21,7 @@ rm -rf build
 cmake -B build -DCMAKE_BUILD_TYPE=Release \
     -DASCEND_CANN_PACKAGE_PATH="$CANN_ROOT" \
     -DSOC_VERSION="$SOC" > build_cfg.log 2>&1 || { echo CFG_FAIL; tail -30 build_cfg.log; exit 1; }
-cmake --build build --parallel "${PYPTO_BUILD_JOBS:-8}" > build.log 2>&1 || {
+cmake --build build --parallel "${PYPTO_BUILD_JOBS:-2}" > build.log 2>&1 || {
     echo BUILD_FAIL
     tail -60 build.log
     exit 1

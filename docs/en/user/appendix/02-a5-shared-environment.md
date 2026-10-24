@@ -337,7 +337,97 @@ msprof op --output=./msprof_gmm --launch-skip-before-match 33 \
 ```
 
 The 220 us FP8 figure in the project notes is a different dtype on a 32-AIC
-Ascend950DT_9582; it is not the INT8 target for this board.
+Ascend950DT_9582; it is not the INT8 target for this board. The FP8 case and
+the bandwidth limit behind that figure are covered below.
+
+### FP8 no-scale case and the 220 us baseline
+
+`examples/advanced/10l_group_matmul_fp8_pergroup_nz_balanced.py` runs 10k's
+schedule with FP8E4M3FN inputs and an FP16 output, matching the user's AscendC
+dtype and per-group NZ layout. The A5 Cube accumulates FP8 in FP32 through the
+plain `TMATMUL` (no MX scale); keep the accumulator FP32 and let the final
+Acc->GM store narrow to FP16. Do not add an explicit
+`pl.cast(acc, pl.FP16, mode="rint")` before that store: the autotiler folds
+that cast only into a *later matmul's* Acc->Mat writeback, not into an Acc->GM
+store, so it stays a 256x256 Vector `tcvt` and overflows UB with 640 KB of Vec
+staging.
+
+Measured in one task (device 1) with `PYPTO_PTOAS_SYNC=bufid`, 3 warmup + 10
+measured launches:
+
+| Kernel | Data path | benchmark `device_us` | profile AICore makespan | cube | MTE2 | fixpipe |
+| ------ | --------- | --------------------- | ----------------------- | ---- | ---- | ------- |
+| 10k INT8 | INT8 -> INT32 | 365.8 us | 332.8 us | 240.6 us | 313.9 us | 25.3 us |
+| 10l FP8 | E4M3 -> FP16 | 335.7 us | 302.3 us | 239.5 us | 282.8 us | 13.3 us |
+| AscendC INT8 | INT8 -> INT32 | ACL 322-323 us | msprof 286.6-290.9 us | 243.3 us | 269.0 us | 111.0 us |
+
+The PMU figures are per core at 1.65 GHz and both PyPTO kernels load 25.1 MB
+per core from GM into L1. FP8 raises MTE2 from 80 to 89 GB/s, exactly
+AscendC's INT8 rate on this board, and is 96.6% MTE2-busy with 96.9% core
+busy. Cube + MTE2 sum to 522.3 us against a 302.3 us makespan, so at least
+220 us of cube runs under MTE2; fixpipe is only 13.3 us. That is the same
+MTE2-bound shape as the AscendC trace. The 30 us gain over INT8 is a 31.1 us
+MTE2 reduction (313.9 -> 282.8 us); fixpipe also halves (25.3 -> 13.3 us) but
+was already under MTE2, and cube is unchanged. FP16 halves the output bytes.
+At the kernel level the FP8 case
+is within 5.5% of the AscendC INT8 library on the same board, even though
+that library writes an INT32 output (twice the bytes).
+
+CANN cannot produce this case through the library operator. The 950 checker
+(`grouped_matmul_950_checker.cpp`, `CheckBasicQuantParams` and
+`CheckWeightNzSpecialParams`) requires a non-null scale for FP8 whenever the
+output is not INT32, and with a FRACTAL_NZ weight and E4M3 inputs it then
+requires both `scale` and `perTokenScale` to be FLOAT8_E8M0 -- the MX path.
+A plain FP8 matmul with a FLOAT32 unit scale and no perTokenScale is rejected
+with `161002`. A same-board AscendC number for the user's custom no-scale FP8
+kernel therefore needs that kernel's source or binary.
+
+Reproduce the benchmark and the profile with:
+
+```bash
+PYPTO_PTOAS_SYNC=bufid python examples/advanced/10l_group_matmul_fp8_pergroup_nz_balanced.py \
+    -p a5 -d "$TASK_DEVICE" --rounds 10
+PYPTO_PTOAS_SYNC=bufid python examples/advanced/10l_group_matmul_fp8_pergroup_nz_balanced.py \
+    -p a5 -d "$TASK_DEVICE" --profile
+```
+
+#### Why 220 us is not reachable on this board
+
+Core count is not the whole story. Each of the 384 output tiles loads 0.917 MB
+of activations and 0.917 MB of weight, for 704.6 MB of L1 loads per launch.
+The 12 N tiles of a group share its activations, so only 29.4 MB of those
+bytes are unique; each group's `[K, N]` weight is used by that group alone and
+all 352.3 MB is compulsory. The FP16 output adds 50.3 MB of writes. The user's
+220 us on the 32-AIC board therefore needs at least 381.7 MB / 220 us =
+1.74 TB/s of HBM reads. Even scaling that number perfectly to 28 cores
+(251 us) needs 1.52 TB/s.
+
+This board is far below that. `scripts/bench/mte2_bandwidth` streams 1 GiB of
+unique GM data per launch with 8-deep 64 KiB multibuffering:
+
+| Blocks | Aggregate | Per core |
+| ------ | --------- | -------- |
+| 28 | 1.11 TB/s | 37-40 GB/s |
+| 14 | 1.08 TB/s | 77 GB/s |
+| 1 | 165 GB/s | 165 GB/s |
+
+The FP8 GMM's compulsory reads over its 302.3 us makespan are already
+381.7 MB / 302.3 us = 1.26 TB/s, above the pure streaming probe, so the probe
+is a conservative floor for this board. The kernel is at the memory floor;
+there is no remaining pipeline-overlap gap of the size implied by 220 us.
+The 32-AIC 950DT must be supplying roughly 1.7-2.0 TB/s for that number.
+
+The decisive same-board check is the streaming probe on the 32-core machine:
+
+```bash
+SOC_VERSION=ascend950dt_9582 bash scripts/bench/mte2_bandwidth/build.sh
+task-submit --device auto --max-time 0 --timeout 0 \
+    --run "bash scripts/bench/mte2_bandwidth/run.sh 32"
+```
+
+If it reports ~1.7-2.0 TB/s, the 220 us figure is explained by the board. If
+it reports ~1.1 TB/s like the 950PR, the user's kernel is doing something the
+library cannot express and its source is required.
 
 ## Core count
 
@@ -345,7 +435,10 @@ All eight whitelisted devices (0-7) report **28 AIC at 1.65 GHz**. The job
 submission layer may place a task on any of them, but the visible count is 28.
 The 32-AIC / 220us AscendC baseline in the project notes was recorded on an
 Ascend950DT_9582, which is a different board: do not compare makespans across
-the two without normalizing for the core count.
+the two without normalizing for the core count. Core-count normalization alone
+(28/32) makes 220us equivalent to 251us here, but the FP8 memory-floor analysis
+above shows the 950DT's HBM bandwidth is the larger factor; run the streaming
+probe on that board to separate the two.
 
 A 32-block SPMD launch on this board runs 28 blocks in the first wave and 4 in
 a second wave; the makespan then includes two full block latencies and
