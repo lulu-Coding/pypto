@@ -47,6 +47,12 @@ Measured on the 28-AIC board with PYPTO_PTOAS_SYNC=bufid, in the same task as
 MTE2, the same rate as the AscendC INT8 library on this board, and the
 kernel-level gap to that library is 5.5%.
 
+A panel/depth sweep with PYPTO_GMM_L1_K / PYPTO_GMM_STAGE found 256/2 best:
+512/2 is 348.9us, 256/3 is 337.7us, 256/4 is 337.6us. L1_K=448 and 224 fail
+in AutoTile with an L0B capacity error (163840 / 229376 bytes against the
+65536-byte limit). The kernel is HBM-bound, so larger bursts and deeper
+pipelines do not help.
+
 The user's AscendC custom no-scale FP8 kernel measures 220us on a 32-AIC
 950DT. CANN's aclnnGroupedMatmulWeightNz cannot reproduce it: its 950 checker
 rejects FP8 with an FP16 output and a null scale, and with an NZ weight it

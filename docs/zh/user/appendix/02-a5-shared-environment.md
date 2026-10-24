@@ -366,6 +366,11 @@ PYPTO_PTOAS_SYNC=bufid python examples/advanced/10l_group_matmul_fp8_pergroup_nz
     -p a5 -d "$TASK_DEVICE" --profile
 ```
 
+panel/深度扫描（`PYPTO_GMM_L1_K` / `PYPTO_GMM_STAGE`）确认实测的 256/2 最优：
+512/2 为 348.9us，256/3 为 337.7us，256/4 为 337.6us；L1_K=448 和 224 在
+AutoTile 的 L0B 容量检查处失败（163840 / 229376 字节对 65536 字节）。对于已经
+贴着 HBM 下限的内核，更大的 burst 和更深的流水没有帮助。
+
 #### 为什么本板达不到 220us
 
 核数不是全部差异。384 个输出 tile 各自从 L1 视角加载 0.917MB 激活和 0.917MB

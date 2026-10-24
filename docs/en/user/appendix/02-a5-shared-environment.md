@@ -391,6 +391,12 @@ PYPTO_PTOAS_SYNC=bufid python examples/advanced/10l_group_matmul_fp8_pergroup_nz
     -p a5 -d "$TASK_DEVICE" --profile
 ```
 
+A panel/depth sweep (`PYPTO_GMM_L1_K` / `PYPTO_GMM_STAGE`) found the measured
+256/2 schedule best: 512/2 is 348.9 us, 256/3 is 337.7 us, 256/4 is 337.6 us;
+L1_K=448 and 224 fail in AutoTile's L0B capacity check (163840 / 229376 bytes
+against 65536). Larger bursts and deeper pipelines do not help a kernel that
+is already at the HBM floor.
+
 #### Why 220 us is not reachable on this board
 
 Core count is not the whole story. Each of the 384 output tiles loads 0.917 MB
