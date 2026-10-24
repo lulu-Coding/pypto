@@ -58,6 +58,7 @@ number needs that custom kernel's source; this file provides the PyPTO number.
 """
 
 import argparse
+import os
 import time
 from pathlib import Path
 
@@ -76,7 +77,9 @@ GROUP_M = 256
 K, N = 3584, 3072
 M = GROUP_M * GROUP
 
-L1_K = 256
+# Tuning knobs for the MTE2 sweep; the defaults are the measured 10l schedule.
+L1_K = int(os.environ.get("PYPTO_GMM_L1_K", "256"))
+PIPE_STAGE = int(os.environ.get("PYPTO_GMM_STAGE", "2"))
 TILE_N = 256
 N_TILES = N // TILE_N
 N_PANELS = K // L1_K
@@ -85,6 +88,7 @@ NZ_C0 = 32
 
 assert K % L1_K == 0 and N % TILE_N == 0 and M % GROUP_M == 0
 assert K % 16 == 0 and N % NZ_C0 == 0, "per-group NZ fractal alignment"
+assert PIPE_STAGE >= 1 and N_PANELS > 1
 assert TOTAL_TILES == 384
 
 
@@ -116,7 +120,7 @@ def _matmul_tasks(
             w_head = w[g : g + 1, 0:L1_K, n0 : n0 + TILE_N]
             acc = pl.matmul(x_head, w_head, out_dtype=pl.FP32)
 
-            for kb in pl.pipeline(1, N_PANELS, stage=2):
+            for kb in pl.pipeline(1, N_PANELS, stage=PIPE_STAGE):
                 k1 = kb * L1_K
                 x_k = x[row : row + GROUP_M, k1 : k1 + L1_K]
                 w_k = w[g : g + 1, k1 : k1 + L1_K, n0 : n0 + TILE_N]
@@ -179,6 +183,11 @@ def main() -> None:
     parser.add_argument("--rounds", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument(
+        "--skip-verify",
+        action="store_true",
+        help="skip the CPU FP32 reference (sweeps only; do not use for a result you keep)",
+    )
+    parser.add_argument(
         "--planner",
         choices=["pypto", "dsa_rp", "ptoas"],
         default="pypto",
@@ -227,7 +236,7 @@ def main() -> None:
 
     print(
         f"compiling: device-sized grid over {TOTAL_TILES} tiles, FP8E4M3 per-group NZ weight, "
-        f"FP16 out, L1_K={L1_K}, planner={args.planner} ..."
+        f"FP16 out, L1_K={L1_K}, stage={PIPE_STAGE}, planner={args.planner} ..."
     )
     t0 = time.perf_counter()
     compiled = group_matmul_fp8_pergroup_nz_balanced.compile(x, w_nz, out, config=cfg)
@@ -235,13 +244,16 @@ def main() -> None:
 
     compiled(x, w_nz, out, config=cfg)
 
-    print("verifying bit-exact against FP32-accumulation reference ...")
-    expected = grouped_matmul_ref(x, w)
-    if not torch.equal(out, expected):
-        diff = (out.float() - expected.float()).abs()
-        mismatches = int((out != expected).sum())
-        raise SystemExit(f"FAIL: max abs diff {diff.max().item()}, mismatches {mismatches} of {out.numel()}")
-    print("OK  bit-exact")
+    if args.skip_verify:
+        print("SKIP verify (sweep mode)")
+    else:
+        print("verifying bit-exact against FP32-accumulation reference ...")
+        expected = grouped_matmul_ref(x, w)
+        if not torch.equal(out, expected):
+            diff = (out.float() - expected.float()).abs()
+            mismatches = int((out != expected).sum())
+            raise SystemExit(f"FAIL: max abs diff {diff.max().item()}, mismatches {mismatches} of {out.numel()}")
+        print("OK  bit-exact")
 
     if args.profile:
         roots = [Path(args.artifacts_dir)]
