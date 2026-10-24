@@ -301,6 +301,32 @@ MTE2-busy and move the same ~25.1 MB per core, but AscendC sustains ~89 GB/s
 versus PyPTO's ~82 GB/s. AscendC's fixpipe (111 us) is overlapped under MTE2;
 PyPTO's is only 25 us, so unit-flag overlap is not the missing piece.
 
+### Pipeline trace and overlap
+
+`msprof op` can emit a Chrome `trace.json`; the flag is
+`--aic-metrics=PipeTimeline,PipeUtilization` (there is no
+`--aicmetric=pipeline`). For the AscendC GMM, the trace for core 0 shows:
+
+```text
+MTE2   busy 298.6 us / 305.4 us horizon (97.8%)
+CUBE   busy 263.4 us (86.3%); 260.7 us of it overlaps MTE2
+FIXP   busy 132.0 us (43.2%); 127.8 us of it overlaps MTE2
+```
+
+That is the "cube/MTE/fixpipe fully covered" shape: MTE2 is the long pole and
+the other pipes run underneath it.
+
+The PyPTO runtime kernel (`aicore_kernel_0_mix_aic`) cannot be profiled with
+`msprof op` in this environment: kernel replay reports
+`Kernel run on device ... failed`, and application replay raises an AICPU
+exception / scheduler timeout (507018, `S1:running-stalled`). Use PyPTO's own
+DFX instead (`enable_chip_swimlane=4`, `enable_pmu=2`, then
+`swimlane_summary.py`). For 10k the PMU numbers are cube 240.6us, MTE2
+313.9us, fixpipe 25.3us and AICore makespan 332.8us. If cube and MTE2 were
+serialized the kernel could not finish in 332.8us (they sum to 554.5us), so at
+least 221us of cube runs under MTE2. MTE2 occupies 94% of the makespan, while
+fixpipe is small and not limiting.
+
 `msprof op` profiles only the first kernel launch by default. The harness runs
 32 weight TransData conversions, one GMM warm-up, then five measured GMM calls.
 Skip 33 launches to capture a warmed GMM kernel:

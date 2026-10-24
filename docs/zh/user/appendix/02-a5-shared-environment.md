@@ -287,6 +287,29 @@ cube 已经打平。剩下的约 15% 在 MTE2：两边都约 97% MTE2 忙碌、�
 约 25.1MB，但 AscendC 约 89GB/s，PyPTO 约 82GB/s。AscendC 的 fixpipe（111us）
 被 MTE2 覆盖；PyPTO 只有 25us，所以 unit-flag 重叠不是缺失的那一块。
 
+### Pipeline trace 与重叠度
+
+`msprof op` 可以导出 Chrome `trace.json`；参数是
+`--aic-metrics=PipeTimeline,PipeUtilization`（没有 `--aicmetric=pipeline`）。
+AscendC GMM 的 core 0 trace 为：
+
+```text
+MTE2   busy 298.6 us / horizon 305.4 us (97.8%)
+CUBE   busy 263.4 us (86.3%)，其中 260.7 us 与 MTE2 重叠
+FIXP   busy 132.0 us (43.2%)，其中 127.8 us 与 MTE2 重叠
+```
+
+这就是“cube/MTE/fixpipe 基本全覆盖”的形态：MTE2 是长板，其余 pipe 在它下面跑。
+
+PyPTO runtime 的 kernel（`aicore_kernel_0_mix_aic`）在当前环境里不能用
+`msprof op` 采集：kernel replay 报 `Kernel run on device ... failed`，
+application replay 会触发 AICPU 异常/调度超时（507018，
+`S1:running-stalled`）。PyPTO 侧应使用自带 DFX
+（`enable_chip_swimlane=4`、`enable_pmu=2`，再跑 `swimlane_summary.py`）。10k 的
+PMU 为 cube 240.6us、MTE2 313.9us、fixpipe 25.3us、AICore makespan 332.8us。
+如果 cube 与 MTE2 串行，332.8us 内不可能完成（两者相加 554.5us），因此至少有
+221us 的 cube 与 MTE2 重叠。MTE2 占 makespan 的 94%，fixpipe 很小，不是瓶颈。
+
 `msprof op` 默认只 profile 第一次 kernel launch。该基准先做 32 次 weight
 TransData 转换、1 次 GMM 预热，然后 5 次测量；跳过 33 次 launch 可抓到预热后的
 GMM kernel：
